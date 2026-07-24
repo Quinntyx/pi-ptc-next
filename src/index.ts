@@ -46,18 +46,18 @@ function renderExecutingCode(
   }
 
   if (startIdx > 0) {
-    lines.push(theme.fg("muted", "    │ ..."));
+    lines.push(theme.fg("muted", "      │ ..."));
   }
 
   for (let index = startIdx; index < endIdx; index++) {
     const lineNumber = index + 1;
     const isCurrentLine = lineNumber === currentLine;
     const line = codeLines[index];
-    let prefix = `${String(lineNumber).padStart(4, " ")} │ `;
+    let prefix = `${String(lineNumber).padStart(6, " ")} │ `;
     let content = line;
 
     if (isCurrentLine) {
-      prefix = theme.fg("success", `  → ${String(lineNumber).padStart(3, " ")} │ `);
+      prefix = theme.fg("success", ` → ${String(lineNumber).padStart(3, " ")} │ `);
       content = theme.fg("text", line);
     } else if (lineNumber < currentLine) {
       prefix = theme.fg("muted", prefix);
