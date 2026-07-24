@@ -70,7 +70,7 @@ function renderExecutingCode(
   }
 
   if (endIdx < codeLines.length) {
-    lines.push(theme.fg("muted", "    │ ..."));
+    lines.push(theme.fg("muted", "      │ ..."));
   }
 
   return new Text(lines.join("\n"), 0, 0);
