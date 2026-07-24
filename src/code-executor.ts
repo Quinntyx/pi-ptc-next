@@ -81,6 +81,7 @@ asyncio.run(_runtime_main(user_main))
       const result = await rpc.waitForCompletion(this.settings.executionTimeoutMs);
       return {
         output: truncateOutput(result.output, this.settings.maxOutputChars),
+        images: result.images,
         details: result.details,
       };
     } catch (error) {

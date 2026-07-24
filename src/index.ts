@@ -181,10 +181,25 @@ function buildCodeExecutionTool(
         });
 
         noteCodeExecutionSuccess(recoveryState);
+        const content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }> = [
+          { type: "text" as const, text: result.output || "(No output)" },
+        ];
+
+        if (result.images && result.images.length > 0) {
+          for (const img of result.images) {
+            content.push({
+              type: "image" as const,
+              mimeType: img.mimeType,
+              data: img.data,
+            });
+          }
+        }
+
         return {
-          content: [{ type: "text" as const, text: result.output || "(No output)" }],
+          content,
           details: {
             ...result.details,
+            imagesCount: result.images?.length || 0,
             telemetry: buildPtcExecutionTelemetry(recoveryState),
             recovery: buildPtcRecoveryDetails(recoveryState),
           },

@@ -20,12 +20,19 @@ export interface RpcErrorPayload {
   stack?: string;
 }
 
+export interface PtcImageArtifact {
+  mimeType: string;
+  data: string;
+  width?: number;
+  height?: number;
+}
+
 export type RpcMessage =
   | { type: "tool_call"; id: string; tool: string; params: Record<string, unknown> }
   | { type: "tool_result"; id: string; value?: unknown; error?: RpcErrorPayload }
   | { type: "execution_progress"; line: number; total_lines: number }
   | { type: "stdout"; text: string }
-  | { type: "complete"; output: string }
+  | { type: "complete"; output: string; images?: PtcImageArtifact[] }
   | { type: "error"; message: string; traceback?: string }
   | { type: "update"; message: string };
 
@@ -58,5 +65,6 @@ export interface ExecutionDetails extends ExecutionMetrics {
 
 export interface CodeExecutionResult {
   output: string;
+  images?: PtcImageArtifact[];
   details: ExecutionDetails;
 }

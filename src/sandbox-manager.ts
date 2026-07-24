@@ -3,13 +3,27 @@ import { execSync, spawn } from "child_process";
 import type { SandboxManager } from "./contracts/execution-types";
 import type { PtcSettings } from "./contracts/settings";
 import { debugLog } from "./utils";
+import { existsSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 
 const EXECUTION_TIMEOUT = 270_000;
 const DOCKER_WORKSPACE_ROOT = "/workspace";
+function resolvePythonExecutable(): string {
+  if (process.env.PTC_PYTHON_EXECUTABLE) {
+    return process.env.PTC_PYTHON_EXECUTABLE;
+  }
+  const venvPython = join(homedir(), ".cache", "pi-ptc", "python-env", "bin", "python");
+  if (existsSync(venvPython)) {
+    return venvPython;
+  }
+  return "python3";
+}
 
 class SubprocessSandbox implements SandboxManager {
   spawn(code: string, cwd: string): import("child_process").ChildProcess {
-    return spawn("python3", ["-u", "-c", code], {
+    const pythonExe = resolvePythonExecutable();
+    return spawn(pythonExe, ["-u", "-c", code], {
       cwd,
       env: { ...process.env },
     });

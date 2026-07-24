@@ -84,7 +84,8 @@ function validateStdoutMessage(value: Record<string, unknown>): Extract<RpcMessa
 
 function validateCompleteMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "complete" }> {
   if (isString(value.output)) {
-    return { type: "complete", output: value.output };
+    const images = Array.isArray(value.images) ? (value.images as any) : undefined;
+    return { type: "complete", output: value.output, images };
   }
 
   throw new PtcProtocolError("Invalid complete frame: expected string output.");
@@ -323,6 +324,7 @@ export class RpcProtocol {
         const finalOutput = this.stdout ? `${this.stdout}${msg.output}`.trim() : msg.output;
         this.resolveOnce({
           output: finalOutput,
+          images: msg.images,
           details: this.buildExecutionDetails(),
         });
         break;

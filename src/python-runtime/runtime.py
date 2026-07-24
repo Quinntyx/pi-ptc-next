@@ -135,6 +135,97 @@ class _PtcHelpers:
 ptc = _PtcHelpers(globals().get("PTC_MAX_PARALLEL_TOOL_CALLS", 8))
 
 
+class _LazyModuleProxy:
+    def __init__(self, module_name: str, setup_fn=None):
+        self._module_name = module_name
+        self._setup_fn = setup_fn
+        self._module = None
+
+    def _load(self):
+        if self._module is None:
+            if self._setup_fn:
+                self._setup_fn()
+            import importlib
+            self._module = importlib.import_module(self._module_name)
+        return self._module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+    def __getitem__(self, item: Any) -> Any:
+        return self._load()[item]
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._load()(*args, **kwargs)
+
+    def __dir__(self) -> list[str]:
+        return dir(self._load())
+
+    def __repr__(self) -> str:
+        return repr(self._load())
+
+def _setup_matplotlib():
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+    except Exception:
+        pass
+
+np = _LazyModuleProxy("numpy")
+pd = _LazyModuleProxy("pandas")
+plt = _LazyModuleProxy("matplotlib.pyplot", setup_fn=_setup_matplotlib)
+
+def _capture_figures() -> list[dict[str, Any]]:
+    captured = []
+    try:
+        import matplotlib.pyplot as _plt
+        import io as _io
+        import base64 as _b64
+        try:
+            from PIL import Image as _PILImage
+        except ImportError:
+            _PILImage = None
+
+        fig_nums = _plt.get_fignums()
+        if not fig_nums:
+            return captured
+
+        for num in fig_nums[:4]:
+            try:
+                fig = _plt.figure(num)
+                buf = _io.BytesIO()
+                fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+                buf.seek(0)
+                img_bytes = buf.read()
+
+                width, height = fig.get_size_inches() * fig.dpi
+                width, height = int(width), int(height)
+
+                if _PILImage and len(img_bytes) > 2 * 1024 * 1024:
+                    try:
+                        pil_img = _PILImage.open(_io.BytesIO(img_bytes))
+                        pil_img.thumbnail((1600, 1200))
+                        out_buf = _io.BytesIO()
+                        pil_img.save(out_buf, format="PNG", optimize=True)
+                        img_bytes = out_buf.getvalue()
+                        width, height = pil_img.size
+                    except Exception:
+                        pass
+
+                b64_data = _b64.b64encode(img_bytes).decode("ascii")
+                captured.append({
+                    "mimeType": "image/png",
+                    "data": b64_data,
+                    "width": width,
+                    "height": height
+                })
+            except Exception:
+                pass
+        _plt.close("all")
+    except Exception:
+        pass
+    return captured
+
 def _stringify_output(value: Any) -> str:
     if value is None:
         return ""
@@ -147,6 +238,7 @@ def _stringify_output(value: Any) -> str:
 
 async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
     try:
+        _setup_matplotlib()
         await _rpc.start_reader()
         _ptc_sys.settrace(_trace_lines)
         _ptc_sys.stdout = _stdout_proxy
@@ -154,7 +246,8 @@ async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
         _stdout_proxy.flush()
         _ptc_sys.stdout = _ORIGINAL_STDOUT
         _ptc_sys.settrace(None)
-        _emit_protocol({"type": "complete", "output": _stringify_output(output)})
+        images = _capture_figures()
+        _emit_protocol({"type": "complete", "output": _stringify_output(output), "images": images})
     except Exception as error:
         _ptc_sys.stdout = _ORIGINAL_STDOUT
         _ptc_sys.settrace(None)
