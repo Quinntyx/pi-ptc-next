@@ -164,6 +164,9 @@ export class RpcProtocol {
   private nestedResultChars = 0;
   private nestedResultCount = 0;
   private nestedErrors = 0;
+  private currentLine?: number;
+  private totalLines?: number;
+  private activeTool?: string;
 
   constructor(
     private proc: ChildProcess,
@@ -274,6 +277,10 @@ export class RpcProtocol {
       nestedErrors: this.nestedErrors,
       durationMs: Date.now() - this.startedAt,
       estimatedAvoidedTokens: estimateTokensFromChars(this.nestedResultChars),
+      currentLine: this.currentLine,
+      totalLines: this.totalLines,
+      userCode: this.userCodeLines,
+      activeTool: this.activeTool,
       ...overrides,
     };
   }
@@ -299,6 +306,9 @@ export class RpcProtocol {
         break;
 
       case "execution_progress":
+        this.currentLine = msg.line;
+        this.totalLines = msg.total_lines;
+        this.activeTool = undefined;
         if (this.onUpdate) {
           this.onUpdate({
             content: [
@@ -307,11 +317,7 @@ export class RpcProtocol {
                 text: `Executing line ${msg.line}/${msg.total_lines}`,
               },
             ],
-            details: this.buildExecutionDetails({
-              currentLine: msg.line,
-              totalLines: msg.total_lines,
-              userCode: this.userCodeLines,
-            }),
+            details: this.buildExecutionDetails(),
           });
         }
         break;
@@ -348,6 +354,7 @@ export class RpcProtocol {
   private async handleToolCall(msg: Extract<RpcMessage, { type: "tool_call" }>): Promise<void> {
     this.nestedToolCalls += 1;
     this.nestedToolNames.push(msg.tool);
+    this.activeTool = msg.tool;
 
     if (this.onUpdate) {
       this.onUpdate({
@@ -374,6 +381,8 @@ export class RpcProtocol {
         id: msg.id,
         error: serializeError(error),
       });
+    } finally {
+      this.activeTool = undefined;
     }
   }
 

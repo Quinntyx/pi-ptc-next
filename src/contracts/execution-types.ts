@@ -59,6 +59,8 @@ export interface ExecutionDetails extends ExecutionMetrics {
   currentLine?: number;
   totalLines?: number;
   userCode?: string[];
+  activeTool?: string;
+  imagesCount?: number;
   telemetry?: PtcExecutionTelemetry;
   recovery?: PtcRecoveryDetails;
 }

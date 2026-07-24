@@ -26,20 +26,38 @@ function renderExecutingCode(
   codeLines: string[],
   currentLine: number,
   totalLines: number,
+  activeTool: string | undefined,
   theme: Theme
 ): Component {
   const lines: string[] = [];
-  lines.push(theme.fg("muted", `Executing Python code (line ${currentLine}/${totalLines}):`));
+  const toolBadge = activeTool ? theme.fg("success", ` • calling ${activeTool}()`) : "";
+  lines.push(theme.fg("muted", `Executing Python code (line ${currentLine}/${totalLines})`) + toolBadge);
   lines.push("");
 
-  codeLines.forEach((line, index) => {
+  let startIdx = 0;
+  let endIdx = codeLines.length;
+
+  if (codeLines.length > 12) {
+    startIdx = Math.max(0, currentLine - 4);
+    endIdx = Math.min(codeLines.length, startIdx + 10);
+    if (endIdx - startIdx < 10 && startIdx > 0) {
+      startIdx = Math.max(0, endIdx - 10);
+    }
+  }
+
+  if (startIdx > 0) {
+    lines.push(theme.fg("muted", "    │ ..."));
+  }
+
+  for (let index = startIdx; index < endIdx; index++) {
     const lineNumber = index + 1;
     const isCurrentLine = lineNumber === currentLine;
-    let prefix = `${String(lineNumber).padStart(3, " ")} │ `;
+    const line = codeLines[index];
+    let prefix = `${String(lineNumber).padStart(4, " ")} │ `;
     let content = line;
 
     if (isCurrentLine) {
-      prefix = theme.fg("success", `→ ${String(lineNumber).padStart(2, " ")} │ `);
+      prefix = theme.fg("success", `  → ${String(lineNumber).padStart(3, " ")} │ `);
       content = theme.fg("text", line);
     } else if (lineNumber < currentLine) {
       prefix = theme.fg("muted", prefix);
@@ -49,7 +67,11 @@ function renderExecutingCode(
     }
 
     lines.push(prefix + content);
-  });
+  }
+
+  if (endIdx < codeLines.length) {
+    lines.push(theme.fg("muted", "    │ ..."));
+  }
 
   return new Text(lines.join("\n"), 0, 0);
 }
@@ -59,14 +81,35 @@ function renderCompletedOutput(resultText: string, details: ExecutionDetails | u
     return new Text(resultText || "(No output)", 0, 0);
   }
 
-  const summary = theme.fg(
-    "muted",
-    `[PTC] nested calls=${details.nestedToolCalls}, nested results=${details.nestedResultCount}, ` +
-      `estimated avoided tokens≈${details.estimatedAvoidedTokens}, duration=${Math.round(details.durationMs / 1000)}s`
-  );
+  const durationSec = (details.durationMs / 1000).toFixed(1).replace(/\.0$/, "");
+  const avoidTok = details.estimatedAvoidedTokens > 0
+    ? ` • ~${details.estimatedAvoidedTokens.toLocaleString()} tokens saved`
+    : "";
+  const nestedStr = details.nestedToolCalls > 0
+    ? `${details.nestedToolCalls} nested call${details.nestedToolCalls > 1 ? "s" : ""}`
+    : "local logic";
+  const imgStr = details.imagesCount && details.imagesCount > 0
+    ? theme.fg("success", ` • ${details.imagesCount} figure${details.imagesCount > 1 ? "s" : ""} generated`)
+    : "";
 
-  const body = resultText || "(No output)";
-  return new Text(`${summary}\n\n${body}`, 0, 0);
+  const header = theme.fg(
+    "muted",
+    `[PTC] ${nestedStr}${avoidTok} • ${durationSec}s`
+  ) + imgStr;
+
+  const rawBody = resultText || "(No output)";
+  const bodyLines = rawBody.split("\n");
+  const maxDisplayLines = 25;
+  let displayedBody = rawBody;
+
+  if (bodyLines.length > maxDisplayLines) {
+    displayedBody = bodyLines.slice(0, maxDisplayLines).join("\n") +
+      `\n${theme.fg("muted", `... (${bodyLines.length - maxDisplayLines} more lines omitted in view)`)}`;
+  }
+
+  return new Text(`${header}
+
+${displayedBody}`, 0, 0);
 }
 
 function buildToolDescription(currentSettings: PtcSettings, callableTools: ToolInfo[]): string {
@@ -223,6 +266,7 @@ function buildCodeExecutionTool(
           details.userCode,
           details.currentLine,
           details.totalLines || details.userCode.length,
+          details.activeTool,
           theme
         );
       }
