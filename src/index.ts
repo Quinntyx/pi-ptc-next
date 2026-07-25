@@ -21,6 +21,10 @@ import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
 import { debugLog, isMutationPrompt, loadSettingsFromEnv, shouldAutoRoutePromptToCodeExecution } from "./utils";
+// Running tally of cumulative PTC token savings, shared in-process on globalThis
+// so other extensions (e.g. the prompt status bar) can surface it without a cross-package import.
+const ptcTokensSaved = { tokensSaved: 0 };
+(globalThis as Record<string, unknown>).__ptcTokensSaved = ptcTokensSaved;
 
 function renderExecutingCode(
   codeLines: string[],
@@ -224,6 +228,9 @@ function buildCodeExecutionTool(
         });
 
         noteCodeExecutionSuccess(recoveryState);
+        if (result.details.estimatedAvoidedTokens > 0) {
+          ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
+        }
         const content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }> = [
           { type: "text" as const, text: result.output || "(No output)" },
         ];
