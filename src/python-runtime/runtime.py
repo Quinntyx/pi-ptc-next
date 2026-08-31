@@ -50,7 +50,9 @@ def _trace_lines(frame, event, arg):
         return _trace_lines
 
     if frame.f_code.co_name == "user_main":
-        lineno = frame.f_lineno - frame.f_code.co_firstlineno + 1
+        # f_lineno is offset from co_firstlineno, which points at the `def` line.
+        # The first body line therefore maps to user line 1, not 2.
+        lineno = frame.f_lineno - frame.f_code.co_firstlineno
         _current_line = lineno
         try:
             _emit_protocol({"type": "execution_progress", "line": lineno, "total_lines": _PTC_USER_CODE_LINE_COUNT})
