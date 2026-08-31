@@ -1,5 +1,11 @@
 import { Type } from "@sinclair/typebox";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+  Theme,
+  ToolRenderResultOptions,
+} from "@mariozechner/pi-coding-agent";
 import { Text, type Component } from "@mariozechner/pi-tui";
 import { CodeExecutor } from "./code-executor";
 import { PtcPythonError } from "./execution/execution-errors";
@@ -21,17 +27,33 @@ import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
 import { debugLog, isMutationPrompt, loadSettingsFromEnv, shouldAutoRoutePromptToCodeExecution } from "./utils";
+import {
+  CODE_VIEW_FULL_THRESHOLD,
+  CODE_VIEW_HEIGHT,
+  computeCodeViewStart,
+  type CodeViewState,
+} from "./execution/code-view";
 // Running tally of cumulative PTC token savings, shared in-process on globalThis
 // so other extensions (e.g. the prompt status bar) can surface it without a cross-package import.
 const ptcTokensSaved = { tokensSaved: 0 };
 (globalThis as Record<string, unknown>).__ptcTokensSaved = ptcTokensSaved;
+
+//
+// Minimal structural view of the render context the pi TUI passes as the fourth
+// argument to renderResult. `state` is shared across all renders of the same tool
+// execution, which lets the executing-code view carry its scroll position between
+// partial updates (the installed @mariozechner types predate this argument).
+interface PartialRenderContext {
+  state?: { viewStartLine?: number };
+}
 
 function renderExecutingCode(
   codeLines: string[],
   currentLine: number,
   totalLines: number,
   activeTool: string | undefined,
-  theme: Theme
+  theme: Theme,
+  state: CodeViewState
 ): Component {
   const lines: string[] = [];
   const toolBadge = activeTool ? theme.fg("success", ` • calling ${activeTool}()`) : "";
@@ -41,12 +63,12 @@ function renderExecutingCode(
   let startIdx = 0;
   let endIdx = codeLines.length;
 
-  if (codeLines.length > 12) {
-    startIdx = Math.max(0, currentLine - 4);
-    endIdx = Math.min(codeLines.length, startIdx + 10);
-    if (endIdx - startIdx < 10 && startIdx > 0) {
-      startIdx = Math.max(0, endIdx - 10);
-    }
+  if (codeLines.length > CODE_VIEW_FULL_THRESHOLD) {
+    state.viewStartLine = computeCodeViewStart(currentLine, codeLines.length, state.viewStartLine);
+    startIdx = state.viewStartLine - 1;
+    endIdx = Math.min(codeLines.length, startIdx + CODE_VIEW_HEIGHT);
+  } else {
+    state.viewStartLine = 1;
   }
 
   if (startIdx > 0) {
@@ -266,15 +288,22 @@ function buildCodeExecutionTool(
         throw error;
       }
     },
-    renderResult(result, { isPartial }, theme) {
+    renderResult(
+      result: AgentToolResult<unknown>,
+      { isPartial }: ToolRenderResultOptions,
+      theme: Theme,
+      context?: PartialRenderContext
+    ) {
       const details = result.details as ExecutionDetails | undefined;
       if (isPartial && details?.userCode && details.currentLine) {
+        const state = (context?.state ?? {}) as CodeViewState;
         return renderExecutingCode(
           details.userCode,
           details.currentLine,
           details.totalLines || details.userCode.length,
           details.activeTool,
-          theme
+          theme,
+          state
         );
       }
 
