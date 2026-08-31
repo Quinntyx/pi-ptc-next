@@ -246,3 +246,83 @@ test("CodeExecutor runs the core tool-call pipeline through RpcProtocol", async 
   assert.equal(result.details.nestedToolCalls, 1);
   assert.equal(result.details.nestedResultCount, 1);
 });
+
+test("CodeExecutor does not spawn when the caller signal is already aborted", async () => {
+  let spawnCalls = 0;
+  const sandboxManager = {
+    spawn() {
+      spawnCalls += 1;
+      throw new Error("must not spawn");
+    },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+    async cleanup() {},
+  };
+  const toolRegistry = {
+    createCallableToolRuntime() { throw new Error("must not create runtime"); },
+  };
+  const controller = new AbortController();
+  controller.abort();
+  const executor = new CodeExecutor(
+    sandboxManager,
+    toolRegistry,
+    {
+      executionTimeoutMs: 1000, maxOutputChars: 1000, allowMutations: false,
+      allowBash: false, maxParallelToolCalls: 4, callableTools: undefined, blockedTools: undefined,
+    },
+    process.cwd()
+  );
+
+  await assert.rejects(
+    executor.execute("return 1", { cwd: process.cwd(), ctx: { cwd: process.cwd() }, signal: controller.signal }),
+    /aborted before/
+  );
+  assert.equal(spawnCalls, 0);
+});
+
+test("CodeExecutor aborts the nested-tool signal on execution timeout", async () => {
+  class HangingProcess extends EventEmitter {
+    constructor() {
+      super();
+      this.stdin = new PassThrough();
+      this.stdout = new PassThrough();
+      this.stderr = new PassThrough();
+      this.exitCode = null;
+      this.signalCode = null;
+    }
+    kill(signal) {
+      this.signalCode = signal;
+      this.emit("exit", null, signal);
+      return true;
+    }
+  }
+
+  let nestedSignal;
+  const proc = new HangingProcess();
+  const sandboxManager = {
+    spawn() { return proc; },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+    async cleanup() {},
+  };
+  const toolRegistry = {
+    createCallableToolRuntime(_cwd, _settings, execution) {
+      nestedSignal = execution.signal;
+      return { tools: [], runTool: async () => null };
+    },
+  };
+  const executor = new CodeExecutor(
+    sandboxManager,
+    toolRegistry,
+    {
+      executionTimeoutMs: 10, maxOutputChars: 1000, allowMutations: false,
+      allowBash: false, maxParallelToolCalls: 4, callableTools: undefined, blockedTools: undefined,
+    },
+    process.cwd()
+  );
+
+  await assert.rejects(
+    executor.execute("while True: pass", { cwd: process.cwd(), ctx: { cwd: process.cwd() } }),
+    /timed out/
+  );
+  assert.equal(nestedSignal.aborted, true);
+  assert.equal(proc.signalCode, "SIGTERM");
+});

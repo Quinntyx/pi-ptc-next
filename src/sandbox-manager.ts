@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { execSync, spawn } from "child_process";
+import { execFileSync, spawn, type ChildProcess } from "child_process";
 import type { SandboxManager } from "./contracts/execution-types";
 import type { PtcSettings } from "./contracts/settings";
 import { debugLog } from "./utils";
@@ -8,7 +8,34 @@ import { homedir } from "os";
 import { join } from "path";
 
 const EXECUTION_TIMEOUT = 270_000;
+const PROCESS_TERMINATION_GRACE_MS = 1_000;
 const DOCKER_WORKSPACE_ROOT = "/workspace";
+
+function isProcessRunning(proc: ChildProcess): boolean {
+  return proc.exitCode === null && proc.signalCode === null;
+}
+
+function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (!isProcessRunning(proc)) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timer);
+      proc.removeListener("exit", onExit);
+      proc.removeListener("error", onError);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const onError = () => finish(true);
+    const timer = setTimeout(() => finish(!isProcessRunning(proc)), timeoutMs);
+    timer.unref?.();
+    proc.once("exit", onExit);
+    proc.once("error", onError);
+  });
+}
+
 function resolvePythonExecutable(): string {
   if (process.env.PTC_PYTHON_EXECUTABLE) {
     return process.env.PTC_PYTHON_EXECUTABLE;
@@ -21,20 +48,63 @@ function resolvePythonExecutable(): string {
 }
 
 class SubprocessSandbox implements SandboxManager {
-  spawn(code: string, cwd: string): import("child_process").ChildProcess {
+  private readonly children = new Set<ChildProcess>();
+
+  spawn(code: string, cwd: string): ChildProcess {
     const pythonExe = resolvePythonExecutable();
-    return spawn(pythonExe, ["-u", "-c", code], {
+    const proc = spawn(pythonExe, ["-u", "-c", code], {
       cwd,
       env: { ...process.env },
+      // A separate process group lets cleanup terminate grandchildren spawned
+      // by user code instead of leaving them holding RPC pipes open.
+      detached: process.platform !== "win32",
     });
+
+    this.children.add(proc);
+    const forget = () => this.children.delete(proc);
+    proc.once("exit", forget);
+    proc.once("error", forget);
+    return proc;
+  }
+
+  terminate(proc: ChildProcess, signal: NodeJS.Signals): boolean {
+    if (!isProcessRunning(proc)) {
+      return false;
+    }
+
+    if (process.platform !== "win32" && proc.pid) {
+      try {
+        process.kill(-proc.pid, signal);
+        return true;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ESRCH") {
+          return false;
+        }
+        throw error;
+      }
+    }
+
+    return proc.kill(signal);
   }
 
   getRuntimeWorkspaceRoot(cwd: string): string {
     return cwd;
   }
 
-  cleanup(): Promise<void> {
-    return Promise.resolve();
+  async cleanup(): Promise<void> {
+    const children = [...this.children];
+    for (const proc of children) {
+      this.terminate(proc, "SIGTERM");
+    }
+    await Promise.all(children.map((proc) => waitForExit(proc, PROCESS_TERMINATION_GRACE_MS)));
+
+    const survivors = children.filter(isProcessRunning);
+    for (const proc of survivors) {
+      this.terminate(proc, "SIGKILL");
+    }
+    await Promise.all(survivors.map((proc) => waitForExit(proc, PROCESS_TERMINATION_GRACE_MS)));
+    this.children.clear();
   }
 }
 
@@ -42,6 +112,7 @@ class DockerSandbox implements SandboxManager {
   private containerId: string | null = null;
   private lastUsed = 0;
   private readonly sessionId: string;
+  private readonly activeExecutions = new Set<ChildProcess>();
   private cleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(sessionId: string) {
@@ -60,7 +131,11 @@ class DockerSandbox implements SandboxManager {
   }
 
   private cleanupExpired(): void {
-    if (this.containerId && Date.now() - this.lastUsed > EXECUTION_TIMEOUT) {
+    if (
+      this.containerId &&
+      this.activeExecutions.size === 0 &&
+      Date.now() - this.lastUsed > EXECUTION_TIMEOUT
+    ) {
       this.stopContainerNow();
     }
   }
@@ -74,41 +149,50 @@ class DockerSandbox implements SandboxManager {
     this.containerId = null;
 
     try {
-      execSync(`docker stop ${containerId}`, { stdio: "ignore" });
+      execFileSync("docker", ["stop", "--time", "1", containerId], { stdio: "ignore" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("No such container") || message.includes("is not running")) {
         return;
       }
       throw new Error(`Failed to stop container ${containerId}: ${message}`);
+    } finally {
+      this.activeExecutions.clear();
     }
   }
 
   private ensureContainer(cwd: string): void {
-    if (this.containerId && Date.now() - this.lastUsed <= EXECUTION_TIMEOUT) {
+    if (
+      this.containerId &&
+      (this.activeExecutions.size > 0 || Date.now() - this.lastUsed <= EXECUTION_TIMEOUT)
+    ) {
       return;
     }
 
     this.stopContainerNow();
 
     const containerName = `pi-ptc-${this.sessionId}-${Date.now()}`;
-    const output = execSync(
-      `docker run -d --rm --network none --name ${containerName} ` +
-      `-v "${cwd}:${DOCKER_WORKSPACE_ROOT}:ro" ` +
-      `-w ${DOCKER_WORKSPACE_ROOT} ` +
-      `--memory 512m --cpus 1.0 ` +
-      `python:3.12-slim tail -f /dev/null`,
+    const output = execFileSync(
+      "docker",
+      [
+        "run", "-d", "--rm", "--network", "none",
+        "--name", containerName,
+        "-v", `${cwd}:${DOCKER_WORKSPACE_ROOT}:ro`,
+        "-w", DOCKER_WORKSPACE_ROOT,
+        "--memory", "512m", "--cpus", "1.0",
+        "python:3.12-slim", "tail", "-f", "/dev/null",
+      ],
       { encoding: "utf-8" }
     );
     this.containerId = output.trim();
   }
 
-  spawn(code: string, cwd: string): import("child_process").ChildProcess {
+  spawn(code: string, cwd: string): ChildProcess {
     try {
       this.ensureContainer(cwd);
       this.lastUsed = Date.now();
 
-      return spawn("docker", [
+      const proc = spawn("docker", [
         "exec",
         "-i",
         "-w",
@@ -119,10 +203,22 @@ class DockerSandbox implements SandboxManager {
         "-c",
         code,
       ]);
+      this.activeExecutions.add(proc);
+      const forget = () => {
+        this.activeExecutions.delete(proc);
+        this.lastUsed = Date.now();
+      };
+      proc.once("exit", forget);
+      proc.once("error", forget);
+      return proc;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`Failed to create/use Docker container: ${message}`);
     }
+  }
+
+  terminate(proc: ChildProcess, signal: NodeJS.Signals): boolean {
+    return isProcessRunning(proc) ? proc.kill(signal) : false;
   }
 
   getRuntimeWorkspaceRoot(_cwd: string): string {
@@ -141,7 +237,7 @@ class DockerSandbox implements SandboxManager {
 
 function isDockerAvailable(): boolean {
   try {
-    execSync("docker --version", { stdio: "ignore" });
+    execFileSync("docker", ["--version"], { stdio: "ignore" });
     return true;
   } catch {
     return false;

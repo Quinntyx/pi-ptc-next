@@ -43,6 +43,7 @@ class RpcClient:
             while True:
                 line = await reader.readline()
                 if not line:
+                    self._fail_pending_calls(RpcProtocolError("RPC host closed stdin while tool calls were pending"))
                     break
 
                 try:
@@ -81,29 +82,33 @@ class RpcClient:
             "tool": tool,
             "params": params,
         }
-        protocol_write = globals().get("_ptc_protocol_write")
-        if callable(protocol_write):
-            protocol_write(request)
-        else:
-            print(json.dumps(request), flush=True)
 
-        future: asyncio.Future[Any] = asyncio.Future()
+        # Register before writing so a fast host response can never be dropped.
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self.pending_calls[call_id] = future
-
         try:
-            return await asyncio.wait_for(future, timeout=300.0)
-        except asyncio.TimeoutError as error:
-            if call_id in self.pending_calls:
-                del self.pending_calls[call_id]
-            raise Exception(f"Tool call '{tool}' timed out") from error
+            protocol_write = globals().get("_ptc_protocol_write")
+            if callable(protocol_write):
+                protocol_write(request)
+            else:
+                print(json.dumps(request), flush=True)
+
+            try:
+                return await asyncio.wait_for(future, timeout=300.0)
+            except asyncio.TimeoutError as error:
+                raise Exception(f"Tool call '{tool}' timed out") from error
+        finally:
+            self.pending_calls.pop(call_id, None)
 
     async def cleanup(self) -> None:
+        self._fail_pending_calls(RpcProtocolError("RPC client shut down"))
         if self.reader_task:
             self.reader_task.cancel()
             try:
                 await self.reader_task
             except asyncio.CancelledError:
                 pass
+            self.reader_task = None
 
 
 _rpc = RpcClient()

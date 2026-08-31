@@ -2,13 +2,18 @@ import asyncio as _ptc_asyncio
 import json as _ptc_json
 import os as _ptc_os
 import sys as _ptc_sys
+import time as _ptc_time
 import traceback as _ptc_traceback
 from typing import Any, Callable, Coroutine, Iterable, Sequence
 
 _current_line = 0
+_last_reported_line = 0
+_last_progress_at = 0.0
+_PTC_PROGRESS_INTERVAL_SECONDS = 0.05
 _PTC_HOST_WORKSPACE_ROOT = globals().get("PTC_HOST_WORKSPACE_ROOT", _ptc_os.getcwd())
 _PTC_RUNTIME_WORKSPACE_ROOT = globals().get("PTC_RUNTIME_WORKSPACE_ROOT", _ptc_os.getcwd())
 _PTC_USER_CODE_LINE_COUNT = globals().get("PTC_USER_CODE_LINE_COUNT", 0)
+_PTC_MAX_OUTPUT_CHARS = max(1, int(globals().get("PTC_MAX_OUTPUT_CHARS", 100_000)))
 _ORIGINAL_STDOUT = _ptc_sys.stdout
 
 
@@ -23,12 +28,21 @@ _ptc_protocol_write = _emit_protocol
 class _StdoutProxy:
     def __init__(self):
         self._buffer = ""
+        self.total_chars = 0
+        self.accepted_chars = 0
 
     def write(self, text: str) -> int:
         if not text:
             return 0
 
-        self._buffer += text
+        self.total_chars += len(text)
+        remaining = _PTC_MAX_OUTPUT_CHARS - self.accepted_chars
+        if remaining <= 0:
+            return len(text)
+
+        accepted = text[:remaining]
+        self.accepted_chars += len(accepted)
+        self._buffer += accepted
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             _emit_protocol({"type": "stdout", "text": f"{line}\n"})
@@ -43,6 +57,28 @@ class _StdoutProxy:
 _stdout_proxy = _StdoutProxy()
 
 
+def _report_execution_progress(lineno: int, force: bool = False) -> None:
+    global _last_progress_at, _last_reported_line
+
+    # sys.settrace fires for every executed line. Emitting and flushing one JSON
+    # frame per event can fill the pipe and starve the Node event loop/SIGCHLD
+    # handling during tight loops. Repeated lines need no redraw, and changed
+    # lines are capped at 20 updates/second.
+    if lineno == _last_reported_line:
+        return
+
+    now = _ptc_time.monotonic()
+    if not force and _last_progress_at and now - _last_progress_at < _PTC_PROGRESS_INTERVAL_SECONDS:
+        return
+
+    try:
+        _emit_protocol({"type": "execution_progress", "line": lineno, "total_lines": _PTC_USER_CODE_LINE_COUNT})
+        _last_reported_line = lineno
+        _last_progress_at = now
+    except Exception:
+        pass
+
+
 def _trace_lines(frame, event, arg):
     global _current_line
 
@@ -54,10 +90,7 @@ def _trace_lines(frame, event, arg):
         # The first body line therefore maps to user line 1, not 2.
         lineno = frame.f_lineno - frame.f_code.co_firstlineno
         _current_line = lineno
-        try:
-            _emit_protocol({"type": "execution_progress", "line": lineno, "total_lines": _PTC_USER_CODE_LINE_COUNT})
-        except Exception:
-            pass
+        _report_execution_progress(lineno)
 
     return _trace_lines
 
@@ -248,8 +281,20 @@ async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
         _stdout_proxy.flush()
         _ptc_sys.stdout = _ORIGINAL_STDOUT
         _ptc_sys.settrace(None)
+        # Ensure short executions and the final line are observable even when
+        # the regular progress update was suppressed by the rate limit.
+        if _current_line:
+            _report_execution_progress(_current_line, force=True)
         images = _capture_figures()
-        _emit_protocol({"type": "complete", "output": _stringify_output(output), "images": images})
+        final_output = _stringify_output(output)
+        total_output_chars = _stdout_proxy.total_chars + len(final_output)
+        remaining_output_chars = max(0, _PTC_MAX_OUTPUT_CHARS - _stdout_proxy.accepted_chars)
+        _emit_protocol({
+            "type": "complete",
+            "output": final_output[:remaining_output_chars],
+            "images": images,
+            "total_output_chars": total_output_chars,
+        })
     except Exception as error:
         _ptc_sys.stdout = _ORIGINAL_STDOUT
         _ptc_sys.settrace(None)

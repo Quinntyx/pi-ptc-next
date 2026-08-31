@@ -5,6 +5,8 @@ import type { ToolUpdateCallback } from "./tool-types";
 
 export interface SandboxManager {
   spawn(code: string, cwd: string): ChildProcess;
+  /** Terminate one execution. Implementations may kill its whole process group. */
+  terminate?(proc: ChildProcess, signal: NodeJS.Signals): boolean;
   getRuntimeWorkspaceRoot(cwd: string): string;
   cleanup(): Promise<void>;
 }
@@ -32,7 +34,7 @@ export type RpcMessage =
   | { type: "tool_result"; id: string; value?: unknown; error?: RpcErrorPayload }
   | { type: "execution_progress"; line: number; total_lines: number }
   | { type: "stdout"; text: string }
-  | { type: "complete"; output: string; images?: PtcImageArtifact[] }
+  | { type: "complete"; output: string; images?: PtcImageArtifact[]; total_output_chars?: number }
   | { type: "error"; message: string; traceback?: string }
   | { type: "update"; message: string };
 

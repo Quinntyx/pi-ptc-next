@@ -39,3 +39,15 @@ test("createSandbox rejects implicit unsandboxed subprocess mode", async () => {
     /PTC requires a sandboxed runtime/
   );
 });
+
+test("subprocess sandbox cleanup terminates and reaps active Python executions", async () => {
+  const sandbox = await createSandbox({ useDocker: false, allowUnsandboxedSubprocess: true });
+  const proc = sandbox.spawn("import time; time.sleep(60)", process.cwd());
+  const exited = new Promise((resolve) => proc.once("exit", resolve));
+
+  await sandbox.cleanup();
+  await exited;
+
+  assert.notEqual(proc.signalCode, null);
+  assert.equal(proc.exitCode === null || proc.exitCode === 0, true);
+});

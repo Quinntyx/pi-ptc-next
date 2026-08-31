@@ -83,12 +83,24 @@ function validateStdoutMessage(value: Record<string, unknown>): Extract<RpcMessa
 }
 
 function validateCompleteMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "complete" }> {
-  if (isString(value.output)) {
+  const totalOutputChars = value.total_output_chars;
+  if (
+    isString(value.output) &&
+    (totalOutputChars === undefined ||
+      (typeof totalOutputChars === "number" && Number.isFinite(totalOutputChars) && totalOutputChars >= 0))
+  ) {
     const images = Array.isArray(value.images) ? (value.images as any) : undefined;
-    return { type: "complete", output: value.output, images };
+    return {
+      type: "complete",
+      output: value.output,
+      images,
+      total_output_chars: totalOutputChars,
+    };
   }
 
-  throw new PtcProtocolError("Invalid complete frame: expected string output.");
+  throw new PtcProtocolError(
+    "Invalid complete frame: expected string output and optional non-negative total_output_chars."
+  );
 }
 
 function validateErrorMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "error" }> {
@@ -148,15 +160,35 @@ function serializeError(error: unknown): RpcErrorPayload {
   };
 }
 
+const DEFAULT_MAX_OUTPUT_CHARS = 100_000;
+const MAX_STDERR_CHARS = 64_000;
+const EXIT_FRAME_GRACE_MS = 100;
+const NATURAL_EXIT_GRACE_MS = 250;
+const TERMINATION_GRACE_MS = 1_000;
+
+export interface RpcProtocolOptions {
+  maxOutputChars?: number;
+  /** Abort nested host tools when the Python execution fails or times out. */
+  onFailure?: (error: Error) => void;
+  /** Sandbox-aware termination (for example, killing a local process group). */
+  terminateProcess?: (signal: NodeJS.Signals) => boolean;
+}
+
 export class RpcProtocol {
   private lineReader: readline.Interface;
   private completionPromise: Promise<CodeExecutionResult>;
   private completionResolve!: (value: CodeExecutionResult) => void;
   private completionReject!: (error: Error) => void;
+  private processExitPromise: Promise<void>;
+  private processExitResolve!: () => void;
   private stderr = "";
+  private stderrCharsSeen = 0;
   private stdout = "";
+  private stdoutCharsSeen = 0;
   private userCodeLines: string[];
   private completed = false;
+  private succeeded = false;
+  private processExited = false;
   private unexpectedExitMessage: string | null = null;
   private startedAt = Date.now();
   private nestedToolCalls = 0;
@@ -167,17 +199,31 @@ export class RpcProtocol {
   private currentLine?: number;
   private totalLines?: number;
   private activeTool?: string;
+  private executionTimeout?: NodeJS.Timeout;
+  private exitFrameTimer?: NodeJS.Timeout;
+  private forceKillTimer?: NodeJS.Timeout;
+  private abortHandler?: () => void;
+  private readonly maxOutputChars: number;
 
   constructor(
     private proc: ChildProcess,
     private runTool: RunTool,
     userCode: string,
     private signal?: AbortSignal,
-    private onUpdate?: AgentToolUpdateCallback<unknown>
+    private onUpdate?: AgentToolUpdateCallback<unknown>,
+    private options: RpcProtocolOptions = {}
   ) {
     this.userCodeLines = userCode.split("\n");
+    this.maxOutputChars = Number.isFinite(options.maxOutputChars) && (options.maxOutputChars as number) > 0
+      ? Math.floor(options.maxOutputChars as number)
+      : DEFAULT_MAX_OUTPUT_CHARS;
+
+    if (!proc.stdout) {
+      throw new PtcTransportError("Python process did not expose stdout for the RPC protocol.");
+    }
+
     this.lineReader = readline.createInterface({
-      input: proc.stdout!,
+      input: proc.stdout,
       crlfDelay: Infinity,
     });
 
@@ -185,8 +231,17 @@ export class RpcProtocol {
       this.completionResolve = resolve;
       this.completionReject = reject;
     });
+    // Keep lifecycle cleanup safe even when a caller abandons or replaces the
+    // waiter; consumers awaiting the original promise still receive the error.
+    void this.completionPromise.catch(() => undefined);
+    this.processExitPromise = new Promise((resolve) => {
+      this.processExitResolve = resolve;
+    });
 
     this.lineReader.on("line", (line) => {
+      if (this.completed) {
+        return;
+      }
       void this.handleLine(line).catch((error) => {
         this.rejectOnce(error instanceof Error ? error : new PtcProtocolError(String(error)));
       });
@@ -202,42 +257,119 @@ export class RpcProtocol {
     });
 
     proc.stderr?.on("data", (data) => {
-      this.stderr += data.toString();
+      const text = data.toString();
+      this.stderrCharsSeen += text.length;
+      const remaining = MAX_STDERR_CHARS - this.stderr.length;
+      if (remaining > 0) {
+        this.stderr += text.slice(0, remaining);
+      }
+    });
+
+    proc.stdin?.on("error", (error) => {
+      this.rejectOnce(new PtcTransportError(`Python process stdin failed: ${error.message}`));
     });
 
     proc.on("exit", (code, exitSignal) => {
+      this.processExited = true;
+      this.processExitResolve();
+      this.clearForceKillTimer();
+
       if (this.completed) {
         return;
       }
 
       const exitDescriptor = exitSignal ? `signal ${exitSignal}` : code === null ? "unknown status" : `code ${code}`;
-      const stderrSuffix = this.stderr.trim() ? `\n${this.stderr.trim()}` : "";
-      this.unexpectedExitMessage = `Python process exited with ${exitDescriptor} before completing the RPC protocol.${stderrSuffix}`;
+      this.unexpectedExitMessage = `Python process exited with ${exitDescriptor} before completing the RPC protocol.`;
+
+      // `exit` can precede the final buffered stdout frame. Give readline a
+      // brief chance to parse it, but do not wait forever when a grandchild
+      // inherited stdout and keeps the pipe open.
+      this.exitFrameTimer = setTimeout(() => {
+        if (!this.completed) {
+          this.rejectUnexpectedTransport(this.buildUnexpectedExitMessage());
+        }
+      }, EXIT_FRAME_GRACE_MS);
     });
 
-    proc.on("error", (err) => {
-      this.rejectOnce(new PtcTransportError(`Python process transport error: ${err.message}`));
+    proc.on("error", (error) => {
+      this.processExited = true;
+      this.processExitResolve();
+      this.rejectOnce(new PtcTransportError(`Python process transport error: ${error.message}`), false);
     });
 
     if (signal) {
-      signal.addEventListener(
-        "abort",
-        () => {
-          this.terminateProcess();
-          this.rejectOnce(new PtcAbortError("Execution aborted"));
-        },
-        { once: true }
-      );
+      this.abortHandler = () => {
+        this.rejectOnce(new PtcAbortError("Execution aborted"));
+      };
+      if (signal.aborted) {
+        queueMicrotask(this.abortHandler);
+      } else {
+        signal.addEventListener("abort", this.abortHandler, { once: true });
+      }
+    }
+  }
+
+  private isProcessRunning(): boolean {
+    return !this.processExited && this.proc.exitCode === null && this.proc.signalCode === null;
+  }
+
+  private clearForceKillTimer(): void {
+    if (this.forceKillTimer) {
+      clearTimeout(this.forceKillTimer);
+      this.forceKillTimer = undefined;
+    }
+  }
+
+  private clearSettlementResources(): void {
+    if (this.executionTimeout) {
+      clearTimeout(this.executionTimeout);
+      this.executionTimeout = undefined;
+    }
+    if (this.exitFrameTimer) {
+      clearTimeout(this.exitFrameTimer);
+      this.exitFrameTimer = undefined;
+    }
+    if (this.signal && this.abortHandler) {
+      this.signal.removeEventListener("abort", this.abortHandler);
+      this.abortHandler = undefined;
+    }
+  }
+
+  private sendSignal(signal: NodeJS.Signals): boolean {
+    if (!this.isProcessRunning()) {
+      return false;
+    }
+
+    try {
+      return this.options.terminateProcess
+        ? this.options.terminateProcess(signal)
+        : this.proc.kill(signal);
+    } catch {
+      return false;
     }
   }
 
   private terminateProcess(): void {
-    this.proc.kill("SIGTERM");
-    setTimeout(() => {
-      if (this.proc.exitCode === null) {
-        this.proc.kill("SIGKILL");
+    if (!this.sendSignal("SIGTERM")) {
+      return;
+    }
+
+    this.clearForceKillTimer();
+    this.forceKillTimer = setTimeout(() => {
+      if (this.isProcessRunning()) {
+        this.sendSignal("SIGKILL");
       }
-    }, 5000);
+    }, TERMINATION_GRACE_MS);
+    this.forceKillTimer.unref?.();
+  }
+
+  private buildUnexpectedExitMessage(): string {
+    const base = this.unexpectedExitMessage || "Python process exited before completing the RPC protocol.";
+    const stderr = this.stderr.trim();
+    const truncated = this.stderrCharsSeen > this.stderr.length
+      ? `\n[stderr truncated - showing first ${MAX_STDERR_CHARS} characters of ${this.stderrCharsSeen}]`
+      : "";
+    return `${base}${stderr ? `\n${stderr}` : ""}${truncated}`;
   }
 
   private appendStdout(text: string): void {
@@ -245,7 +377,24 @@ export class RpcProtocol {
       return;
     }
 
-    this.stdout = this.stdout ? `${this.stdout}${text}` : text;
+    this.stdoutCharsSeen += text.length;
+    const remaining = this.maxOutputChars - this.stdout.length;
+    if (remaining > 0) {
+      this.stdout += text.slice(0, remaining);
+    }
+  }
+
+  private buildFinalOutput(finalText: string, reportedTotalChars?: number): string {
+    const observedChars = this.stdoutCharsSeen + finalText.length;
+    const totalChars = Math.max(observedChars, reportedTotalChars ?? observedChars);
+    const remaining = this.maxOutputChars - this.stdout.length;
+    const retainedFinal = remaining > 0 ? finalText.slice(0, remaining) : "";
+    const retained = this.stdoutCharsSeen > 0 ? `${this.stdout}${retainedFinal}`.trim() : retainedFinal;
+
+    if (totalChars <= this.maxOutputChars) {
+      return retained;
+    }
+    return `${retained}\n\n[Output truncated - showing first ${this.maxOutputChars} characters of ${totalChars}]`;
   }
 
   private resolveOnce(result: CodeExecutionResult): void {
@@ -253,19 +402,31 @@ export class RpcProtocol {
       return;
     }
     this.completed = true;
+    this.succeeded = true;
+    this.clearSettlementResources();
     this.completionResolve(result);
   }
 
-  private rejectOnce(error: Error): void {
+  private rejectOnce(error: Error, terminate = true): void {
     if (this.completed) {
       return;
     }
     this.completed = true;
+    this.clearSettlementResources();
+
+    try {
+      this.options.onFailure?.(error);
+    } catch {
+      // Failure cleanup is best-effort and must not replace the original error.
+    }
+    if (terminate) {
+      this.terminateProcess();
+    }
     this.completionReject(error);
   }
 
   private rejectUnexpectedTransport(message: string): void {
-    this.rejectOnce(new PtcTransportError(message));
+    this.rejectOnce(new PtcTransportError(message), this.isProcessRunning());
   }
 
   private buildExecutionDetails(overrides?: Partial<ExecutionDetails>): ExecutionDetails {
@@ -298,6 +459,9 @@ export class RpcProtocol {
   }
 
   private async handleLine(line: string): Promise<void> {
+    if (this.completed) {
+      return;
+    }
     const msg = this.parseMessage(line);
 
     switch (msg.type) {
@@ -309,44 +473,33 @@ export class RpcProtocol {
         this.currentLine = msg.line;
         this.totalLines = msg.total_lines;
         this.activeTool = undefined;
-        if (this.onUpdate) {
-          this.onUpdate({
-            content: [
-              {
-                type: "text",
-                text: `Executing line ${msg.line}/${msg.total_lines}`,
-              },
-            ],
-            details: this.buildExecutionDetails(),
-          });
-        }
+        this.onUpdate?.({
+          content: [{ type: "text", text: `Executing line ${msg.line}/${msg.total_lines}` }],
+          details: this.buildExecutionDetails(),
+        });
         break;
 
       case "stdout":
         this.appendStdout(msg.text);
         break;
 
-      case "complete": {
-        const finalOutput = this.stdout ? `${this.stdout}${msg.output}`.trim() : msg.output;
+      case "complete":
         this.resolveOnce({
-          output: finalOutput,
+          output: this.buildFinalOutput(msg.output, msg.total_output_chars),
           images: msg.images,
           details: this.buildExecutionDetails(),
         });
         break;
-      }
 
       case "error":
         this.rejectOnce(new PtcPythonError(msg.message, msg.traceback));
         break;
 
       case "update":
-        if (this.onUpdate) {
-          this.onUpdate({
-            content: [{ type: "text", text: msg.message }],
-            details: this.buildExecutionDetails(),
-          });
-        }
+        this.onUpdate?.({
+          content: [{ type: "text", text: msg.message }],
+          details: this.buildExecutionDetails(),
+        });
         break;
     }
   }
@@ -356,61 +509,101 @@ export class RpcProtocol {
     this.nestedToolNames.push(msg.tool);
     this.activeTool = msg.tool;
 
-    if (this.onUpdate) {
-      this.onUpdate({
-        content: [{ type: "text", text: `Calling ${msg.tool}()` }],
-        details: this.buildExecutionDetails(),
-      });
-    }
+    this.onUpdate?.({
+      content: [{ type: "text", text: `Calling ${msg.tool}()` }],
+      details: this.buildExecutionDetails(),
+    });
 
+    let response: RpcMessage;
     try {
       const result = await this.runTool(msg.tool, msg.params, msg.id);
-      const normalized = normalizeToolResult(msg.tool, result as { content?: Array<Record<string, unknown>>; details?: unknown });
+      const normalized = normalizeToolResult(
+        msg.tool,
+        result as { content?: Array<Record<string, unknown>>; details?: unknown }
+      );
       this.nestedResultCount += 1;
       this.nestedResultChars += normalized.estimatedChars;
-
-      this.send({
-        type: "tool_result",
-        id: msg.id,
-        value: normalized.value,
-      });
+      response = { type: "tool_result", id: msg.id, value: normalized.value };
     } catch (error) {
       this.nestedErrors += 1;
-      this.send({
-        type: "tool_result",
-        id: msg.id,
-        error: serializeError(error),
-      });
+      response = { type: "tool_result", id: msg.id, error: serializeError(error) };
     } finally {
       this.activeTool = undefined;
+    }
+
+    if (!this.completed) {
+      this.send(response);
     }
   }
 
   private send(msg: RpcMessage): void {
-    if (this.proc.stdin && !this.proc.stdin.destroyed) {
-      this.proc.stdin.write(JSON.stringify(msg) + "\n");
+    if (!this.proc.stdin || this.proc.stdin.destroyed || this.proc.stdin.writableEnded) {
+      throw new PtcTransportError("Python process stdin closed before a tool result could be delivered.");
     }
+
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(msg);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new PtcProtocolError(`Failed to serialize tool result: ${detail}`);
+    }
+    this.proc.stdin.write(`${serialized}\n`);
   }
 
   async waitForCompletion(timeoutMs?: number): Promise<CodeExecutionResult> {
-    if (timeoutMs === undefined) {
-      return this.completionPromise;
+    if (timeoutMs !== undefined && !this.executionTimeout && !this.completed) {
+      this.executionTimeout = setTimeout(() => {
+        this.rejectOnce(
+          new PtcTimeoutError(`Execution timed out after ${Math.round(timeoutMs / 1000)} seconds`)
+        );
+      }, timeoutMs);
+    }
+    return this.completionPromise;
+  }
+
+  private waitForProcessExit(timeoutMs: number): Promise<boolean> {
+    if (!this.isProcessRunning()) {
+      return Promise.resolve(true);
     }
 
-    return await Promise.race([
-      this.completionPromise,
-      new Promise<CodeExecutionResult>((_, reject) => {
-        const timeoutId = setTimeout(() => {
-          this.terminateProcess();
-          reject(
-            new PtcTimeoutError(
-              `Execution timed out after ${Math.round(timeoutMs / 1000)} seconds`
-            )
-          );
-        }, timeoutMs);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (exited: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve(exited);
+      };
+      const timer = setTimeout(() => finish(!this.isProcessRunning()), timeoutMs);
+      void this.processExitPromise.then(() => finish(true));
+    });
+  }
 
-        this.completionPromise.finally(() => clearTimeout(timeoutId)).catch(() => undefined);
-      }),
-    ]);
+  /** Ensure the child has exited (and therefore been reaped) before returning. */
+  async dispose(): Promise<void> {
+    this.clearSettlementResources();
+
+    if (this.succeeded && this.isProcessRunning()) {
+      // No more tool responses are expected after a terminal complete frame.
+      // Closing stdin also lets Python's reader task observe EOF during cleanup.
+      this.proc.stdin?.end();
+      await this.waitForProcessExit(NATURAL_EXIT_GRACE_MS);
+    }
+
+    if (this.isProcessRunning()) {
+      this.terminateProcess();
+      await this.waitForProcessExit(TERMINATION_GRACE_MS + 100);
+    }
+
+    if (this.isProcessRunning()) {
+      this.sendSignal("SIGKILL");
+      await this.waitForProcessExit(TERMINATION_GRACE_MS);
+    }
+
+    this.clearForceKillTimer();
+    this.lineReader.close();
   }
 }
