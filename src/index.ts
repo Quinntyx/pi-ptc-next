@@ -227,7 +227,7 @@ function buildCodeExecutionTool(
 ): PtcToolDefinition {
   return {
     name: "code_execution",
-    label: "Code Execution",
+    label: "python",
     description: buildToolDescription(currentSettings, callableTools),
     parameters: Type.Object({
       code: Type.String({
