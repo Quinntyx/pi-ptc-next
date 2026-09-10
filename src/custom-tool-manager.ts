@@ -4,7 +4,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import type { LoadedTool, PtcToolDefinition } from "./contracts/tool-types";
 import type { ToolRegistry } from "./tool-registry";
-import { debugLog, logWarning } from "./utils";
+import { debugLog, logWarning, withActivityLabel } from "./utils";
 
 function buildRegisteredTool(definition: PtcToolDefinition): PtcToolDefinition {
   return {
@@ -180,7 +180,7 @@ export class CustomToolManager {
     }
 
     this.toolRegistry.upsertTool(loadedTool.tool);
-    this.pi.registerTool(loadedTool.tool);
+    this.pi.registerTool(withActivityLabel(loadedTool.tool));
     this.setToolActive(loadedTool.tool.name, loadedTool.tool);
     this.fileToTool.set(loadedTool.filename, loadedTool.tool.name);
     this.onToolSetChanged?.();

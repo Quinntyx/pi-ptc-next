@@ -26,7 +26,13 @@ import { createSandbox } from "./sandbox-manager";
 import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
-import { debugLog, isMutationPrompt, loadSettingsFromEnv, shouldAutoRoutePromptToCodeExecution } from "./utils";
+import {
+  debugLog,
+  isMutationPrompt,
+  loadSettingsFromEnv,
+  shouldAutoRoutePromptToCodeExecution,
+  withActivityLabel,
+} from "./utils";
 import {
   CODE_VIEW_FULL_THRESHOLD,
   CODE_VIEW_HEIGHT,
@@ -390,7 +396,7 @@ function registerCodeExecutionTool(
   sessionState: PtcSessionState
 ): void {
   const callableTools = toolRegistry.getCallableTools(currentCwd, settings);
-  pi.registerTool(buildCodeExecutionTool(settings, callableTools, codeExecutor, sessionState));
+  pi.registerTool(withActivityLabel(buildCodeExecutionTool(settings, callableTools, codeExecutor, sessionState)));
 }
 
 function registerCodeExecutionToolForState(

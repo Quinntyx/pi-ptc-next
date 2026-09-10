@@ -170,3 +170,21 @@ export function debugLog(message: string, ...args: unknown[]): void {
 export function logWarning(message: string, ...args: unknown[]): void {
   process.emitWarning(formatLogMessage(message, args), { code: "PTC" });
 }
+
+/**
+ * pi-tool-tree labels each tool call with a model-supplied `activity` word and groups
+ * neighboring calls by it. It publishes its wrapper on globalThis so other extensions
+ * can opt in without a cross-package import, and so the wrapper can be a no-op when
+ * that extension is not installed or its `toolActivityParam` setting is off. The
+ * wrapper adds an `activity` property to the schema, defaults a missing label, and
+ * strips the label again before `execute` receives the arguments.
+ */
+export function withActivityLabel<T extends object>(tool: T): T {
+  const integration = (
+    globalThis as unknown as Record<symbol, { wrapTool?: (tool: unknown) => unknown } | undefined>
+  )[Symbol.for("pi-tool-tree:activity-api")];
+  if (typeof integration?.wrapTool !== "function") {
+    return tool;
+  }
+  return integration.wrapTool(tool) as T;
+}
