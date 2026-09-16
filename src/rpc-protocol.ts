@@ -10,7 +10,7 @@ import {
 } from "./execution/execution-errors";
 import { normalizeToolResult } from "./tool-adapters";
 import { estimateTokensFromChars } from "./utils";
-import type { CodeExecutionResult, ExecutionDetails, RpcErrorPayload, RpcMessage } from "./contracts/execution-types";
+import type { CodeExecutionResult, ExecutionDetails, RpcErrorPayload, RpcMessage, SubagentRuntimeSnapshot } from "./contracts/execution-types";
 
 type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Promise<unknown>;
 
@@ -123,6 +123,55 @@ function validateUpdateMessage(value: Record<string, unknown>): Extract<RpcMessa
   throw new PtcProtocolError("Invalid update frame: expected string message.");
 }
 
+function validateExecDoneMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "exec_done" }> {
+  if (!isString(value.id) || !isString(value.output)) {
+    throw new PtcProtocolError("Invalid exec_done frame: expected string id and output.");
+  }
+  const totalOutputChars = value.total_output_chars;
+  if (totalOutputChars !== undefined && !(typeof totalOutputChars === "number" && Number.isFinite(totalOutputChars) && totalOutputChars >= 0)) {
+    throw new PtcProtocolError("Invalid exec_done frame: total_output_chars must be a non-negative number.");
+  }
+  return {
+    type: "exec_done",
+    id: value.id,
+    output: value.output,
+    images: Array.isArray(value.images) ? (value.images as never) : undefined,
+    total_output_chars: totalOutputChars,
+  };
+}
+
+function validateExecErrorMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "exec_error" }> {
+  if (!isString(value.id) || !isString(value.message) || (value.traceback !== undefined && !isString(value.traceback))) {
+    throw new PtcProtocolError("Invalid exec_error frame: expected string id/message and optional traceback.");
+  }
+  return { type: "exec_error", id: value.id, message: value.message, traceback: value.traceback };
+}
+
+function validateSessionReadyMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "session_ready" }> {
+  return { type: "session_ready" };
+}
+
+function validateSubagentStateMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "subagent_state" }> {
+  if (!isRecord(value.snapshot) || !Array.isArray(value.snapshot.agents)) {
+    throw new PtcProtocolError("Invalid subagent_state frame: expected object snapshot with an agents array.");
+  }
+  return { type: "subagent_state", snapshot: value.snapshot as unknown as SubagentRuntimeSnapshot };
+}
+
+function validateScriptExportedMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "script_exported" }> {
+  if (!isString(value.id) || !isString(value.path) || typeof value.cells !== "number") {
+    throw new PtcProtocolError("Invalid script_exported frame: expected string id/path and numeric cells.");
+  }
+  return {
+    type: "script_exported",
+    id: value.id,
+    path: value.path,
+    cells: value.cells,
+    wrapped_async: value.wrapped_async === true,
+    error: isString(value.error) ? value.error : undefined,
+  };
+}
+
 const RPC_MESSAGE_VALIDATORS: { [K in RpcMessageType]: RpcMessageValidator<K> } = {
   tool_call: validateToolCallMessage,
   tool_result: validateToolResultMessage,
@@ -131,9 +180,14 @@ const RPC_MESSAGE_VALIDATORS: { [K in RpcMessageType]: RpcMessageValidator<K> } 
   complete: validateCompleteMessage,
   error: validateErrorMessage,
   update: validateUpdateMessage,
+  exec_done: validateExecDoneMessage,
+  exec_error: validateExecErrorMessage,
+  session_ready: validateSessionReadyMessage,
+  subagent_state: validateSubagentStateMessage,
+  script_exported: validateScriptExportedMessage,
 };
 
-function validateRpcMessage(value: unknown): RpcMessage {
+export function validateRpcMessage(value: unknown): RpcMessage {
   if (!isRecord(value) || !isString(value.type)) {
     throw new PtcProtocolError("RPC frame must be an object with a string type field.");
   }

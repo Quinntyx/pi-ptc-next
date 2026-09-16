@@ -19,7 +19,161 @@ function setModuleExports(modulePath, exports) {
   };
 }
 
-test("ptc extension bootstraps and cleans up runtime components", async () => {
+function makeFakeSessionManager(sandbox) {
+  return class FakePythonSessionManager {
+    static lastInstance = null;
+
+    constructor(sandboxManager, toolRegistry, settings, extensionRoot, hooks) {
+      this.sandboxManager = sandboxManager;
+      this.toolRegistry = toolRegistry;
+      this.settings = settings;
+      this.extensionRoot = extensionRoot;
+      this.hooks = hooks ?? {};
+      FakePythonSessionManager.lastInstance = this;
+      if (sandbox.instances !== undefined) {
+        sandbox.instances += 1;
+      }
+    }
+
+    async provision() {
+      return { id: "s1" };
+    }
+
+    async execForeground(sessionId, code) {
+      return this.execute(sessionId, code);
+    }
+
+    async execBackground() {
+      return { execId: "bg-1" };
+    }
+
+    async waitForExec() {
+      return this.execute("s1", "wait_for");
+    }
+
+    async toScript() {
+      return { path: "/tmp/script.py", cells: 2, wrappedAsync: false };
+    }
+
+    pendingBackground() {
+      return [];
+    }
+
+    list() {
+      return [];
+    }
+
+    mostRecentActive() {
+      return null;
+    }
+
+    allSubagentSnapshots() {
+      return [];
+    }
+
+    getSubagentSnapshot() {
+      return null;
+    }
+
+    async markBackgrounded() {
+      return null;
+    }
+
+    async dispose() {}
+
+    async disposeAll() {}
+
+    async execute(_sessionId, _code) {
+      return {
+        output: "ok",
+        details: {
+          nestedToolCalls: 0,
+          nestedToolNames: [],
+          nestedResultChars: 0,
+          nestedResultCount: 0,
+          nestedErrors: 0,
+          durationMs: 1,
+          estimatedAvoidedTokens: 0,
+        },
+      };
+    }
+  };
+}
+
+function buildPi({ eventHandlers, registered, activeTools }) {
+  const commands = {};
+  const pi = {
+    registerTool(tool) {
+      registered.push(tool);
+    },
+    registerCommand(name, definition) {
+      commands[name] = definition;
+    },
+    commands,
+    on(event, handler) {
+      eventHandlers.set(event, handler);
+    },
+    getAllTools() {
+      return [{ name: "python_exec" }];
+    },
+    getActiveTools() {
+      return [...activeTools];
+    },
+    setActiveTools(next) {
+      activeTools.splice(0, activeTools.length, ...next);
+    },
+  };
+  return { pi, commands };
+}
+
+function restoreInjectedModules(sandbox, overrides = {}) {
+  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
+    createSandbox: async () => sandbox,
+  });
+  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
+    CustomToolManager: class FakeCustomToolManager {
+      async start() {}
+      close() {}
+    },
+  });
+  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
+    ToolRegistry: class FakeToolRegistry {
+      getCallableTools() {
+        return [];
+      }
+
+      getAutoRoutableToolNames() {
+        return ["read", "grep"];
+      }
+    },
+  });
+  const FakeSessionManager = makeFakeSessionManager(sandbox);
+  for (const [method, implementation] of Object.entries(overrides)) {
+    FakeSessionManager.prototype[method] = implementation;
+  }
+  const restoreSessions = setModuleExports("../dist/python-session-manager.js", {
+    PythonSessionManager: FakeSessionManager,
+  });
+  return () => {
+    restoreSandbox();
+    restoreManager();
+    restoreRegistry();
+    restoreSessions();
+  };
+}
+
+async function loadExtension() {
+  delete require.cache[require.resolve("../dist/index.js")];
+  const extensionModule = require("../dist/index.js");
+  const ptcExtension = extensionModule.default || extensionModule;
+  return ptcExtension;
+}
+
+function toolResultDetails(result) {
+  return result.details;
+}
+
+test("ptc extension bootstraps session tools, the /ptc command, and cleans up runtime components", async () => {
   const sandbox = {
     cleanupCalls: 0,
     spawn() {
@@ -34,7 +188,6 @@ test("ptc extension bootstraps and cleans up runtime components", async () => {
   };
 
   let managerInstance = null;
-  let codeExecutorInstance = null;
 
   class FakeCustomToolManager {
     constructor(extensionRoot, pi, toolRegistry, onToolSetChanged) {
@@ -57,11 +210,10 @@ test("ptc extension bootstraps and cleans up runtime components", async () => {
     }
   }
 
-  class FakeToolRegistry {
-    constructor(pi) {
-      this.pi = pi;
-    }
-
+  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
+    CustomToolManager: FakeCustomToolManager,
+  });
+  const FakeToolRegistry = class {
     getCallableTools() {
       return [];
     }
@@ -69,76 +221,33 @@ test("ptc extension bootstraps and cleans up runtime components", async () => {
     getAutoRoutableToolNames() {
       return ["read", "grep"];
     }
-  }
-
-  class FakeCodeExecutor {
-    constructor(sandboxManager, toolRegistry, settings, extensionRoot) {
-      this.sandboxManager = sandboxManager;
-      this.toolRegistry = toolRegistry;
-      this.settings = settings;
-      this.extensionRoot = extensionRoot;
-      codeExecutorInstance = this;
-    }
-
-    async execute() {
-      return {
-        output: "ok",
-        details: {
-          nestedToolCalls: 0,
-          nestedToolNames: [],
-          nestedResultChars: 0,
-          nestedResultCount: 0,
-          nestedErrors: 0,
-          durationMs: 1,
-          estimatedAvoidedTokens: 0,
-        },
-      };
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
+  };
   const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
     ToolRegistry: FakeToolRegistry,
   });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
+  const FakeSessionManager = makeFakeSessionManager(sandbox);
+  const restoreSessions = setModuleExports("../dist/python-session-manager.js", {
+    PythonSessionManager: FakeSessionManager,
+  });
+  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
+    createSandbox: async () => sandbox,
   });
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [];
-      },
-      getActiveTools() {
-        return [];
-      },
-      setActiveTools() {},
-    };
+    const { pi, commands } = buildPi({ eventHandlers, registered, activeTools: [] });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const codeExecutionTools = registered.filter((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTools.length >= 1);
+    const toolNames = registered.map((tool) => tool.name).sort();
+    assert.deepEqual(toolNames, ["provision_python_session", "python_exec", "python_session_to_script"]);
+    assert.ok(commands.ptc);
     assert.equal(managerInstance.started, 1);
-    assert.equal(codeExecutorInstance.sandboxManager, sandbox);
 
     await eventHandlers.get("session_shutdown")();
     assert.equal(managerInstance.closed, 1);
@@ -147,12 +256,12 @@ test("ptc extension bootstraps and cleans up runtime components", async () => {
     restoreSandbox();
     restoreManager();
     restoreRegistry();
-    restoreExecutor();
+    restoreSessions();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
 
-test("ptc extension auto-routes repo-wide analysis prompts toward code_execution", async () => {
+test("ptc extension auto-routes repo-wide analysis prompts toward python_exec", async () => {
   const sandbox = {
     async cleanup() {},
     spawn() {
@@ -163,73 +272,16 @@ test("ptc extension auto-routes repo-wide analysis prompts toward code_execution
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return ["read", "grep"];
-    }
-  }
-
-  class FakeCodeExecutor {
-    async execute() {
-      return {
-        output: "ok",
-        details: {
-          nestedToolCalls: 0,
-          nestedToolNames: [],
-          nestedResultChars: 0,
-          nestedResultCount: 0,
-          nestedErrors: 0,
-          durationMs: 1,
-          estimatedAvoidedTokens: 0,
-        },
-      };
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
-  });
+  const restore = restoreInjectedModules(sandbox);
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
+    const registered = [];
     const activeTools = ["read", "grep"];
-    const pi = {
-      registerTool() {},
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [...activeTools];
-      },
-      setActiveTools(next) {
-        activeTools.splice(0, activeTools.length, ...next);
-      },
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
@@ -239,19 +291,21 @@ test("ptc extension auto-routes repo-wide analysis prompts toward code_execution
       systemPrompt: "base prompt",
     });
 
-    assert.deepEqual(activeTools, ["code_execution"]);
-    assert.match(routeResult.systemPrompt, /Prefer calling code_execution first/);
+    assert.deepEqual(activeTools, ["python_exec", "provision_python_session"]);
+    assert.match(routeResult.systemPrompt, /strong fit for python_exec/);
+    assert.match(routeResult.systemPrompt, /provision_python_session/);
 
     eventHandlers.get("agent_end")();
     assert.deepEqual(activeTools, ["read", "grep"]);
   } finally {
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
+
+function restoreInjectedModulesNoOverrides(sandbox) {
+  return restoreInjectedModules(sandbox);
+}
 
 test("ptc extension does not auto-route or auto-recover mutation prompts", async () => {
   const previousAutoRecover = process.env.PTC_AUTO_RECOVER;
@@ -269,68 +323,23 @@ test("ptc extension does not auto-route or auto-recover mutation prompts", async
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return ["read", "grep"];
-    }
-  }
-
-  class FakeCodeExecutor {
-    async execute() {
+  const restore = restoreInjectedModules(sandbox, {
+    execForeground() {
       throw new PtcPythonError(
         "TypeError: object of type 'coroutine' has no len()",
         'Traceback (most recent call last):\n  File "<stdin>", line 2, in user_main'
       );
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
+    },
   });
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
     const activeTools = ["read", "grep"];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [...activeTools];
-      },
-      setActiveTools(next) {
-        activeTools.splice(0, activeTools.length, ...next);
-      },
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
@@ -343,13 +352,13 @@ test("ptc extension does not auto-route or auto-recover mutation prompts", async
     assert.equal(routeResult, undefined);
     assert.deepEqual(activeTools, ["read", "grep"]);
 
-    const codeExecutionTool = registered.find((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTool);
+    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    assert.ok(pythonExecTool);
 
     await assert.rejects(
-      codeExecutionTool.execute(
+      pythonExecTool.execute(
         "call-1",
-        { code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { session_id: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -365,10 +374,7 @@ test("ptc extension does not auto-route or auto-recover mutation prompts", async
     } else {
       process.env.PTC_AUTO_RECOVER = previousAutoRecover;
     }
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
@@ -384,118 +390,59 @@ test("ptc extension resets recovery state for each user request", async () => {
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return [];
-    }
-  }
-
-  const seenStates = [];
-  class FakeCodeExecutor {
-    async execute(_code, options) {
-      seenStates.push(options.recoveryState);
-      return {
-        output: "ok",
-        details: {
-          nestedToolCalls: 0,
-          nestedToolNames: [],
-          nestedResultChars: 0,
-          nestedResultCount: 0,
-          nestedErrors: 0,
-          durationMs: 1,
-          estimatedAvoidedTokens: 0,
-        },
-      };
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
+  const restore = restoreInjectedModules(sandbox, {
+    async execForeground() {
+      return successResult();
+    },
   });
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [];
-      },
-      setActiveTools() {},
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const codeExecutionTool = registered.find((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTool);
+    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
-    await codeExecutionTool.execute("call-1", { code: "return 1" }, undefined, undefined, { cwd: process.cwd() });
-    await codeExecutionTool.execute("call-2", { code: "return 2" }, undefined, undefined, { cwd: process.cwd() });
+    const firstResult = await pythonExecTool.execute("call-1", { session_id: "s1", code: "return 1" }, undefined, undefined, { cwd: process.cwd() });
+    const secondResult = await pythonExecTool.execute("call-2", { session_id: "s1", code: "return 2" }, undefined, undefined, { cwd: process.cwd() });
 
-    const firstRequestState = seenStates[0];
-    assert.equal(seenStates[1], firstRequestState);
-    assert.deepEqual(firstRequestState, {
+    const firstTelemetry = firstResult.details.telemetry;
+    assert.deepEqual(firstTelemetry, {
       autoRouted: false,
       firstToolPath: "code_execution",
-      routedToCodeExecution: true,
+      codeExecutionAttempts: 1,
+      recoveryAttemptCount: 0,
+      terminalState: "success",
+    });
+    assert.deepEqual(secondResult.details.telemetry, {
+      autoRouted: false,
+      firstToolPath: "code_execution",
       codeExecutionAttempts: 2,
-      recoveryAttempted: false,
-      failureClass: null,
+      recoveryAttemptCount: 0,
       terminalState: "success",
     });
 
     eventHandlers.get("agent_end")();
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
-    await codeExecutionTool.execute("call-3", { code: "return 3" }, undefined, undefined, { cwd: process.cwd() });
+    const thirdResult = await pythonExecTool.execute("call-3", { session_id: "s1", code: "return 3" }, undefined, undefined, { cwd: process.cwd() });
 
-    const secondRequestState = seenStates[2];
-    assert.notEqual(secondRequestState, firstRequestState);
-    assert.deepEqual(secondRequestState, {
+    assert.deepEqual(thirdResult.details.telemetry, {
       autoRouted: false,
       firstToolPath: "code_execution",
-      routedToCodeExecution: true,
       codeExecutionAttempts: 1,
-      recoveryAttempted: false,
-      failureClass: null,
+      recoveryAttemptCount: 0,
       terminalState: "success",
     });
   } finally {
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
@@ -518,77 +465,34 @@ test("ptc extension appends one targeted recovery message on the next turn after
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return [];
-    }
-  }
-
-  class FakeCodeExecutor {
-    async execute() {
+  const restore = restoreInjectedModules(sandbox, {
+    execForeground() {
       throw new PtcPythonError(
         "TypeError: object of type 'coroutine' has no len()",
         'Traceback (most recent call last):\n  File "<stdin>", line 2, in user_main'
       );
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
+    },
   });
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [];
-      },
-      setActiveTools() {},
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const codeExecutionTool = registered.find((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTool);
+    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
     await assert.rejects(
-      codeExecutionTool.execute(
+      pythonExecTool.execute(
         "call-1",
-        { code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { session_id: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -619,10 +523,7 @@ test("ptc extension appends one targeted recovery message on the next turn after
     } else {
       process.env.PTC_AUTO_RECOVER = previousAutoRecover;
     }
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
@@ -643,79 +544,36 @@ test("ptc extension does not append a second automatic recovery message after re
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return [];
-    }
-  }
-
   let attempts = 0;
-  class FakeCodeExecutor {
-    async execute() {
+  const restore = restoreInjectedModules(sandbox, {
+    execForeground() {
       attempts += 1;
       throw new PtcPythonError(
         "TypeError: 'coroutine' object is not iterable",
         'Traceback (most recent call last):\n  File "<stdin>", line 2, in user_main'
       );
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
+    },
   });
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [];
-      },
-      setActiveTools() {},
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const codeExecutionTool = registered.find((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTool);
+    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
     await assert.rejects(
-      codeExecutionTool.execute(
+      pythonExecTool.execute(
         "call-1",
-        { code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
+        { session_id: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -728,9 +586,9 @@ test("ptc extension does not append a second automatic recovery message after re
     assert.equal(firstContext.messages[0].customType, "ptc-recovery");
 
     await assert.rejects(
-      codeExecutionTool.execute(
+      pythonExecTool.execute(
         "call-2",
-        { code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
+        { session_id: "s1", code: "paths = sorted(glob('src/**/*.ts'))\nreturn paths[:3]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -747,15 +605,12 @@ test("ptc extension does not append a second automatic recovery message after re
     } else {
       process.env.PTC_AUTO_RECOVER = previousAutoRecover;
     }
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
 
-test("ptc extension includes recovery telemetry in successful code_execution details after one bounded retry", async () => {
+test("ptc extension includes recovery telemetry in successful python_exec details after one bounded retry", async () => {
   const previousAutoRecover = process.env.PTC_AUTO_RECOVER;
   process.env.PTC_AUTO_RECOVER = "true";
 
@@ -771,24 +626,9 @@ test("ptc extension includes recovery telemetry in successful code_execution det
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return [];
-    }
-  }
-
   let attempts = 0;
-  class FakeCodeExecutor {
-    async execute() {
+  const restore = restoreInjectedModules(sandbox, {
+    async execForeground() {
       attempts += 1;
       if (attempts === 1) {
         throw new PtcPythonError(
@@ -796,69 +636,29 @@ test("ptc extension includes recovery telemetry in successful code_execution det
           'Traceback (most recent call last):\n  File "<stdin>", line 2, in user_main'
         );
       }
-
-      return {
-        output: "ok",
-        details: {
-          nestedToolCalls: 0,
-          nestedToolNames: [],
-          nestedResultChars: 0,
-          nestedResultCount: 0,
-          nestedErrors: 0,
-          durationMs: 1,
-          estimatedAvoidedTokens: 0,
-        },
-      };
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
+      return successResult();
+    },
   });
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [];
-      },
-      setActiveTools() {},
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const codeExecutionTool = registered.find((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTool);
+    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
     await assert.rejects(
-      codeExecutionTool.execute(
+      pythonExecTool.execute(
         "call-1",
-        { code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
+        { session_id: "s1", code: "path = 'README.md'\ncontent = read(path)\nreturn len(content)" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -869,9 +669,9 @@ test("ptc extension includes recovery telemetry in successful code_execution det
     const firstContext = eventHandlers.get("context")({ messages: [] });
     assert.equal(firstContext.messages[0].customType, "ptc-recovery");
 
-    const result = await codeExecutionTool.execute(
+    const result = await pythonExecTool.execute(
       "call-2",
-      { code: "path = 'README.md'\ncontent = await read(path)\nreturn len(content)" },
+      { session_id: "s1", code: "path = 'README.md'\ncontent = await read(path)\nreturn len(content)" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -895,15 +695,12 @@ test("ptc extension includes recovery telemetry in successful code_execution det
     } else {
       process.env.PTC_AUTO_RECOVER = previousAutoRecover;
     }
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
 
-test("ptc extension includes first-path telemetry in non-recovered code_execution details", async () => {
+test("ptc extension includes first-path telemetry in non-recovered python_exec details", async () => {
   const sandbox = {
     async cleanup() {},
     spawn() {
@@ -914,76 +711,16 @@ test("ptc extension includes first-path telemetry in non-recovered code_executio
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return ["read", "grep"];
-    }
-  }
-
-  class FakeCodeExecutor {
-    async execute() {
-      return {
-        output: "ok",
-        details: {
-          nestedToolCalls: 0,
-          nestedToolNames: [],
-          nestedResultChars: 0,
-          nestedResultCount: 0,
-          nestedErrors: 0,
-          durationMs: 1,
-          estimatedAvoidedTokens: 0,
-        },
-      };
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
-  });
+  const restore = restoreInjectedModules(sandbox);
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
     const activeTools = ["read", "grep"];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [...activeTools];
-      },
-      setActiveTools(next) {
-        activeTools.splice(0, activeTools.length, ...next);
-      },
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
@@ -992,12 +729,12 @@ test("ptc extension includes first-path telemetry in non-recovered code_executio
       systemPrompt: "base prompt",
     });
 
-    const codeExecutionTool = registered.find((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTool);
+    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    assert.ok(pythonExecTool);
 
-    const result = await codeExecutionTool.execute(
+    const result = await pythonExecTool.execute(
       "call-1",
-      { code: "return 1" },
+      { session_id: "s1", code: "return 1" },
       undefined,
       undefined,
       { cwd: process.cwd() }
@@ -1016,10 +753,7 @@ test("ptc extension includes first-path telemetry in non-recovered code_executio
       terminalState: "success",
     });
   } finally {
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
@@ -1040,77 +774,34 @@ test("ptc extension does not auto-recover literal zero-match path failures", asy
     },
   };
 
-  class FakeCustomToolManager {
-    async start() {}
-    close() {}
-  }
-
-  class FakeToolRegistry {
-    getCallableTools() {
-      return [];
-    }
-
-    getAutoRoutableToolNames() {
-      return [];
-    }
-  }
-
-  class FakeCodeExecutor {
-    async execute() {
+  const restore = restoreInjectedModules(sandbox, {
+    execForeground() {
       throw new PtcPythonError(
         "FileNotFoundError: [Errno 2] No such file or directory: 'src/**/*.missing.ts'",
         'Traceback (most recent call last):\n  File "<stdin>", line 2, in user_main'
       );
-    }
-  }
-
-  const restoreSandbox = setModuleExports("../dist/sandbox-manager.js", {
-    createSandbox: async () => sandbox,
-  });
-  const restoreManager = setModuleExports("../dist/custom-tool-manager.js", {
-    CustomToolManager: FakeCustomToolManager,
-  });
-  const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
-    ToolRegistry: FakeToolRegistry,
-  });
-  const restoreExecutor = setModuleExports("../dist/code-executor.js", {
-    CodeExecutor: FakeCodeExecutor,
+    },
   });
 
   try {
-    delete require.cache[require.resolve("../dist/index.js")];
     const extensionModule = require("../dist/index.js");
     const ptcExtension = extensionModule.default || extensionModule;
 
     const eventHandlers = new Map();
     const registered = [];
-    const pi = {
-      registerTool(tool) {
-        registered.push(tool);
-      },
-      on(event, handler) {
-        eventHandlers.set(event, handler);
-      },
-      getAllTools() {
-        return [{ name: "code_execution" }];
-      },
-      getActiveTools() {
-        return [];
-      },
-      setActiveTools() {},
-    };
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
 
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const codeExecutionTool = registered.find((tool) => tool.name === "code_execution");
-    assert.ok(codeExecutionTool);
+    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
     await assert.rejects(
-      codeExecutionTool.execute(
+      pythonExecTool.execute(
         "call-1",
-        { code: "paths = await glob('src/**/*.missing.ts')\nreturn paths[0]" },
+        { session_id: "s1", code: "paths = await glob('src/**/*.missing.ts')\nreturn paths[0]" },
         undefined,
         undefined,
         { cwd: process.cwd() }
@@ -1126,10 +817,23 @@ test("ptc extension does not auto-recover literal zero-match path failures", asy
     } else {
       process.env.PTC_AUTO_RECOVER = previousAutoRecover;
     }
-    restoreSandbox();
-    restoreManager();
-    restoreRegistry();
-    restoreExecutor();
+    restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }
 });
+
+function successResult() {
+  return {
+    output: "ok",
+    images: undefined,
+    details: {
+      nestedToolCalls: 0,
+      nestedToolNames: [],
+      nestedResultChars: 0,
+      nestedResultCount: 0,
+      nestedErrors: 0,
+      durationMs: 1,
+      estimatedAvoidedTokens: 0,
+    },
+  };
+}

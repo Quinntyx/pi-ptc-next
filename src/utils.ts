@@ -52,6 +52,11 @@ function parseListEnv(value: string | undefined): string[] | undefined {
   return items.length > 0 ? items : undefined;
 }
 
+function emptyToUndefined(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 export function loadSettingsFromEnv(): PtcSettings {
   const settings = {
     executionTimeoutMs: parsePositiveIntEnv(
@@ -74,6 +79,10 @@ export function loadSettingsFromEnv(): PtcSettings {
     trustedReadOnlyTools: parseListEnv(process.env.PTC_TRUSTED_READ_ONLY_TOOLS),
     callableTools: parseListEnv(process.env.PTC_CALLABLE_TOOLS),
     blockedTools: parseListEnv(process.env.PTC_BLOCKED_TOOLS),
+    maxPythonSessions: parseClampedIntEnv(process.env.PTC_MAX_PYTHON_SESSIONS, 4, 1, 32),
+    scriptsDir: emptyToUndefined(process.env.PTC_SCRIPTS_DIR),
+    subagentsProfile: emptyToUndefined(process.env.PTC_SUBAGENTS_PROFILE),
+    subagentFooter: parseBooleanEnv(process.env.PTC_SUBAGENT_FOOTER, true),
   } satisfies PtcSettings;
 
   debugLoggingEnabled = settings.debugLogging;
@@ -92,7 +101,7 @@ export function shouldAutoRoutePromptToCodeExecution(prompt: string): boolean {
     return false;
   }
 
-  if (/\b(?:use|call|run|invoke) (?:the )?code_execution\b/.test(normalized)) {
+  if (/\b(?:use|call|run|invoke) (?:the )?python_exec\b/.test(normalized)) {
     return true;
   }
 
@@ -142,7 +151,7 @@ export function estimateTokensFromChars(chars: number): number {
 export function validateUserCode(userCode: string): void {
   if (/\basyncio\.run\s*\(/.test(userCode)) {
     throw new Error(
-      "Top-level await is already available inside code_execution. Remove asyncio.run(...) and await your coroutines directly."
+      "Top-level await is already available inside python_exec. Remove asyncio.run(...) and await your coroutines directly."
     );
   }
 

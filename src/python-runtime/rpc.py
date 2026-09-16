@@ -3,6 +3,8 @@ import json
 import sys
 from typing import Any, Dict, Optional
 
+_ptc_rpc_asyncio = asyncio
+
 
 class ToolCallError(Exception):
     def __init__(self, payload: Dict[str, Any]):
@@ -23,6 +25,15 @@ class RpcClient:
         self.call_id = 0
         self.pending_calls: Dict[str, asyncio.Future[Any]] = {}
         self.reader_task: Optional[asyncio.Task[Any]] = None
+        # Persistent-session mode: the host sends {"type":"exec",...} frames on
+        # the same stdin pipe; a registered handler receives them.
+        self.exec_handler = None
+        # Set when the host closes stdin (EOF) or the pipe breaks; the session
+        # exec loop waits on this to shut down.
+        self.disconnected = _ptc_rpc_asyncio.Event()
+
+    def set_exec_handler(self, handler) -> None:
+        self.exec_handler = handler
 
     async def start_reader(self) -> None:
         self.reader_task = asyncio.create_task(self._stdin_reader())
@@ -58,8 +69,15 @@ class RpcClient:
         except Exception as error:
             self._fail_pending_calls(error if isinstance(error, Exception) else RpcProtocolError(str(error)))
             print(f"stdin reader error: {error}", file=sys.stderr)
+        finally:
+            self.disconnected.set()
 
     def _handle_response(self, response: Dict[str, Any]) -> None:
+        if response.get("type") in ("exec", "export_script"):
+            handler = self.exec_handler
+            if handler is not None:
+                handler(response)
+            return
         call_id = response.get("id")
         if call_id and call_id in self.pending_calls:
             future = self.pending_calls[call_id]

@@ -36,7 +36,41 @@ export type RpcMessage =
   | { type: "stdout"; text: string }
   | { type: "complete"; output: string; images?: PtcImageArtifact[]; total_output_chars?: number }
   | { type: "error"; message: string; traceback?: string }
-  | { type: "update"; message: string };
+  | { type: "update"; message: string }
+  // Persistent-session frames (python_exec against a provisioned interpreter).
+  | { type: "exec_done"; id: string; output: string; images?: PtcImageArtifact[]; total_output_chars?: number }
+  | { type: "exec_error"; id: string; message: string; traceback?: string }
+  | { type: "session_ready" }
+  | { type: "subagent_state"; snapshot: SubagentRuntimeSnapshot }
+  | { type: "script_exported"; id: string; path: string; cells: number; wrapped_async: boolean; error?: string };
+
+export interface SubagentAgentRow {
+  id: string;
+  name: string;
+  status: string;
+  startedAt?: number;
+  elapsedMs?: number;
+  socketPath?: string | null;
+  windowId?: string | null;
+  toolCalls?: number | null;
+  thinkingMs?: number | null;
+  phase?: string | null;
+  label?: string | null;
+}
+
+export interface SubagentRuntimeSnapshot {
+  pid?: number;
+  depth?: number;
+  agents: SubagentAgentRow[];
+  totals?: { running?: number; settled?: number; failed?: number };
+  timestamp?: number;
+}
+
+export interface ScriptExportResult {
+  path: string;
+  cells: number;
+  wrappedAsync: boolean;
+}
 
 interface ExecutionMetrics {
   nestedToolCalls: number;
@@ -65,6 +99,10 @@ export interface ExecutionDetails extends ExecutionMetrics {
   imagesCount?: number;
   telemetry?: PtcExecutionTelemetry;
   recovery?: PtcRecoveryDetails;
+  sessionId?: string;
+  execId?: string;
+  subagentSnapshot?: SubagentRuntimeSnapshot;
+  backgrounded?: boolean;
 }
 
 export interface CodeExecutionResult {

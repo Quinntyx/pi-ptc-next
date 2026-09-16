@@ -85,7 +85,7 @@ def _trace_lines(frame, event, arg):
     if event != "line":
         return _trace_lines
 
-    if frame.f_code.co_name == "user_main":
+    if frame.f_code.co_name in ("user_main", "_ptc_cell"):
         # f_lineno is offset from co_firstlineno, which points at the `def` line.
         # The first body line therefore maps to user line 1, not 2.
         lineno = frame.f_lineno - frame.f_code.co_firstlineno
@@ -308,3 +308,7 @@ async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
         _ptc_sys.exit(1)
     finally:
         await _rpc.cleanup()
+
+# The one-shot entry point (``asyncio.run(_runtime_main(user_main))``) lives in
+# the host-built combined script for one-shot executions; persistent-session
+# mode (PTC_MODE == "session") invokes session.py's exec loop instead.

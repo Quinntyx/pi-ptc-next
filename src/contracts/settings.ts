@@ -13,4 +13,8 @@ export interface PtcSettings {
   trustedReadOnlyTools?: string[];
   callableTools?: string[];
   blockedTools?: string[];
+  maxPythonSessions: number;
+  scriptsDir?: string;
+  subagentsProfile?: string;
+  subagentFooter: boolean;
 }

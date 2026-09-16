@@ -1,6 +1,6 @@
 # pi-ptc-next
 
-`pi-ptc-next` adds a provider-agnostic `code_execution` tool to pi. The model writes Python code, Python calls local pi tools through an internal RPC bridge, and only the final Python output is returned to the model context.
+`pi-ptc-next` adds persistent Python tool-calling sessions to pi. The model provisions a Python session, sends code chunks to it with `python_exec`, Python calls local pi tools through an internal RPC bridge, and only each chunk's final output is returned to the model context. Sessions also expose pi-subagent orchestration via the autoimported `pi_subagents` module.
 
 This is **not** Anthropic's provider-native PTC wire protocol. Instead, it implements the same core local behavior in a way that can work across multiple labs and models such as GPT-5.4, GLM-5, and Claude-class models.
 
@@ -36,7 +36,7 @@ This fork is published publicly as **pi-ptc-next** to distinguish it from the or
 Use it normally.
 
 For simple requests, the agent should still use direct tools like `read`, `grep`, and `find`.
-For strong PTC-shaped requests, the extension now biases the agent toward `code_execution` proactively.
+For strong PTC-shaped requests, the extension now biases the agent toward `python_exec` proactively.
 
 Common auto-routing signals:
 
@@ -58,12 +58,13 @@ Without PTC, multi-step tool use usually looks like this:
 
 That is expensive for large intermediate results.
 
-With `code_execution`, the model can do this instead:
+With `python_exec`, the model can do this instead:
 
-1. Write Python once
-2. Call tools from Python as async functions
-3. Filter/aggregate/loop locally
-4. Return only the compact final answer
+1. `provision_python_session` once
+2. Write Python chunks that call tools as async functions
+3. Filter/aggregate/loop locally — definitions, imports, and variables persist across chunks
+4. Return only compact final answers
+5. Export the cumulative code as a durable script with `python_session_to_script` when the logic stabilizes
 
 ## What changed in this version
 
@@ -84,7 +85,7 @@ This implementation now focuses on provider-agnostic reliability:
 
 ## Available Python functions
 
-By default, Python code inside `code_execution` can call a safe built-in subset:
+By default, Python code inside `python_exec` can call a safe built-in subset:
 
 - `read(path, offset=None, limit=None) -> str`
 - `glob(pattern, path='.', limit=1000) -> list[str]`
@@ -108,7 +109,7 @@ This fork also supports caller routing metadata via `ptc.callers`:
 
 ## Model-facing usage rules
 
-The `code_execution` tool is best for:
+The `python_exec` tool is best for:
 
 - 3+ dependent tool calls
 - loops, filtering, aggregation, and batching
@@ -208,8 +209,12 @@ If a custom tool is marked code-execution-only, `pi-ptc-next` will register it b
 
 - `PTC_ALLOW_MUTATIONS=true` — allow mutating tools from Python
 - `PTC_ALLOW_BASH=true` — allow `bash` from Python
-- `PTC_AUTO_ROUTE=true` — auto-route repo-wide analysis prompts toward `code_execution` (default: true)
-- `PTC_AUTO_RECOVER=true` — enable one bounded async-only recovery hint after a qualifying first-attempt `code_execution` failure (default: false)
+- `PTC_AUTO_ROUTE=true` — auto-route repo-wide analysis prompts toward `python_exec` (default: true)
+- `PTC_AUTO_RECOVER=true` — enable one bounded async-only recovery hint after a qualifying first-attempt `python_exec` failure (default: false)
+- `PTC_MAX_PYTHON_SESSIONS` — concurrent persistent interpreters (default: 4)
+- `PTC_SCRIPTS_DIR` — default export directory for `python_session_to_script` (default: `./.pi/scripts`)
+- `PTC_SUBAGENTS_PROFILE` — pi profile directory `pi_subagents` launches subagent instances with (default: `~/.config/pi/profiles/subagents`)
+- `PTC_SUBAGENT_FOOTER=false` — hide the subagent status footer element (for custom footers consuming the `pi-ptc:subagent-runtime` API)
 - `PTC_AUTO_RECOVER_MAX_ATTEMPTS=1` — bounded recovery cap; values above `1` are clamped back to `1`
 - `PTC_TRUSTED_READ_ONLY_TOOLS=query_db,fetch_metadata` — allowlisted custom tools treated as read-only when mutations are disabled
 - `PTC_CALLABLE_TOOLS=read,glob,find,grep,ls` — explicit allowlist override

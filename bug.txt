@@ -1,0 +1,9 @@
+❯ ps aux | grep python
+root         800  0.0  0.0 148876 55404 ?        Ssl  Aug23   0:00 /usr/bin/python /usr/bin/firewalld --nofork --nopid
+zlare       2407  0.0  0.0  72932 43944 ?        Ss   Aug23   0:00 /usr/bin/python3 /usr/share/system-config-printer/applet.py
+zlare     142956 23.1  0.0      0     0 pts/18   Z+   16:14   3:48 [python] <defunct>
+zlare     145677  0.0  0.0   6916  4384 pts/20   S+   16:30   0:00 grep --color=auto python
+❯ ps -o pid,stat,wchan:32,cmd -p 142956
+    PID STAT WCHAN                            CMD
+ 142956 Z+   -                                [python] <defunct>
+~ ❯ 

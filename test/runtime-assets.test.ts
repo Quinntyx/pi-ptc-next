@@ -15,16 +15,18 @@ function withTempExtensionRoot(callback) {
   }
 }
 
-test("loadPythonRuntimeSources reads both runtime files from the extension root", () => {
+test("loadPythonRuntimeSources reads all runtime files from the extension root", () => {
   withTempExtensionRoot((extensionRoot) => {
     const runtimeDir = path.join(extensionRoot, "src", "python-runtime");
     fs.mkdirSync(runtimeDir, { recursive: true });
     fs.writeFileSync(path.join(runtimeDir, "rpc.py"), "RPC = True\n", "utf-8");
     fs.writeFileSync(path.join(runtimeDir, "runtime.py"), "RUNTIME = True\n", "utf-8");
+    fs.writeFileSync(path.join(runtimeDir, "session.py"), "SESSION = True\n", "utf-8");
 
     const sources = loadPythonRuntimeSources(extensionRoot);
     assert.equal(sources.rpcCode, "RPC = True\n");
     assert.equal(sources.runtimeCode, "RUNTIME = True\n");
+    assert.equal(sources.sessionCode, "SESSION = True\n");
   });
 });
 
@@ -35,10 +37,12 @@ test("loadPythonRuntimeSources also supports src-root entrypoints", () => {
     fs.mkdirSync(runtimeDir, { recursive: true });
     fs.writeFileSync(path.join(runtimeDir, "rpc.py"), "RPC = True\n", "utf-8");
     fs.writeFileSync(path.join(runtimeDir, "runtime.py"), "RUNTIME = True\n", "utf-8");
+    fs.writeFileSync(path.join(runtimeDir, "session.py"), "SESSION = True\n", "utf-8");
 
     const sources = loadPythonRuntimeSources(srcRoot);
     assert.equal(sources.rpcCode, "RPC = True\n");
     assert.equal(sources.runtimeCode, "RUNTIME = True\n");
+    assert.equal(sources.sessionCode, "SESSION = True\n");
   });
 });
 

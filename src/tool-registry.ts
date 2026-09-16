@@ -15,6 +15,12 @@ import type { PtcSettings } from "./contracts/settings";
 import type { CallerMetadata, ExecuteToolContext, PtcToolDefinition, PtcToolOptions, ToolInfo } from "./contracts/tool-types";
 import { logWarning } from "./utils";
 
+const PTC_OWNED_TOOLS = new Set(["provision_python_session", "python_exec", "python_session_to_script"]);
+
+function isPtcOwnedTool(name: string): boolean {
+  return PTC_OWNED_TOOLS.has(name);
+}
+
 function classifyTool(name: string, ptc?: PtcToolOptions): { isReadOnly: boolean } {
   return classifyBuiltinTool(name, ptc);
 }
@@ -25,7 +31,7 @@ function getConfiguredCallers(tool: ToolInfo): Set<"direct" | "code_execution"> 
     return new Set(configured);
   }
 
-  if (tool.name === "code_execution") {
+  if (tool.name === "code_execution" || isPtcOwnedTool(tool.name)) {
     return new Set(["direct"]);
   }
 
@@ -140,7 +146,7 @@ export class ToolRegistry {
       builtins.set("glob", {
         ...findTool,
         name: "glob",
-        description: "Find files by glob pattern. Alias of find(). Returns a list of matching relative paths in code_execution.",
+        description: "Find files by glob pattern. Alias of find(). Returns a list of matching relative paths in python_exec.",
         source: "alias",
         isReadOnly: true,
       });
@@ -203,7 +209,7 @@ export class ToolRegistry {
     const trustedReadOnlyTools = new Set(settings.trustedReadOnlyTools || []);
 
     const callableTools = allTools.filter((tool) => {
-      if (tool.name === "code_execution") {
+      if (tool.name === "code_execution" || isPtcOwnedTool(tool.name)) {
         return false;
       }
       if (blockedSet.has(tool.name)) {
@@ -242,7 +248,7 @@ export class ToolRegistry {
   getAutoRoutableToolNames(cwd: string, settings: PtcSettings): string[] {
     const callableNames = new Set(this.getCallableTools(cwd, settings).map((tool) => tool.name));
     return this.getAllTools(cwd)
-      .filter((tool) => tool.name !== "code_execution")
+      .filter((tool) => tool.name !== "code_execution" && !isPtcOwnedTool(tool.name))
       .filter((tool) => toolAllowsDirectCaller(tool))
       .filter((tool) => callableNames.has(tool.name))
       .map((tool) => tool.name);
