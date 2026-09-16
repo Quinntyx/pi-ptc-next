@@ -78,7 +78,7 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
       const last = index === groupAgents.length - 1;
       const branch = last ? "╰" : "├";
       const rail = (s: string) => theme.fg("muted", s);
-      const gutter = agent.awaited ? theme.fg("accent", "▶ ") : "    ";
+      const gutter = agent.awaited ? theme.fg("accent", "  ▶ ") : "    ";
 
       if (agent.status === "starting") {
         lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", "○ " + agent.name)}`);

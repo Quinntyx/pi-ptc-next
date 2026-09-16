@@ -18,7 +18,7 @@ test("subagent fan panel renders groups, awaited arrow, and status lines", () =>
   const lines = renderSubagentPanel(snapshot, noopTheme);
   const plain = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
   assert.ok(plain.some((l) => l.startsWith("    ● researching")), plain.join("\n"));
-  assert.ok(plain.some((l) => l.includes("▶ ├ ● docs-sweeper")));
+  assert.ok(plain.some((l) => l.startsWith("  ▶ ├ ● docs-sweeper"))); // arrow in the gutter, tree glyph at col 4
   assert.ok(plain.some((l) => l.includes("├ ● test-digger") && l.includes("ctx 230k/1m (23%)")));
   assert.ok(plain.some((l) => l.includes("╰ testing · 12s · 3 tool calls · thinking 6.2s")));
   assert.ok(plain.filter((l) => l === "    │").length >= 2); // rail continuation lines
