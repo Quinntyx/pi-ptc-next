@@ -129,6 +129,10 @@ Important runtime rules:
 - Prefer returning compact JSON or summaries
 - Intermediate tool results stay local unless you explicitly print or return them
 
+## Session footguns
+
+- Child processes spawned from a `python_exec` chunk inherit the interpreter's RPC pipes. Any child that reads stdin or writes to stdout will corrupt the protocol and hang the session — always pass `stdin=DEVNULL` and capture stdout/stderr when using `subprocess` inside a session (e.g. `subprocess.run([...], stdin=subprocess.DEVNULL, capture_output=True)`).
+
 ## Python helpers
 
 The runtime also exposes a `ptc` helper object:
