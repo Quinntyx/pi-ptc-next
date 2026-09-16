@@ -63,14 +63,14 @@ interface PartialRenderContext {
   state?: { viewStartLine?: number };
 }
 
-function renderExecutingCode(
+function buildExecutingCodeLines(
   codeLines: string[],
   currentLine: number,
   totalLines: number,
   activeTool: string | undefined,
   theme: Theme,
   state: CodeViewState
-): Component {
+): string[] {
   const lines: string[] = [];
   const toolBadge = activeTool ? theme.fg("success", ` • calling ${activeTool}()`) : "";
   lines.push(theme.fg("muted", `Executing Python code (line ${currentLine}/${totalLines})`) + toolBadge);
@@ -115,7 +115,18 @@ function renderExecutingCode(
     lines.push(theme.fg("muted", "       │ ..."));
   }
 
-  return new Text(lines.join("\n"), 0, 0);
+  return lines;
+}
+
+function renderExecutingCode(
+  codeLines: string[],
+  currentLine: number,
+  totalLines: number,
+  activeTool: string | undefined,
+  theme: Theme,
+  state: CodeViewState
+): Component {
+  return new Text(buildExecutingCodeLines(codeLines, currentLine, totalLines, activeTool, theme, state).join("\n"), 0, 0);
 }
 
 function renderSubagentPanel(snapshot: SubagentRuntimeSnapshot | undefined, theme: Theme): string[] {
@@ -271,10 +282,9 @@ Takes an optional path to a Python file that is executed first, so the session c
 
 const PYTHON_EXEC_DESCRIPTION = `Execute Python code in a persistent session. Chunks run in one shared namespace: imports, functions, and variables from earlier chunks remain available.
 
-Options:
 - session_id (required): id from provision_python_session. Unknown ids error with the list of live sessions.
-- background (optional): run the chunk without blocking; the result arrives as a [ptc-background-complete] message. Use for long-running work (e.g. waiting on pi_subagents fan-outs) so the session stays responsive.
-- wait_for (optional): exec id of a backgrounded chunk in this session; blocks until it completes and returns its result.
+
+Runs synchronously and blocks until the chunk finishes — progress streams into the transcript, including a live view of any pi_subagents fan-out the code runs. Prefer doing all orchestration inside one chunk (spawn subagents, wait for them, aggregate, return the summary) so the viewer can render the whole fan-out.
 
 Rules:
 - Top-level await is available; do not call asyncio.run(...).
@@ -468,108 +478,27 @@ function pythonExecTool(
         description:
           "Python code to execute in the session. Top-level await is supported; do not call asyncio.run(...). Definitions persist across chunks; return a compact final result.",
       }),
-      background: Type.Optional(
-        Type.Boolean({
-          description:
-            "Run without blocking: the tool returns immediately with an exec id and the result arrives later as a [ptc-background-complete] message. Use for long-running work such as pi_subagents fan-outs.",
-        })
-      ),
-      wait_for: Type.Optional(
-        Type.String({
-          description: "Exec id of a backgrounded chunk in this session; blocks until it completes and returns its result.",
-        })
-      ),
     }),
-    execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { session_id: sessionId, code, background, wait_for: waitFor } = params as {
-        session_id: string;
-        code: string;
-        background?: boolean;
-        wait_for?: string;
-      };
-      const recoveryState = getRequestRecoveryState(sessionState);
-
-      // Background / wait_for paths do not stream the code view.
-      if (background === true) {
-        try {
-          const { execId } = await sessionManager.execBackground(sessionId, code, { cwd: ctx.cwd, ctx, signal, onUpdate, parentToolCallId: toolCallId });
-          return {
-            content: [{
-              type: "text",
-              text: `Backgrounded exec ${execId} in session ${sessionId}. The result arrives as a [ptc-background-complete] message; retrieve it early with python_exec wait_for: "${execId}" if needed.`,
-            }],
-            details: { sessionId, execId, backgrounded: true },
+        execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+          const { session_id: sessionId, code } = params as {
+            session_id: string;
+            code: string;
           };
-        } catch (error) {
-          return { content: [{ type: "text", text: describeSessionError(error, sessionManager) }], details: { sessionId } };
-        }
-      }
-
-      if (waitFor) {
-        try {
-          const result = await sessionManager.waitForExec(sessionId, waitFor);
-          return { content: [{ type: "text", text: result.output || "(No output)" }], details: { ...result.details, sessionId, waitedFor: waitFor } };
-        } catch (error) {
-          return { content: [{ type: "text", text: describeSessionError(error, sessionManager) }], details: { sessionId } };
-        }
-      }
-
-      // Foreground exec with the recovery flow from the legacy code_execution tool.
+          const recoveryState = getRequestRecoveryState(sessionState);
+    
+          // background/wait_for modes are WIP (deferred): synchronous runs make the
+          // live subagent viewer straightforward. The manager keeps the machinery
+          // for when it returns.
+    
+          // Foreground exec with the recovery flow from the legacy code_execution tool.
       noteCodeExecutionAttempt(recoveryState);
       sessionState.lastCtx = ctx;
-
-      // /ptc background issued before this call starts: go straight to background.
-      if (sessionState.requestedBackground === sessionId) {
-        sessionState.requestedBackground = null;
-        try {
-          const { execId } = await sessionManager.execBackground(sessionId, code, { cwd: ctx.cwd, ctx, signal, onUpdate, parentToolCallId: toolCallId });
-          return {
-            content: [{ type: "text", text: `User manually backgrounded this ptc run (exec ${execId} in session ${sessionId}). The result arrives as a [ptc-background-complete] message.` }],
-            details: { sessionId, execId, backgrounded: true, manuallyBackgrounded: true },
-          };
-        } catch (error) {
-          return { content: [{ type: "text", text: describeSessionError(error, sessionManager) }], details: { sessionId } };
-        }
-      }
 
       try {
         const execOptions = { cwd: ctx.cwd, ctx, signal, onUpdate, parentToolCallId: toolCallId };
         sessionState.activeForegroundToolCallId = toolCallId;
         sessionState.activeForegroundSessionId = sessionId;
         const execPromise = sessionManager.execForeground(sessionId, code, execOptions);
-
-        // Manual backgrounding race: /ptc background converts the in-flight run.
-        let manualBackgroundWatch: ReturnType<typeof setInterval> | undefined;
-        const manualBackgroundPromise = new Promise<"manual-background">((resolve) => {
-          manualBackgroundWatch = setInterval(() => {
-            if (sessionState.requestedBackground === sessionId) {
-              clearInterval(manualBackgroundWatch);
-              sessionState.requestedBackground = null;
-              resolve("manual-background");
-            }
-          }, 250);
-          manualBackgroundWatch.unref?.();
-        });
-        const outcome = await Promise.race([
-          execPromise.then(
-            () => "done" as const,
-            () => "error" as const
-          ),
-          manualBackgroundPromise,
-        ]);
-        if (outcome === "manual-background") {
-          const execId = await sessionManager.markBackgrounded(sessionId);
-          noteCodeExecutionSuccess(recoveryState);
-          return {
-            content: [{
-              type: "text",
-              text: execId
-                ? `User manually backgrounded this ptc run. Exec ${execId} continues in session ${sessionId}; the result arrives as a [ptc-background-complete] message.`
-                : "User manually backgrounded this ptc run (no exec in flight).",
-            }],
-            details: { sessionId, execId: execId ?? undefined, backgrounded: true, manuallyBackgrounded: true },
-          };
-        }
 
         const result = await execPromise;
         noteCodeExecutionSuccess(recoveryState);
@@ -615,23 +544,28 @@ function pythonExecTool(
       context?: PartialRenderContext
     ) {
       const details = result.details as ExecutionDetails | undefined;
-      if (isPartial && details?.userCode && details.currentLine) {
+      if (isPartial && details?.userCode && details.userCode.length > 0) {
         const state = (context?.state ?? {}) as CodeViewState;
-        const codeComponent = renderExecutingCode(
+        // Progress frames set currentLine; fast execs may complete a line tick
+        // before the first render, so default to the top of the chunk.
+        const currentLine = details.currentLine && details.currentLine > 0 ? details.currentLine : 1;
+        const totalLines = details.totalLines || details.userCode.length;
+        const lines = buildExecutingCodeLines(
           details.userCode,
-          details.currentLine,
-          details.totalLines || details.userCode.length,
+          currentLine,
+          totalLines,
           details.activeTool,
           theme,
           state
-        ) as unknown as { text?: string };
-        // The subagent panel rides below the code view.
+        );
+        // The subagent fan renders below the code view when the chunk spawned
+        // subagents through pi_subagents.
         const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme);
-        if (subagentLines.length === 0) {
-          return codeComponent as unknown as Component;
+        if (subagentLines.length > 0) {
+          lines.push("");
+          lines.push(...subagentLines);
         }
-        const existing = (codeComponent as unknown as { text?: string })?.text ?? "";
-        return new Text(`${existing}\n${subagentLines.join("\n")}`, 0, 0);
+        return new Text(lines.join("\n"), 0, 0);
       }
 
       const text = result.content
@@ -727,63 +661,32 @@ function resolveTargetSession(
 
 function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManager, sessionState: PtcSessionState): void {
   pi.registerCommand("ptc", {
-    description: "Control PTC python sessions: /ptc <background|bg|foreground|fg|kill> [session_id]",
+    description: "Control PTC python sessions: /ptc <kill> [session_id] (background/foreground are WIP)",
     handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
       const [actionRaw, requestedId] = (args ?? "").trim().split(/\s+/);
       const action = (actionRaw ?? "").toLowerCase();
 
       if (!["background", "bg", "foreground", "fg", "kill"].includes(action)) {
-        ctx.ui.notify("usage: /ptc <background|bg|foreground|fg|kill> [session_id]", "error");
+        ctx.ui.notify("usage: /ptc <kill> [session_id]  (background|bg|foreground|fg are WIP/deferred)", "error");
         return;
       }
 
-      const target = resolveTargetSession(sessionManager, sessionState, requestedId);
-      if ("error" in target === false && !("id" in target)) {
-        ctx.ui.notify(String(target), "error");
+      if (action === "background" || action === "bg" || action === "foreground" || action === "fg") {
+        ctx.ui.notify("/ptc background|foreground is WIP (deferred) — runs are synchronous for now", "error");
         return;
       }
+      const target = resolveTargetSession(sessionManager, sessionState, requestedId);
       if ("error" in target) {
         ctx.ui.notify(target.error, "error");
-        return;
-      }
-      const sessionId = target.id;
-
-      if (action === "background" || action === "bg") {
-        if (sessionState.activeForegroundSessionId !== sessionId || !sessionState.activeForegroundToolCallId) {
-          ctx.ui.notify(`/ptc background: no blocking python_exec in flight in session ${sessionId}`, "error");
-          return;
-        }
-        // The running execute() observes this and converts to a background run.
-        sessionState.requestedBackground = sessionId;
-        ctx.ui.notify(`Backgrounding python_exec in session ${sessionId}...`, "info");
-        return;
-      }
-
-      if (action === "foreground" || action === "fg") {
-        const pending = sessionManager.pendingBackground(sessionId).filter((entry) => entry.status === "pending");
-        if (pending.length === 0) {
-          ctx.ui.notify(`/ptc foreground: no pending backgrounded exec in session ${sessionId}`, "error");
-          return;
-        }
-        const execId = pending[pending.length - 1].execId;
-        pi.sendMessage(
-          {
-            customType: "ptc-foreground",
-            content: `Bring backgrounded exec ${execId} (session ${sessionId}) back to the foreground: call python_exec with session_id "${sessionId}" and wait_for "${execId}", then report its result.`,
-            display: true,
-          },
-          { triggerTurn: true, deliverAs: "steer" }
-        );
-        ctx.ui.notify(`Foregrounding exec ${execId} in session ${sessionId}`, "info");
         return;
       }
 
       // kill
       try {
-        await sessionManager.dispose(sessionId);
-        ctx.ui.notify(`Disposed python session ${sessionId}`, "info");
+        await sessionManager.dispose(target.id);
+        ctx.ui.notify(`Disposed python session ${target.id}`, "info");
       } catch (error) {
-        ctx.ui.notify(`Failed to dispose session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(`Failed to dispose session ${target.id}: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },
   });

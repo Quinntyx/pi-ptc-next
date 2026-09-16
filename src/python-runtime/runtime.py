@@ -88,7 +88,10 @@ def _trace_lines(frame, event, arg):
     if frame.f_code.co_name in ("user_main", "_ptc_cell"):
         # f_lineno is offset from co_firstlineno, which points at the `def` line.
         # The first body line therefore maps to user line 1, not 2.
-        lineno = frame.f_lineno - frame.f_code.co_firstlineno
+        # _PTC_LINENO_OFFSET shifts the mapping when the wrapper's def line is
+        # placed ON the first user statement (persistent session cells), where
+        # the raw delta starts at 0 for the first body line.
+        lineno = frame.f_lineno - frame.f_code.co_firstlineno + globals().get("_PTC_LINENO_OFFSET", 0)
         _current_line = lineno
         _report_execution_progress(lineno)
 

@@ -47,6 +47,7 @@ export type RpcMessage =
 export interface SubagentAgentRow {
   id: string;
   name: string;
+  group?: string | null;
   status: string;
   startedAt?: number;
   elapsedMs?: number;

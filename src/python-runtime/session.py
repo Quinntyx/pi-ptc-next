@@ -34,7 +34,10 @@ _ptc_builtins.PTC_STATE_EMIT = lambda snapshot: _emit_protocol({
 })
 
 _cell_counter = 0
-_PTC_MERGE_SKIP_NAMES = {"ptc_local_storage", "__builtins__"}
+_PTC_MERGE_SKIP_NAMES = {"ptc_cell_storage", "__builtins__"}
+# The session wrapper's `def _ptc_cell` is placed on the chunk's first user
+# line, so raw trace deltas start at 0; shift to 1-based like the one-shot path.
+_PTC_LINENO_OFFSET = 1
 
 
 def _ptc_merge_cell_locals(storage: dict) -> None:
