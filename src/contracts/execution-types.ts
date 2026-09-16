@@ -58,6 +58,8 @@ export interface SubagentAgentRow {
   phase?: string | null;
   label?: string | null;
   labelElapsedMs?: number | null;
+  /** tool calls made under the current activity label (viewer detail line) */
+  labelCalls?: number | null;
   /** e.g. `read src/auth_test.py` — the call currently executing */
   liveTool?: string | null;
   /** true while the PTC chunk is awaiting this agent (viewer arrow) */

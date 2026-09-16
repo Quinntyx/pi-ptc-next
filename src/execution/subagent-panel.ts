@@ -40,7 +40,7 @@ function formatAgentSeconds(ms: number | undefined | null): string {
 }
 
 function agentCallsSegment(calls: number | null | undefined, theme: Theme): string {
-  if (calls === undefined || calls === null) return "";
+  if (!calls) return "";
   return theme.fg("muted", ` · ${calls} tool call${calls === 1 ? "" : "s"}`);
 }
 
@@ -107,7 +107,9 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
       if (agent.labelElapsedMs) {
         detailBits.push(theme.fg("muted", ` · ${formatAgentSeconds(agent.labelElapsedMs)}`));
       }
-      detailBits.push(agentCallsSegment(agent.toolCalls, theme));
+      if (agent.labelCalls) {
+        detailBits.push(theme.fg("muted", ` · ${agent.labelCalls} tool call${agent.labelCalls === 1 ? "" : "s"}`));
+      }
       if (agent.thinkingMs) {
         detailBits.push(theme.fg("muted", ` · thinking ${formatAgentSeconds(agent.thinkingMs)}`));
       }
@@ -119,7 +121,9 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
         lines.push(`    ${theme.fg("muted", detailRail)}${theme.fg("muted", "╰")} ${detailBits.join("")}`);
       }
 
-      lines.push("");
+      if (!last) {
+        lines.push(`    ${theme.fg("muted", "│")}`);
+      }
     });
     lines.push("");
   }
