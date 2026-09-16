@@ -57,6 +57,12 @@ export interface SubagentAgentRow {
   thinkingMs?: number | null;
   phase?: string | null;
   label?: string | null;
+  labelElapsedMs?: number | null;
+  /** e.g. `read src/auth_test.py` — the call currently executing */
+  liveTool?: string | null;
+  /** true while the PTC chunk is awaiting this agent (viewer arrow) */
+  awaited?: boolean;
+  ctx?: { tokens?: number | null; limit?: number | null; percent?: number | null } | null;
 }
 
 export interface SubagentRuntimeSnapshot {
@@ -64,6 +70,8 @@ export interface SubagentRuntimeSnapshot {
   depth?: number;
   agents: SubagentAgentRow[];
   totals?: { running?: number; settled?: number; failed?: number };
+  /** phase label -> epoch ms when subagents.phase() was called */
+  groups?: Record<string, number>;
   timestamp?: number;
 }
 

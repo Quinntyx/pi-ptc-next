@@ -42,6 +42,7 @@ import {
   computeCodeViewStart,
   type CodeViewState,
 } from "./execution/code-view";
+import { renderSubagentPanel } from "./execution/subagent-panel";
 import {
   PythonSessionManager,
   UnknownSessionError,
@@ -129,39 +130,6 @@ function renderExecutingCode(
   return new Text(buildExecutingCodeLines(codeLines, currentLine, totalLines, activeTool, theme, state).join("\n"), 0, 0);
 }
 
-function renderSubagentPanel(snapshot: SubagentRuntimeSnapshot | undefined, theme: Theme): string[] {
-  if (!snapshot || !Array.isArray(snapshot.agents) || snapshot.agents.length === 0) {
-    return [];
-  }
-
-  const totals = snapshot.totals ?? {};
-  const running = totals.running ?? snapshot.agents.filter((a) => a.status === "running" || a.status === "starting").length;
-  const settled = totals.settled ?? snapshot.agents.filter((a) => a.status === "settled").length;
-  const failed = totals.failed ?? snapshot.agents.filter((a) => ["failed", "dead", "stopped"].includes(a.status)).length;
-
-  const lines: string[] = [];
-  const parts: string[] = [];
-  if (running) parts.push(theme.fg("success", `● ${running} running`));
-  if (settled) parts.push(theme.fg("success", `✓ ${settled} done`));
-  if (failed) parts.push(theme.fg("warning", `! ${failed} stopped/failed`));
-  lines.push(theme.fg("muted", "subagents: ") + parts.join(theme.fg("muted", " · ")));
-
-  for (const agent of snapshot.agents) {
-    const seconds = agent.elapsedMs !== undefined ? `${(agent.elapsedMs / 1000).toFixed(1)}s` : "";
-    const calls = agent.toolCalls !== undefined && agent.toolCalls !== null ? `${agent.toolCalls} call${agent.toolCalls === 1 ? "" : "s"}` : "";
-    const thinking = agent.thinkingMs ? `thinking ${(agent.thinkingMs / 1000).toFixed(1)}s` : "";
-    const label = agent.label ?? agent.phase;
-    const bits = [seconds, calls, thinking, label].filter(Boolean).join(" · ");
-    const marker = agent.status === "settled"
-      ? theme.fg("success", "✓")
-      : agent.status === "running" || agent.status === "starting"
-        ? theme.fg("success", "●")
-        : theme.fg("warning", "!");
-    lines.push(` ${theme.fg("muted", "├")} ${marker} ${agent.name}${bits ? theme.fg("muted", `  ${bits}`) : ""}`);
-  }
-
-  return lines;
-}
 
 function renderCompletedOutput(
   resultText: string,
@@ -498,9 +466,36 @@ function pythonExecTool(
         const execOptions = { cwd: ctx.cwd, ctx, signal, onUpdate, parentToolCallId: toolCallId };
         sessionState.activeForegroundToolCallId = toolCallId;
         sessionState.activeForegroundSessionId = sessionId;
-        const execPromise = sessionManager.execForeground(sessionId, code, execOptions);
 
-        const result = await execPromise;
+        // Keep the viewer animating during pure awaits: subagent state frames
+        // only arrive on registry mutations, so a 120ms repaint ticker merges
+        // the latest snapshot into the streamed details (pi-tool-tree does the
+        // same for its shimmer).
+        let lastUpdate: { content: Array<{ type: "text"; text: string }>; details: ExecutionDetails } | undefined;
+        const streamingOnUpdate: typeof onUpdate = (update) => {
+          lastUpdate = update as never;
+          onUpdate?.(update);
+        };
+        const repaint = setInterval(() => {
+          if (!lastUpdate || !onUpdate) return;
+          const snapshot = sessionState.lastSubagentSnapshot ?? lastUpdate.details.subagentSnapshot;
+          onUpdate?.({
+            content: lastUpdate.content,
+            details: { ...lastUpdate.details, subagentSnapshot: snapshot } as ExecutionDetails,
+          });
+        }, 120);
+        repaint.unref?.();
+
+        const execPromise = sessionManager.execForeground(sessionId, code, {
+          ...execOptions,
+          onUpdate: streamingOnUpdate,
+        });
+        let result: Awaited<ReturnType<typeof sessionManager.execForeground>>;
+        try {
+          result = await execPromise;
+        } finally {
+          clearInterval(repaint);
+        }
         noteCodeExecutionSuccess(recoveryState);
         if (result.details.estimatedAvoidedTokens > 0) {
           ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
