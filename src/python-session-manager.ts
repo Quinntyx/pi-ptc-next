@@ -7,6 +7,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
   PtcProtocolError,
   PtcPythonError,
+  PtcTimeoutError,
 } from "./execution/execution-errors";
 import { normalizeToolResult } from "./tool-adapters";
 import { buildSessionPrelude } from "./execution/session-prelude";
@@ -88,6 +89,7 @@ class PersistentSessionProtocol {
   private execTimeout?: NodeJS.Timeout;
   private backgrounded = false;
   private updateHandler?: ToolUpdateCallback;
+  private execTimeoutMs?: number;
   private currentExecPromiseField: Promise<CodeExecutionResult> | null = null;
   private nestedToolCalls = 0;
   private nestedToolNames: string[] = [];
@@ -198,10 +200,7 @@ class PersistentSessionProtocol {
     const reject = this.execReject;
     this.execResolve = undefined;
     this.execReject = undefined;
-    if (this.execTimeout) {
-      clearTimeout(this.execTimeout);
-      this.execTimeout = undefined;
-    }
+    this.clearExecTimeout();
     if (!resolve || !reject) {
       return; // already finished or superseded
     }
@@ -224,6 +223,9 @@ class PersistentSessionProtocol {
       return;
     }
     const msg = parsed as Record<string, unknown> & { type?: string };
+
+    // Any frame from the interpreter proves it is alive; push the idle window out.
+    this.armExecTimeout();
 
     switch (msg.type) {
       case "session_ready":
@@ -328,6 +330,38 @@ class PersistentSessionProtocol {
     this.updateHandler = handler;
   }
 
+  /**
+   * Idle-timeout handling. `executionTimeoutMs` is shared with ordinary execution,
+   * but for a persistent session it measures *silence*, not total runtime: every
+   * frame the interpreter emits (progress, stdout, nested tool calls, and in
+   * particular subagent activity updates) re-arms the timer. A long fan-out is
+   * therefore limited only by how long no agent reports anything at all.
+   */
+  private clearExecTimeout(): void {
+    if (this.execTimeout) {
+      clearTimeout(this.execTimeout);
+      this.execTimeout = undefined;
+    }
+  }
+
+  private armExecTimeout(): void {
+    if (this.execTimeoutMs === undefined || !this.execResolve) {
+      return; // no exec in flight (or timeouts disabled)
+    }
+    this.clearExecTimeout();
+    const windowMs = this.execTimeoutMs;
+    this.execTimeout = setTimeout(() => {
+      this.execTimeout = undefined;
+      this.finish(
+        new PtcTimeoutError(
+          `Python session idle for ${Math.round(windowMs / 1000)} seconds with no activity ` +
+            "(no progress, output, or subagent updates); the session was terminated."
+        )
+      );
+    }, windowMs);
+    this.execTimeout.unref?.();
+  }
+
   private emitUpdate(extra?: Partial<ExecutionDetails>): void {
     if (this.backgrounded) {
       return; // no active tool call to stream updates into
@@ -400,12 +434,8 @@ class PersistentSessionProtocol {
     });
     this.currentExecPromiseField = promise;
 
-    if (timeoutMs !== undefined) {
-      this.execTimeout = setTimeout(() => {
-        this.finish(new Error(`Python execution timed out after ${Math.round(timeoutMs / 1000)} seconds`));
-      }, timeoutMs);
-      this.execTimeout.unref?.();
-    }
+    this.execTimeoutMs = timeoutMs;
+    this.armExecTimeout();
 
     this.send({ type: "exec", id: this.execId, code, user_code_line_count: this.chunkLines.length });
     return promise;
@@ -455,10 +485,7 @@ class PersistentSessionProtocol {
   }
 
   async dispose(): Promise<void> {
-    if (this.execTimeout) {
-      clearTimeout(this.execTimeout);
-      this.execTimeout = undefined;
-    }
+    this.clearExecTimeout();
     try {
       this.proc.stdin?.end();
     } catch {
@@ -808,6 +835,14 @@ export class PythonSessionManager {
     record.protocol.setUpdateHandler(onUpdate);
     try {
       return await record.protocol.exec(code, this.settings.executionTimeoutMs, backgrounded);
+    } catch (error) {
+      if (error instanceof PtcTimeoutError) {
+        // A silent session is unusable: the chunk may still be running inside the
+        // interpreter with no way to observe or interrupt it, so tear it down
+        // instead of leaving an orphaned process and its subagents behind.
+        void this.dispose(record.id).catch(() => undefined);
+      }
+      throw error;
     } finally {
       record.protocol.setUpdateHandler(undefined);
       record.lastUsedAt = Date.now();

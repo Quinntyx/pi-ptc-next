@@ -10,11 +10,12 @@ const { loadSettingsFromEnv } = require("../dist/utils.js");
 // (Docker sandboxing would need a container; CI without PTC envs skips).
 const RUN_REAL = process.env.PTC_ALLOW_UNSANDBOXED_SUBPROCESS === "true";
 
-function makeManager(hooks = {}) {
+function makeManager(hooks = {}, settingsOverrides = {}) {
   const settings = {
     ...loadSettingsFromEnv(),
     executionTimeoutMs: 30_000,
     maxPythonSessions: 4,
+    ...settingsOverrides,
   };
   const sandboxManager = {
     spawn(code, cwd) {
@@ -225,6 +226,56 @@ test("persistent session: execForeground forwards partial updates to the caller'
     assert.ok(
       updates.some((update) => update.subagentSnapshot !== undefined),
       "expected a partial update carrying the subagent snapshot"
+    );
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("persistent session: subagent activity re-arms the idle timeout", { skip: !RUN_REAL }, async () => {
+  // 1.2s idle window, ~3s of work: only the subagent frames between sleeps keep it alive.
+  const manager = makeManager({}, { executionTimeoutMs: 1_200 });
+  const updates = [];
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const result = await manager.execForeground(
+      id,
+      [
+        "import builtins, time",
+        "emit = getattr(builtins, 'PTC_STATE_EMIT', None)",
+        "for i in range(5):",
+        "    emit({'agents': [{'id': 'a', 'name': 'tick', 'status': 'running'}], 'totals': {'running': 1, 'tick': i}})",
+        "    time.sleep(0.6)",
+        "return 'survived'",
+      ].join("\n"),
+      {
+        cwd: process.cwd(),
+        onUpdate: (update) => updates.push(update),
+      }
+    );
+
+    assert.equal(result.output, "survived");
+    assert.equal(manager.list().length, 1, "session should still be live");
+    assert.ok(updates.length > 0);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("persistent session: silence past the timeout terminates the session", { skip: !RUN_REAL }, async () => {
+  const manager = makeManager({}, { executionTimeoutMs: 1_200 });
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    await assert.rejects(
+      manager.execForeground(id, "import time\ntime.sleep(6)\nreturn 'late'", { cwd: process.cwd() }),
+      (error) => /idle for 1 seconds/.test(error.message)
+    );
+    // The dead session is reaped rather than left orphaned.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(manager.list().length, 0, "timed-out session should be disposed");
+    await assert.rejects(
+      manager.execForeground(id, "return 1", { cwd: process.cwd() }),
+      (error) => /Unknown python session/.test(error.message)
     );
   } finally {
     await manager.disposeAll();
