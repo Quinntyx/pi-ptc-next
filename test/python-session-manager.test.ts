@@ -282,6 +282,58 @@ test("persistent session: silence past the timeout terminates the session", { sk
   }
 });
 
+test("persistent session: parallel python_exec calls are serialized and both return", { skip: !RUN_REAL }, async () => {
+  // pi dispatches several python_exec calls from one assistant message in parallel;
+  // racing them used to orphan one promise (the transcript wedged forever).
+  const manager = makeManager({}, { executionTimeoutMs: 20_000 });
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+
+    const first = manager.execForeground(id, "import time\ntime.sleep(0.4)\nreturn 'first'", { cwd: process.cwd() });
+    const queuedNotices: string[] = [];
+    const second = manager.execForeground(id, "import time\ntime.sleep(0.4)\nreturn 'second'", {
+      cwd: process.cwd(),
+      onUpdate: (update: { content?: Array<{ text?: string }> }) => {
+        const text = (update.content ?? []).map((block) => block.text ?? "").join("");
+        if (text) queuedNotices.push(text);
+      },
+    });
+    const [a, b] = await Promise.all([first, second]);
+
+    assert.equal(a.output, "first");
+    assert.equal(b.output, "second");
+    assert.ok(
+      queuedNotices.some((text) => text.includes("Queued")),
+      `a chunk waiting behind another should announce that: ${JSON.stringify(queuedNotices)}`
+    );
+
+    // The session stays usable afterwards.
+    const third = await manager.execForeground(id, "return 'third'", { cwd: process.cwd() });
+    assert.equal(third.output, "third");
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("persistent session: aborting an exec tears the session down instead of wedging", { skip: !RUN_REAL }, async () => {
+  const manager = makeManager({}, { executionTimeoutMs: 60_000 });
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const controller = new AbortController();
+    const pending = manager.execForeground(id, "import time\ntime.sleep(30)\nreturn 'never'", {
+      cwd: process.cwd(),
+      signal: controller.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    controller.abort();
+    await assert.rejects(pending, (error) => /aborted/.test(error.message));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(manager.list().length, 0, "aborted session should be torn down");
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
 function fakeCtx() {
   return { cwd: process.cwd(), hasUI: false };
 }

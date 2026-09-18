@@ -275,6 +275,10 @@ class PersistentSessionProtocol {
         return;
 
       case "exec_done": {
+        if (msg.id !== this.execId) {
+          // A frame from a superseded exec must never resolve the current one.
+          return;
+        }
         const finalOutput = msg.output as string;
         const observedChars = this.stdoutCharsSeen + finalOutput.length;
         const totalChars = Math.max(observedChars, (msg.total_output_chars as number) ?? observedChars);
@@ -415,8 +419,23 @@ class PersistentSessionProtocol {
     return tail ? ` stderr: ${tail.slice(-2_000)}` : "";
   }
 
+  /**
+   * Reject the exec that is currently in flight (abort teardown). The manager
+   * calls this after a tool call is aborted so the pending promise cannot hang.
+   */
+  rejectInFlight(error: Error): void {
+    this.finish(error);
+  }
+
   /** Run one chunk. The caller serializes (one exec at a time). */
   async exec(code: string, timeoutMs: number | undefined, backgrounded: boolean): Promise<CodeExecutionResult> {
+    if (this.execResolve) {
+      // Serialization is the manager's job; this is defense in depth so two
+      // overlapping execs can never clobber each other's promise state.
+      throw new PtcProtocolError(
+        "python session is busy: another chunk is already executing (python_exec calls are serialized per session)"
+      );
+    }
     this.execId = `exec_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
     this.execStartedAt = Date.now();
     this.chunkLines = code.split("\n");
@@ -509,6 +528,8 @@ interface SessionRecord {
   killed: boolean;
   /** Serializes the python-side exec loop: one chunk runs at a time. */
   queue: Promise<void>;
+  /** Foreground jobs accepted but not yet settled (queued-call detection). */
+  pendingJobs: number;
   background: Map<string, { code: string; status: "pending" | "done" | "error"; result?: CodeExecutionResult }>;
   latestSnapshot: SubagentRuntimeSnapshot | null;
 }
@@ -639,6 +660,7 @@ export class PythonSessionManager {
       lastUsedAt: Date.now(),
       killed: false,
       queue: Promise.resolve(),
+      pendingJobs: 0,
       background: new Map(),
       latestSnapshot: null,
     };
@@ -666,16 +688,51 @@ export class PythonSessionManager {
   }
 
   /** Foreground exec: serialized per session, streams updates, blocks. */
+  /**
+   * Foreground exec: serialized per session. pi may dispatch several python_exec
+   * calls in one assistant message (parallel tool calls), and a session has one
+   * interpreter and one exec loop — so every call must queue behind the previous
+   * one instead of racing it.
+   */
   async execForeground(
     sessionId: string,
     code: string,
     options: SessionExecOptions
   ): Promise<CodeExecutionResult> {
     const record = this.require(sessionId);
-    return record.queue.then(
-      () => this.execChunk(record, code, false, options.onUpdate),
-      () => this.execChunk(record, code, false, options.onUpdate)
+    if (record.pendingJobs > 0 && options.onUpdate) {
+      // pi dispatches parallel tool calls at once; the second chunk cannot start
+      // until the first finishes. Say so instead of showing a silent pending row.
+      options.onUpdate({
+        content: [
+          {
+            type: "text",
+            text: "Queued: another python_exec chunk is still running in this session",
+          },
+        ],
+        details: { sessionId: record.id },
+      });
+    }
+    record.pendingJobs += 1;
+    const job = record.queue.then(
+      () => this.execChunk(record, code, false, options.onUpdate, options.signal),
+      () => this.execChunk(record, code, false, options.onUpdate, options.signal)
     );
+    // Advance the queue regardless of this job's outcome so a failed exec cannot
+    // wedge every later call on the session.
+    record.queue = job.then(
+      () => undefined,
+      () => undefined
+    );
+    void job.then(
+      () => {
+        record.pendingJobs -= 1;
+      },
+      () => {
+        record.pendingJobs -= 1;
+      }
+    );
+    return job;
   }
 
   /** Background exec: queues the chunk, returns the exec id immediately. */
@@ -824,15 +881,40 @@ export class PythonSessionManager {
     record: SessionRecord,
     code: string,
     backgrounded: boolean,
-    onUpdate?: ToolUpdateCallback
+    onUpdate?: ToolUpdateCallback,
+    signal?: AbortSignal
   ): Promise<CodeExecutionResult> {
     validateUserCode(code);
     if (record.killed || record.proc.exitCode !== null) {
       throw new PythonSessionError(`python session ${record.id} is no longer running; provision a new one`);
     }
+    if (signal?.aborted) {
+      throw new Error("python_exec aborted before the chunk started");
+    }
     record.lastUsedAt = Date.now();
     record.chunks.push(code);
     record.protocol.setUpdateHandler(onUpdate);
+
+    // An aborted tool call cannot be unwound inside the interpreter, and leaving
+    // it running would orphan the chunk (plus any subagents it spawned) with no
+    // observer — so abort tears the session down, same as the idle timeout.
+    let abortListener: (() => void) | undefined;
+    let abortError: Error | undefined;
+    if (signal) {
+      abortListener = () => {
+        if (abortError) return;
+        abortError = new Error(
+          `python session ${record.id} was terminated because the tool call was aborted`
+        );
+        // Reject first so the tool call settles immediately, then tear the
+        // session down and forget it (dispose also removes it from the registry).
+        record.protocol.rejectInFlight(abortError);
+        void this.dispose(record.id).catch(() => undefined);
+      };
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) abortListener();
+    }
+
     try {
       return await record.protocol.exec(code, this.settings.executionTimeoutMs, backgrounded);
     } catch (error) {
@@ -844,6 +926,9 @@ export class PythonSessionManager {
       }
       throw error;
     } finally {
+      if (abortListener && signal) {
+        signal.removeEventListener("abort", abortListener);
+      }
       record.protocol.setUpdateHandler(undefined);
       record.lastUsedAt = Date.now();
     }
