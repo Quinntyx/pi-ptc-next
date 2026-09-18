@@ -68,7 +68,6 @@ type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Prom
 
 interface PersistentProtocolOptions {
   maxOutputChars: number;
-  onUpdate?: ToolUpdateCallback;
   terminateProcess: (signal: NodeJS.Signals) => boolean;
   onSubagentSnapshot?: (snapshot: SubagentRuntimeSnapshot) => void;
 }
@@ -88,6 +87,7 @@ class PersistentSessionProtocol {
   private execReject?: (error: Error) => void;
   private execTimeout?: NodeJS.Timeout;
   private backgrounded = false;
+  private updateHandler?: ToolUpdateCallback;
   private currentExecPromiseField: Promise<CodeExecutionResult> | null = null;
   private nestedToolCalls = 0;
   private nestedToolNames: string[] = [];
@@ -319,11 +319,20 @@ class PersistentSessionProtocol {
     }
   }
 
+  /**
+   * Route partial updates to the active tool call. The update handler is set per
+   * exec (not at construction) because the tool call that streams the renders is
+   * only known when the caller invokes python_exec.
+   */
+  setUpdateHandler(handler: ToolUpdateCallback | undefined): void {
+    this.updateHandler = handler;
+  }
+
   private emitUpdate(extra?: Partial<ExecutionDetails>): void {
     if (this.backgrounded) {
       return; // no active tool call to stream updates into
     }
-    this.options.onUpdate?.({
+    this.updateHandler?.({
       content: [{ type: "text", text: this.describeProgress() }],
       details: this.buildDetails(extra),
     });
@@ -616,7 +625,7 @@ export class PythonSessionManager {
     let scriptError: PtcPythonError | undefined;
     if (options.script) {
       try {
-        await this.execChunk(record, options.script, false);
+        await this.execChunk(record, options.script, false, options.onUpdate);
       } catch (error) {
         if (error instanceof PtcPythonError) {
           scriptError = error;
@@ -637,8 +646,8 @@ export class PythonSessionManager {
   ): Promise<CodeExecutionResult> {
     const record = this.require(sessionId);
     return record.queue.then(
-      () => this.execChunk(record, code, false),
-      () => this.execChunk(record, code, false)
+      () => this.execChunk(record, code, false, options.onUpdate),
+      () => this.execChunk(record, code, false, options.onUpdate)
     );
   }
 
@@ -787,7 +796,8 @@ export class PythonSessionManager {
   private async execChunk(
     record: SessionRecord,
     code: string,
-    backgrounded: boolean
+    backgrounded: boolean,
+    onUpdate?: ToolUpdateCallback
   ): Promise<CodeExecutionResult> {
     validateUserCode(code);
     if (record.killed || record.proc.exitCode !== null) {
@@ -795,9 +805,11 @@ export class PythonSessionManager {
     }
     record.lastUsedAt = Date.now();
     record.chunks.push(code);
+    record.protocol.setUpdateHandler(onUpdate);
     try {
       return await record.protocol.exec(code, this.settings.executionTimeoutMs, backgrounded);
     } finally {
+      record.protocol.setUpdateHandler(undefined);
       record.lastUsedAt = Date.now();
     }
   }

@@ -198,6 +198,39 @@ test("persistent session: disposal reaps the interpreter", { skip: !RUN_REAL }, 
   assert.equal(manager.list().length, 0);
 });
 
+test("persistent session: execForeground forwards partial updates to the caller's onUpdate", { skip: !RUN_REAL }, async () => {
+  const manager = makeManager();
+  const updates: Array<{ userCode?: string[]; subagentSnapshot?: unknown }> = [];
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+
+    // Several executed lines guarantee progress frames; the bridge call
+    // guarantees a subagent_state frame — both must reach onUpdate.
+    await manager.execForeground(
+      id,
+      "import builtins, time\nemit = getattr(builtins, 'PTC_STATE_EMIT', None)\nemit({'agents': [{'id': 'a', 'name': 'upd', 'status': 'running'}], 'totals': {'running': 1}})\ntime.sleep(0.2)\nreturn 'done'",
+      {
+        cwd: process.cwd(),
+        onUpdate: (update: { details?: { userCode?: string[]; subagentSnapshot?: unknown } }) => {
+          updates.push((update.details ?? {}) as { userCode?: string[]; subagentSnapshot?: unknown });
+        },
+      }
+    );
+
+    assert.ok(updates.length > 0, "expected at least one partial update");
+    assert.ok(
+      updates.some((update) => Array.isArray(update.userCode) && update.userCode.length > 0),
+      "expected a partial update carrying the chunk's code view lines"
+    );
+    assert.ok(
+      updates.some((update) => update.subagentSnapshot !== undefined),
+      "expected a partial update carrying the subagent snapshot"
+    );
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
 function fakeCtx() {
   return { cwd: process.cwd(), hasUI: false };
 }
