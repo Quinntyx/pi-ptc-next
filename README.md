@@ -151,6 +151,13 @@ Python traceback:
 asyncio.exceptions.CancelledError
 ```
 
+One nuance for aborts: pi races the tool's abort signal
+(`raceWithAbortSignal`), so pressing Esc rejects the tool call with pi's own
+`AbortError` *before* the interrupted chunk reports back. In that case the same
+report is queued as a `ptc-interrupt` message (`deliverAs: nextTurn`) and reaches
+the model on its next turn. Idle **timeouts** reject normally, so their stack is
+in the tool error field directly.
+
 Because the namespace survives, everything the chunk had already created is still
 there — including `pi_subagents` handles, so an interrupted fan-out can simply be
 awaited again in a later chunk:
