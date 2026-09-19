@@ -270,7 +270,16 @@ def _stringify_output(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, (dict, list, tuple, bool, int, float)):
-        return _ptc_json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
+        # User values can hold anything (modules, sockets, DataFrames with odd
+        # fields); fall back to repr instead of failing the chunk, and make that
+        # fallback the very last resort so the session never dies on formatting.
+        try:
+            return _ptc_json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True, default=repr)
+        except Exception:
+            try:
+                return repr(value)
+            except Exception:
+                return "<unserializable result>"
     return str(value)
 
 

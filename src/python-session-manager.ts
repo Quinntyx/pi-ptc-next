@@ -750,6 +750,8 @@ export class PythonSessionManager {
         this.hooks.onSubagentSnapshot?.(sessionId, snapshot);
       },
       onInterruptedReport: (text) => {
+        // Kept for callers that cannot observe the tool result; pi records our
+        // interrupt error as the tool result, so nothing is queued by default.
         this.hooks.onInterrupted?.(sessionId, text);
       },
     });

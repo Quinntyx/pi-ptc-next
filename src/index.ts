@@ -892,20 +892,9 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
       updateSubagentFooter(sessionState, settings);
     },
     onInterrupted: (sessionId, text) => {
-      // pi already rejected the tool call with its own AbortError, so the Python
-      // stack rides into the session as context for the model's next turn.
-      try {
-        pi.sendMessage(
-          {
-            customType: "ptc-interrupt",
-            content: `python_exec in session ${sessionId} was interrupted.\n\n${text}`,
-            display: true,
-          },
-          { deliverAs: "nextTurn" }
-        );
-      } catch (error) {
-        debugLog("failed to queue the interrupt report", error);
-      }
+      // pi records our interrupt error as the tool result, so the model already has
+      // the stack. This hook exists for hosts that drop tool results; keep it quiet.
+      debugLog(`python_exec interrupt report for ${sessionId}`, text.slice(0, 200));
     },
   });
   (globalThis as Record<string, unknown>).__ptcPythonSessionManager = sessionManager;

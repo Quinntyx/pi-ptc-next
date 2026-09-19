@@ -371,6 +371,27 @@ test("persistent session: an aborted subagent wait leaves handles usable", { ski
   }
 });
 
+test("persistent session: an unserializable result is an error, not a session death", { skip: !RUN_REAL }, async () => {
+  // Returning something json cannot encode (a module, a socket) used to kill the
+  // interpreter with "session terminated during execution".
+  const manager = makeManager({}, { executionTimeoutMs: 20_000 });
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.execForeground(id, "kept = 'still-here'\nreturn kept", { cwd: process.cwd() });
+
+    const result = await manager.execForeground(id, "import time\nreturn {'mod': time, 'nested': {'m': time}}", {
+      cwd: process.cwd(),
+    });
+    assert.match(result.output, /time/, "the module should be rendered via repr");
+
+    assert.equal(manager.list().length, 1, "session must survive an unserializable result");
+    const after = await manager.execForeground(id, "return kept", { cwd: process.cwd() });
+    assert.equal(after.output, "still-here");
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
 function fakeCtx() {
   return { cwd: process.cwd(), hasUI: false };
 }

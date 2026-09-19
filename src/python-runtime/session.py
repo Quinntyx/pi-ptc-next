@@ -187,19 +187,30 @@ async def _ptc_exec_chunk(frame: dict) -> None:
         _stdout_proxy.flush()
         _ptc_sys.stdout = _ORIGINAL_STDOUT
         _ptc_sys.settrace(None)
-        if _current_line:
-            _report_execution_progress(_current_line, force=True)
-        images = _capture_figures()
-        final_output = _stringify_output(result)
-        total_output_chars = _stdout_proxy.total_chars + len(final_output)
-        remaining = max(0, _PTC_MAX_OUTPUT_CHARS - _stdout_proxy.accepted_chars)
-        _emit_protocol({
-            "type": "exec_done",
-            "id": exec_id,
-            "output": final_output[:remaining],
-            "images": images,
-            "total_output_chars": total_output_chars,
-        })
+        try:
+            if _current_line:
+                _report_execution_progress(_current_line, force=True)
+            images = _capture_figures()
+            final_output = _stringify_output(result)
+            total_output_chars = _stdout_proxy.total_chars + len(final_output)
+            remaining = max(0, _PTC_MAX_OUTPUT_CHARS - _stdout_proxy.accepted_chars)
+            _emit_protocol({
+                "type": "exec_done",
+                "id": exec_id,
+                "output": final_output[:remaining],
+                "images": images,
+                "total_output_chars": total_output_chars,
+            })
+        except Exception as report_error:
+            # Formatting the result is host plumbing: a failure here must not take
+            # the whole session down (an unserializable return value used to).
+            _emit_protocol({
+                "type": "exec_error",
+                "id": exec_id,
+                "message": f"failed to report the chunk result: {report_error}",
+                "traceback": _ptc_traceback.format_exc(),
+            })
+            return
     except BaseException as fatal:
         # Only host-initiated teardown (abort/disconnect) lands here; report and
         # let the interpreter die — the host is already tearing the session down.
