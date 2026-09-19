@@ -39,7 +39,7 @@ export type RpcMessage =
   | { type: "update"; message: string }
   // Persistent-session frames (python_exec against a provisioned interpreter).
   | { type: "exec_done"; id: string; output: string; images?: PtcImageArtifact[]; total_output_chars?: number }
-  | { type: "exec_error"; id: string; message: string; traceback?: string }
+  | { type: "exec_error"; id: string; message: string; traceback?: string; interrupted?: boolean; line?: number; source?: string }
   | { type: "session_ready" }
   | { type: "subagent_state"; snapshot: SubagentRuntimeSnapshot }
   | { type: "script_exported"; id: string; path: string; cells: number; wrapped_async: boolean; error?: string };

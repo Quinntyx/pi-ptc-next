@@ -61,8 +61,7 @@ PTC_MODE = "session"
 
 ${runtime.sessionCode}
 
-# Session entry
-import asyncio as _ptc_entry_asyncio
-_ptc_entry_asyncio.run(_ptc_session_entry())
+# Session entry: run our own loop so SIGINT interrupts a chunk, not the process.
+_ptc_session_bootstrap()
 `;
 }

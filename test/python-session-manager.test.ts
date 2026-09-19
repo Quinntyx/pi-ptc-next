@@ -262,21 +262,25 @@ test("persistent session: subagent activity re-arms the idle timeout", { skip: !
   }
 });
 
-test("persistent session: silence past the timeout terminates the session", { skip: !RUN_REAL }, async () => {
+test("persistent session: idle timeout interrupts the chunk and keeps the session", { skip: !RUN_REAL }, async () => {
   const manager = makeManager({}, { executionTimeoutMs: 1_200 });
   try {
     const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
-    await assert.rejects(
-      manager.execForeground(id, "import time\ntime.sleep(6)\nreturn 'late'", { cwd: process.cwd() }),
-      (error) => /idle for 1 seconds/.test(error.message)
-    );
-    // The dead session is reaped rather than left orphaned.
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    assert.equal(manager.list().length, 0, "timed-out session should be disposed");
-    await assert.rejects(
-      manager.execForeground(id, "return 1", { cwd: process.cwd() }),
-      (error) => /Unknown python session/.test(error.message)
-    );
+    // Bind state before hanging, to prove the namespace survives the interrupt.
+    await manager.execForeground(id, "kept = 'survived'\nreturn kept", { cwd: process.cwd() });
+
+    const error = await manager
+      .execForeground(id, "import time\ntime.sleep(30)\nreturn 'late'", { cwd: process.cwd() })
+      .then(() => null, (failure) => failure);
+    assert.ok(error, "a silent chunk must time out");
+    assert.match(error.message, /idle for 1 seconds/);
+    assert.match(error.message, /Python traceback:/, "the timeout must carry the Python stack");
+    assert.match(error.message, /Stopped at:\n  chunk line \d+: time\.sleep\(30\)/, "the report should name the line that was stuck");
+
+    // Ctrl-C semantics: the interpreter stays interactive with its state intact.
+    assert.equal(manager.list().length, 1, "session should survive the interrupt");
+    const after = await manager.execForeground(id, "return kept", { cwd: process.cwd() });
+    assert.equal(after.output, "survived");
   } finally {
     await manager.disposeAll();
   }
@@ -315,10 +319,12 @@ test("persistent session: parallel python_exec calls are serialized and both ret
   }
 });
 
-test("persistent session: aborting an exec tears the session down instead of wedging", { skip: !RUN_REAL }, async () => {
+test("persistent session: aborting interrupts the chunk but keeps the session usable", { skip: !RUN_REAL }, async () => {
   const manager = makeManager({}, { executionTimeoutMs: 60_000 });
   try {
     const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.execForeground(id, "before = 41\nreturn before", { cwd: process.cwd() });
+
     const controller = new AbortController();
     const pending = manager.execForeground(id, "import time\ntime.sleep(30)\nreturn 'never'", {
       cwd: process.cwd(),
@@ -326,9 +332,40 @@ test("persistent session: aborting an exec tears the session down instead of wed
     });
     await new Promise((resolve) => setTimeout(resolve, 700));
     controller.abort();
-    await assert.rejects(pending, (error) => /aborted/.test(error.message));
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    assert.equal(manager.list().length, 0, "aborted session should be torn down");
+
+    const error = await pending.then(() => null, (failure) => failure);
+    assert.ok(error, "the aborted call must settle");
+    assert.match(error.message, /aborted/i);
+    assert.match(error.message, /Python traceback:/, "abort must carry the Python stack");
+    assert.match(error.message, /Stopped at:\n  chunk line \d+: time\.sleep\(30\)/);
+
+    // The session keeps running with its namespace intact (Ctrl-C semantics).
+    assert.equal(manager.list().length, 1, "aborted session should survive");
+    const after = await manager.execForeground(id, "return before + 1", { cwd: process.cwd() });
+    assert.equal(after.output, "42");
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("persistent session: an aborted subagent wait leaves handles usable", { skip: !RUN_REAL }, async () => {
+  // The chunk is cancelled at its await, so the fan-out's handles survive in the
+  // namespace for a later chunk to await.
+  const manager = makeManager({}, { executionTimeoutMs: 30_000 });
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const controller = new AbortController();
+    const pending = manager.execForeground(
+      id,
+      "import asyncio\nhandles = ['sentinel-1', 'sentinel-2']\nawait asyncio.sleep(30)\nreturn handles",
+      { cwd: process.cwd(), signal: controller.signal }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    controller.abort();
+    await pending.then(() => null, () => null);
+
+    const after = await manager.execForeground(id, "return handles", { cwd: process.cwd() });
+    assert.match(after.output, /sentinel-1/);
   } finally {
     await manager.disposeAll();
   }

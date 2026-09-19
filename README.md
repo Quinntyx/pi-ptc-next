@@ -129,6 +129,43 @@ Important runtime rules:
 - Prefer returning compact JSON or summaries
 - Intermediate tool results stay local unless you explicitly print or return them
 
+## Interrupting a chunk
+
+`python_exec` never kills a session to stop a chunk. Both aborting the tool call
+(Esc in the TUI) and the idle timeout send **SIGINT into the interpreter** — the
+same thing Ctrl-C does — so the running chunk raises `KeyboardInterrupt` /
+`CancelledError` at the point where it was stuck and the session stays alive with
+its namespace intact.
+
+The tool call then fails with the Python stack of the interruption, e.g.:
+
+```
+Execution aborted (Ctrl-C); the running chunk was interrupted (the session is still alive).
+Stopped at:
+  chunk line 4: await subagents.wait_all_async(handles)
+Python said: CancelledError: chunk execution was interrupted
+
+Python traceback:
+  File "<ptc-cell-1>", line 4, in _ptc_cell
+  File ".../asyncio/tasks.py", line 702, in sleep
+asyncio.exceptions.CancelledError
+```
+
+Because the namespace survives, everything the chunk had already created is still
+there — including `pi_subagents` handles, so an interrupted fan-out can simply be
+awaited again in a later chunk:
+
+```python
+responses = await subagents.wait_all_async(handles)   # handles survived the abort
+```
+
+The idle timeout is reported the same way (`PtcTimeoutError` + "Stopped at: …" +
+traceback). Use `/ptc interrupt [session_id]` to stop the running chunk from the
+TUI without Esc, or `/ptc kill` to drop the session entirely.
+
+If the interpreter cannot be interrupted (stuck somewhere native), the host gives
+it a short grace period and then forces it down.
+
 ## Session footguns
 
 - Child processes spawned from a `python_exec` chunk inherit the interpreter's RPC pipes. Any child that reads stdin or writes to stdout will corrupt the protocol and hang the session — always pass `stdin=DEVNULL` and capture stdout/stderr when using `subprocess` inside a session (e.g. `subprocess.run([...], stdin=subprocess.DEVNULL, capture_output=True)`).

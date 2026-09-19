@@ -656,13 +656,16 @@ function resolveTargetSession(
 
 function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManager, sessionState: PtcSessionState): void {
   pi.registerCommand("ptc", {
-    description: "Control PTC python sessions: /ptc <kill> [session_id] (background/foreground are WIP)",
+    description: "Control PTC python sessions: /ptc <interrupt|kill> [session_id] (background/foreground are WIP)",
     handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
       const [actionRaw, requestedId] = (args ?? "").trim().split(/\s+/);
       const action = (actionRaw ?? "").toLowerCase();
 
-      if (!["background", "bg", "foreground", "fg", "kill"].includes(action)) {
-        ctx.ui.notify("usage: /ptc <kill> [session_id]  (background|bg|foreground|fg are WIP/deferred)", "error");
+      if (!["background", "bg", "foreground", "fg", "interrupt", "stop", "kill"].includes(action)) {
+        ctx.ui.notify(
+          "usage: /ptc <interrupt|kill> [session_id]  (background|bg|foreground|fg are WIP/deferred)",
+          "error"
+        );
         return;
       }
 
@@ -673,6 +676,19 @@ function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManag
       const target = resolveTargetSession(sessionManager, sessionState, requestedId);
       if ("error" in target) {
         ctx.ui.notify(target.error, "error");
+        return;
+      }
+
+      if (action === "interrupt" || action === "stop") {
+        // Ctrl-C semantics: the running chunk stops where it is, the session (and
+        // anything it spawned) stays alive for the next chunk to reuse.
+        const interrupted = sessionManager.interruptRunning(target.id);
+        ctx.ui.notify(
+          interrupted
+            ? `Interrupted the running chunk in session ${target.id} (session left alive)`
+            : `Nothing running in session ${target.id}`,
+          interrupted ? "info" : "error"
+        );
         return;
       }
 

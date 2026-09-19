@@ -5,6 +5,7 @@ import * as path from "path";
 import type { ChildProcess } from "child_process";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
+  PtcAbortError,
   PtcProtocolError,
   PtcPythonError,
   PtcTimeoutError,
@@ -70,8 +71,15 @@ type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Prom
 interface PersistentProtocolOptions {
   maxOutputChars: number;
   terminateProcess: (signal: NodeJS.Signals) => boolean;
+  /** Send a signal to the interpreter (SIGINT mirrors Ctrl-C). */
+  sendSignal: (signal: NodeJS.Signals) => boolean;
   onSubagentSnapshot?: (snapshot: SubagentRuntimeSnapshot) => void;
 }
+
+/** How long to wait for the interrupted chunk to report back before forcing it. */
+const INTERRUPT_GRACE_MS = 5_000;
+
+type InterruptKind = "abort" | "timeout";
 
 class PersistentSessionProtocol {
   private stdout = "";
@@ -103,6 +111,8 @@ class PersistentSessionProtocol {
   private scriptExportId = "";
   private scriptExportResolve?: (result: ScriptExportResult) => void;
   private scriptExportReject?: (error: Error) => void;
+  private pendingInterrupt?: { kind: InterruptKind; message: string };
+  private interruptGraceTimer?: NodeJS.Timeout;
 
   constructor(
     private proc: ChildProcess,
@@ -201,6 +211,11 @@ class PersistentSessionProtocol {
     this.execResolve = undefined;
     this.execReject = undefined;
     this.clearExecTimeout();
+    if (this.interruptGraceTimer) {
+      clearTimeout(this.interruptGraceTimer);
+      this.interruptGraceTimer = undefined;
+    }
+    this.pendingInterrupt = undefined;
     if (!resolve || !reject) {
       return; // already finished or superseded
     }
@@ -294,7 +309,19 @@ class PersistentSessionProtocol {
         if (msg.id !== this.execId) {
           return; // stale frame from a torn-down exec
         }
-        this.finish(new PtcPythonError(msg.message as string, msg.traceback as string | undefined));
+        const rawMessage = msg.message as string;
+        const traceback = msg.traceback as string | undefined;
+        const interrupt = this.pendingInterrupt;
+        if (interrupt) {
+          // The chunk reported back after our SIGINT: surface the interrupt with
+          // the Python stack so the caller can see where it stopped.
+          this.pendingInterrupt = undefined;
+          const line = typeof msg.line === "number" ? msg.line : undefined;
+          const source = typeof msg.source === "string" && msg.source ? msg.source : undefined;
+          this.finish(this.buildInterruptError(interrupt, rawMessage, traceback, line, source));
+          return;
+        }
+        this.finish(new PtcPythonError(rawMessage, traceback));
         return;
       }
 
@@ -356,14 +383,67 @@ class PersistentSessionProtocol {
     const windowMs = this.execTimeoutMs;
     this.execTimeout = setTimeout(() => {
       this.execTimeout = undefined;
-      this.finish(
-        new PtcTimeoutError(
-          `Python session idle for ${Math.round(windowMs / 1000)} seconds with no activity ` +
-            "(no progress, output, or subagent updates); the session was terminated."
-        )
+      // Interrupt the chunk instead of killing the session: the caller gets the
+      // Python stack where it was stuck, and the session stays interactive.
+      this.interrupt(
+        "timeout",
+        `Python session idle for ${Math.round(windowMs / 1000)} seconds with no activity ` +
+          "(no progress, output, or subagent updates)"
       );
     }, windowMs);
     this.execTimeout.unref?.();
+  }
+
+  /**
+   * Stop the running chunk the way Ctrl-C would: SIGINT into the interpreter,
+   * which surfaces as KeyboardInterrupt/CancelledError inside the chunk. The
+   * process and its namespace survive, so the caller can inspect state and retry.
+   */
+  interrupt(kind: InterruptKind, message: string): void {
+    if (!this.execResolve) {
+      return; // nothing running
+    }
+    this.pendingInterrupt = { kind, message };
+    this.clearExecTimeout();
+    this.options.sendSignal("SIGINT");
+
+    // If the chunk cannot be interrupted (stuck in an uninterruptible native
+    // call), force the process down rather than leaving the call hanging.
+    if (this.interruptGraceTimer) {
+      clearTimeout(this.interruptGraceTimer);
+    }
+    this.interruptGraceTimer = setTimeout(() => {
+      this.interruptGraceTimer = undefined;
+      const interrupt = this.pendingInterrupt;
+      if (!interrupt || !this.execResolve) {
+        return;
+      }
+      this.pendingInterrupt = undefined;
+      this.options.terminateProcess("SIGKILL");
+      this.finish(this.buildInterruptError(interrupt, "interpreter did not respond to the interrupt", undefined));
+    }, INTERRUPT_GRACE_MS);
+    this.interruptGraceTimer.unref?.();
+  }
+
+  private buildInterruptError(
+    interrupt: { kind: InterruptKind; message: string },
+    pythonMessage: string,
+    traceback: string | undefined,
+    line?: number,
+    source?: string
+  ): Error {
+    const where = line
+      ? `  chunk line ${line}${source ? `: ${source}` : ""}`
+      : undefined;
+    const stack = traceback ? `\n\nPython traceback:\n${traceback.trimEnd()}` : "";
+    const text =
+      (interrupt.kind === "timeout"
+        ? `${interrupt.message}; the running chunk was interrupted (the session is still alive).`
+        : "Execution aborted (Ctrl-C); the running chunk was interrupted (the session is still alive).") +
+      (where ? `\nStopped at:\n${where}` : "") +
+      `\nPython said: ${pythonMessage}` +
+      stack;
+    return interrupt.kind === "timeout" ? new PtcTimeoutError(text) : new PtcAbortError(text);
   }
 
   private emitUpdate(extra?: Partial<ExecutionDetails>): void {
@@ -420,8 +500,8 @@ class PersistentSessionProtocol {
   }
 
   /**
-   * Reject the exec that is currently in flight (abort teardown). The manager
-   * calls this after a tool call is aborted so the pending promise cannot hang.
+   * Reject the exec that is currently in flight (used when a queued exec is
+   * discarded before it starts).
    */
   rejectInFlight(error: Error): void {
     this.finish(error);
@@ -645,6 +725,7 @@ export class PythonSessionManager {
     const protocol = new PersistentSessionProtocol(proc, callableToolRuntime.runTool, {
       maxOutputChars: this.settings.maxOutputChars,
       terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
+      sendSignal: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
       onSubagentSnapshot: (snapshot) => {
         record.latestSnapshot = snapshot;
         this.hooks.onSubagentSnapshot?.(sessionId, snapshot);
@@ -834,6 +915,20 @@ export class PythonSessionManager {
   }
 
   /**
+   * Interrupt the chunk running in a session (Ctrl-C semantics). The interpreter
+   * and its namespace survive; the running tool call reports the abort with the
+   * Python stack. Returns false when nothing was running.
+   */
+  interruptRunning(sessionId: string): boolean {
+    const record = this.sessions.get(sessionId);
+    if (!record || !record.protocol.currentExecId()) {
+      return false;
+    }
+    record.protocol.interrupt("abort", "interrupted from /ptc");
+    return true;
+  }
+
+  /**
    * Convert the currently-running foreground exec into a background run
    * ("User manually backgrounded this ptc run"). Returns its exec id, or null
    * when nothing is executing in the session.
@@ -889,27 +984,19 @@ export class PythonSessionManager {
       throw new PythonSessionError(`python session ${record.id} is no longer running; provision a new one`);
     }
     if (signal?.aborted) {
-      throw new Error("python_exec aborted before the chunk started");
+      throw new PtcAbortError("python_exec aborted before the chunk started");
     }
     record.lastUsedAt = Date.now();
     record.chunks.push(code);
     record.protocol.setUpdateHandler(onUpdate);
 
-    // An aborted tool call cannot be unwound inside the interpreter, and leaving
-    // it running would orphan the chunk (plus any subagents it spawned) with no
-    // observer — so abort tears the session down, same as the idle timeout.
+    // An aborted tool call interrupts the running chunk (Ctrl-C semantics) and
+    // leaves the session interactive, so its namespace and any subagents the
+    // chunk spawned can still be used by later chunks.
     let abortListener: (() => void) | undefined;
-    let abortError: Error | undefined;
     if (signal) {
       abortListener = () => {
-        if (abortError) return;
-        abortError = new Error(
-          `python session ${record.id} was terminated because the tool call was aborted`
-        );
-        // Reject first so the tool call settles immediately, then tear the
-        // session down and forget it (dispose also removes it from the registry).
-        record.protocol.rejectInFlight(abortError);
-        void this.dispose(record.id).catch(() => undefined);
+        record.protocol.interrupt("abort", "tool call aborted");
       };
       signal.addEventListener("abort", abortListener, { once: true });
       if (signal.aborted) abortListener();
@@ -917,14 +1004,6 @@ export class PythonSessionManager {
 
     try {
       return await record.protocol.exec(code, this.settings.executionTimeoutMs, backgrounded);
-    } catch (error) {
-      if (error instanceof PtcTimeoutError) {
-        // A silent session is unusable: the chunk may still be running inside the
-        // interpreter with no way to observe or interrupt it, so tear it down
-        // instead of leaving an orphaned process and its subagents behind.
-        void this.dispose(record.id).catch(() => undefined);
-      }
-      throw error;
     } finally {
       if (abortListener && signal) {
         signal.removeEventListener("abort", abortListener);

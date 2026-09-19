@@ -34,6 +34,10 @@ _ptc_builtins.PTC_STATE_EMIT = lambda snapshot: _emit_protocol({
 })
 
 _cell_counter = 0
+# The chunk currently executing, so a SIGINT can cancel it without killing the
+# session (Ctrl-C semantics: stop the chunk, keep the interpreter interactive).
+_ptc_current_chunk_task = None
+_ptc_loop = None
 _PTC_MERGE_SKIP_NAMES = {"ptc_cell_storage", "__builtins__"}
 # The session wrapper's `def _ptc_cell` is placed on the chunk's first user
 # line, so raw trace deltas start at 0; shift to 1-based like the one-shot path.
@@ -144,7 +148,32 @@ async def _ptc_exec_chunk(frame: dict) -> None:
             _stdout_proxy.flush()
             _ptc_sys.stdout = _ORIGINAL_STDOUT
             _ptc_sys.settrace(None)
-            if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            if isinstance(error, (_ptc_asyncio.CancelledError, KeyboardInterrupt)):
+                # Ctrl-C semantics: report where the chunk stopped and stay
+                # interactive, so the caller can inspect state and retry.
+                kind = "CancelledError" if isinstance(error, _ptc_asyncio.CancelledError) else "KeyboardInterrupt"
+                # The traceback is authoritative: the tracer's last line can be the
+                # wrapper's own bookkeeping statement rather than the user's line.
+                line = 0
+                for frame in reversed(_ptc_traceback.extract_tb(error.__traceback__)):
+                    if frame.filename == cell_name:
+                        line = frame.lineno or 0
+                        break
+                if not line:
+                    line = _current_line or 0
+                source_lines = code.split("\n")
+                source = source_lines[line - 1].strip() if 0 < line <= len(source_lines) else ""
+                _emit_protocol({
+                    "type": "exec_error",
+                    "id": exec_id,
+                    "message": f"{kind}: chunk execution was interrupted",
+                    "traceback": _ptc_traceback.format_exc(),
+                    "interrupted": True,
+                    "line": line,
+                    "source": source,
+                })
+                return
+            if isinstance(error, (SystemExit, GeneratorExit)):
                 raise
             _emit_protocol({
                 "type": "exec_error",
@@ -290,9 +319,23 @@ def _ptc_export_script(frame: dict) -> None:
         _fail(str(error))
 
 
+def _ptc_interrupt_chunk() -> None:
+    """Cancel the chunk that is executing right now (Ctrl-C semantics).
+
+    Called when a SIGINT arrives while the event loop was parked in select() with
+    the chunk suspended at an await; the cancellation surfaces inside the chunk as
+    CancelledError, which _ptc_exec_chunk reports as an interrupted exec.
+    """
+    task = _ptc_current_chunk_task
+    if task is not None and not task.done():
+        task.cancel()
+
+
 async def _ptc_session_entry() -> None:
-    """Persistent exec loop; invoked via asyncio.run(_ptc_session_entry()) by
-    the host-built prelude when PTC_MODE == "session"."""
+    """Persistent exec loop; driven by _ptc_session_bootstrap() when
+    PTC_MODE == "session"."""
+    global _ptc_current_chunk_task
+
     await _rpc.start_reader()
     _setup_matplotlib()
 
@@ -303,8 +346,10 @@ async def _ptc_session_entry() -> None:
     _ptc_sys.stdout = _stdout_proxy
 
     disconnect_wait = _ptc_asyncio.ensure_future(_rpc.disconnected.wait())
+    # One persistent getter: an interrupt must never strand a queue read, or the
+    # next frame would be delivered to a forgotten task.
+    get_frame: "_ptc_asyncio.Task[dict]" = _ptc_asyncio.ensure_future(frame_queue.get())
     while True:
-        get_frame = _ptc_asyncio.ensure_future(frame_queue.get())
         done, _pending = await _ptc_asyncio.wait(
             {get_frame, disconnect_wait}, return_when=_ptc_asyncio.FIRST_COMPLETED
         )
@@ -312,14 +357,50 @@ async def _ptc_session_entry() -> None:
             get_frame.cancel()
             break
         frame = get_frame.result()
+        get_frame = _ptc_asyncio.ensure_future(frame_queue.get())
         if frame.get("type") == "export_script":
             _ptc_export_script(frame)
             _stdout_proxy.flush()
             continue
+        task = _ptc_asyncio.ensure_future(_ptc_exec_chunk(frame))
+        _ptc_current_chunk_task = task
         try:
-            await _ptc_exec_chunk(frame)
+            await task
+        except _ptc_asyncio.CancelledError:
+            pass  # _ptc_exec_chunk already reported the interruption
         except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            _ptc_current_chunk_task = None
             break
+        finally:
+            _ptc_current_chunk_task = None
         _stdout_proxy.flush()
 
     await _rpc.cleanup()
+
+
+def _ptc_session_bootstrap() -> None:
+    """Run the session loop on our own event loop so SIGINT can interrupt a chunk
+    without asyncio.run()'s Runner cancelling everything and exiting the process."""
+    global _ptc_loop
+
+    loop = _ptc_asyncio.new_event_loop()
+    _ptc_asyncio.set_event_loop(loop)
+    _ptc_loop = loop
+    main_task = loop.create_task(_ptc_session_entry())
+    try:
+        while True:
+            try:
+                loop.run_until_complete(main_task)
+                break
+            except KeyboardInterrupt:
+                # The signal landed while the loop was parked in select(): cancel
+                # the running chunk and keep serving frames.
+                _ptc_interrupt_chunk()
+                continue
+    finally:
+        _ptc_loop = None
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        loop.close()
