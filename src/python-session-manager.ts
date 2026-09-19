@@ -72,8 +72,15 @@ interface PersistentProtocolOptions {
   maxOutputChars: number;
   terminateProcess: (signal: NodeJS.Signals) => boolean;
   /** Send a signal to the interpreter (SIGINT mirrors Ctrl-C). */
-  sendSignal: (signal: NodeJS.Signals) => boolean;
+  sendSignal: (signal: NodeJS.Signals) => void;
   onSubagentSnapshot?: (snapshot: SubagentRuntimeSnapshot) => void;
+  /**
+   * Fired when an interrupted chunk settles after the tool call was already
+   * aborted by pi: pi rejects the call with its own AbortError immediately (it
+   * races the abort signal), so the Python stack has to reach the model as a
+   * queued message instead of a tool result.
+   */
+  onInterruptedReport?: (text: string) => void;
 }
 
 /** How long to wait for the interrupted chunk to report back before forcing it. */
@@ -318,7 +325,11 @@ class PersistentSessionProtocol {
           this.pendingInterrupt = undefined;
           const line = typeof msg.line === "number" ? msg.line : undefined;
           const source = typeof msg.source === "string" && msg.source ? msg.source : undefined;
-          this.finish(this.buildInterruptError(interrupt, rawMessage, traceback, line, source));
+          const error = this.buildInterruptError(interrupt, rawMessage, traceback, line, source);
+          this.finish(error);
+          if (interrupt.kind === "abort") {
+            this.options.onInterruptedReport?.(error.message);
+          }
           return;
         }
         this.finish(new PtcPythonError(rawMessage, traceback));
@@ -420,7 +431,11 @@ class PersistentSessionProtocol {
       }
       this.pendingInterrupt = undefined;
       this.options.terminateProcess("SIGKILL");
-      this.finish(this.buildInterruptError(interrupt, "interpreter did not respond to the interrupt", undefined));
+      const error = this.buildInterruptError(interrupt, "interpreter did not respond to the interrupt", undefined);
+      this.finish(error);
+      if (interrupt.kind === "abort") {
+        this.options.onInterruptedReport?.(error.message);
+      }
     }, INTERRUPT_GRACE_MS);
     this.interruptGraceTimer.unref?.();
   }
@@ -617,6 +632,8 @@ interface SessionRecord {
 export interface PythonSessionManagerHooks {
   onSubagentSnapshot?: (sessionId: string, snapshot: SubagentRuntimeSnapshot) => void;
   onBackgroundComplete?: (completion: BackgroundCompletion) => void;
+  /** Report for a chunk interrupted after pi had already aborted the tool call. */
+  onInterrupted?: (sessionId: string, text: string) => void;
 }
 
 export class PythonSessionManager {
@@ -725,10 +742,15 @@ export class PythonSessionManager {
     const protocol = new PersistentSessionProtocol(proc, callableToolRuntime.runTool, {
       maxOutputChars: this.settings.maxOutputChars,
       terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
-      sendSignal: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
+      sendSignal: (signal) => {
+        this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal);
+      },
       onSubagentSnapshot: (snapshot) => {
         record.latestSnapshot = snapshot;
         this.hooks.onSubagentSnapshot?.(sessionId, snapshot);
+      },
+      onInterruptedReport: (text) => {
+        this.hooks.onInterrupted?.(sessionId, text);
       },
     });
 
