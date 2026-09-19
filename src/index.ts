@@ -219,12 +219,9 @@ Workflow:
 
 Prefer python_exec for repo-wide analysis, repeated lookups, loops, grouping, ranking, counting, filtering, or any task with 3+ dependent tool calls. Use direct tools for one-file reads, one-off grep/find calls, or tiny lookups.
 
-python_exec options:
-- Default: blocking execution with streaming progress. No hidden backgrounding — background runs are opt-in.
-- background: true — queue the chunk and return immediately; the result arrives later as a [ptc-background-complete] message.
-- wait_for: "<exec_id>" — block until a previously backgrounded exec completes and return its result.
+python_exec runs synchronously and streams progress — including a live viewer of any pi_subagents fan-out the chunk runs (agent status rows render under the code view while it executes). Prefer orchestrating an entire fan-out inside one chunk: spawn the subagents, wait for them, aggregate, return the summary.
 
-python_exec can also orchestrate pi subagents via the autoimported pi_subagents module (AgentHandle / AgentSession); subagent status is rendered live under the code view while the session runs.
+Subagents: the autoimported pi_subagents module spawns real pi instances in tmux windows (AgentHandle / AgentSession). Ask it what is available before naming a model — subagents.capabilities(), subagents.best_model_match("astra").slug, subagents.thinking_levels() — then pass model=/thinking= to subagents.agent().
 
 Important rules:
 - Top-level await is already available. Do not call asyncio.run(...).
