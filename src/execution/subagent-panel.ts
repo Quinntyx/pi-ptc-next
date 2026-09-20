@@ -49,7 +49,12 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
     return [];
   }
 
-  const now = snapshot.timestamp && Date.now() - snapshot.timestamp < 5_000 ? snapshot.timestamp : Date.now();
+  // Animation and elapsed time run on the wall clock. The snapshot's timestamp is
+  // only used to extrapolate the values it carries: pinning `now` to it (as this
+  // once did) froze the shimmer between snapshots, so it advanced at the ~1 Hz
+  // rate of subagent_state frames instead of the repaint rate.
+  const wallNow = Date.now();
+  const drift = snapshot.timestamp ? Math.max(0, wallNow - snapshot.timestamp) : 0;
   const agents = snapshot.agents;
   const groups = snapshot.groups ?? {};
   const groupOrder: string[] = [];
@@ -64,13 +69,13 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   const totals = snapshot.totals ?? {};
   for (const group of withEmpty) {
     const groupAgents = agents.filter((a) => (a.group ?? "") === group);
-    const startedAt = groups[group] ?? Math.min(...groupAgents.map((a) => a.startedAt ?? now));
+    const startedAt = groups[group] ?? Math.min(...groupAgents.map((a) => a.startedAt ?? wallNow));
     if (group) {
   
       const runningCount = groupAgents.filter((a) => a.status === "running" || a.status === "starting").length;
       const head = runningCount > 0
-        ? `${theme.fg("success", "●")} ${theme.fg("accent", group)} ${theme.fg("muted", `· ${formatAgentSeconds(now - startedAt)}`)}`
-        : `${theme.fg("success", "●")} ${theme.fg("muted", group)} ${theme.fg("muted", `· ${formatAgentSeconds(now - startedAt)}`)}`;
+        ? `${theme.fg("success", "●")} ${theme.fg("accent", group)} ${theme.fg("muted", `· ${formatAgentSeconds(wallNow - startedAt)}`)}`
+        : `${theme.fg("success", "●")} ${theme.fg("muted", group)} ${theme.fg("muted", `· ${formatAgentSeconds(wallNow - startedAt)}`)}`;
       lines.push(`    ${head}`);
     }
 
@@ -89,10 +94,16 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
 
       const running = agent.status === "running";
       const light = running ? theme.fg("success", "●") : agent.status === "settled" ? theme.fg("success", "✓") : theme.fg("warning", "!");
+      // Running values tick with the wall clock between snapshots; settled ones are final.
+      const elapsedMs = (agent.elapsedMs ?? 0) + (running ? drift : 0);
+      const labelElapsedMs =
+        agent.labelElapsedMs === null || agent.labelElapsedMs === undefined
+          ? null
+          : agent.labelElapsedMs + (running ? drift : 0);
 
       // agent row: name · elapsed · tool calls · ctx
       const segments = [
-        theme.fg("muted", `· ${formatAgentSeconds(agent.elapsedMs)}`),
+        theme.fg("muted", `· ${formatAgentSeconds(elapsedMs)}`),
         agentCallsSegment(agent.toolCalls, theme),
         formatCtx(agent.ctx, theme),
       ].filter(Boolean);
@@ -102,10 +113,10 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
       const word = agent.label ?? agent.phase;
       const detailBits: string[] = [];
       if (word) {
-        detailBits.push(running ? shimmerWord(word, theme, now) : theme.fg("muted", word));
+        detailBits.push(running ? shimmerWord(word, theme, wallNow) : theme.fg("muted", word));
       }
-      if (agent.labelElapsedMs) {
-        detailBits.push(theme.fg("muted", ` · ${formatAgentSeconds(agent.labelElapsedMs)}`));
+      if (labelElapsedMs) {
+        detailBits.push(theme.fg("muted", ` · ${formatAgentSeconds(labelElapsedMs)}`));
       }
       if (agent.labelCalls) {
         detailBits.push(theme.fg("muted", ` · ${agent.labelCalls} tool call${agent.labelCalls === 1 ? "" : "s"}`));

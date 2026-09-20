@@ -9,6 +9,8 @@ from typing import Any, Callable, Coroutine, Iterable, Sequence
 _current_line = 0
 _last_reported_line = 0
 _last_progress_at = 0.0
+_pending_progress_line: "int | None" = None
+_progress_flush_handle = None
 _PTC_PROGRESS_INTERVAL_SECONDS = 0.05
 _PTC_HOST_WORKSPACE_ROOT = globals().get("PTC_HOST_WORKSPACE_ROOT", _ptc_os.getcwd())
 _PTC_RUNTIME_WORKSPACE_ROOT = globals().get("PTC_RUNTIME_WORKSPACE_ROOT", _ptc_os.getcwd())
@@ -57,26 +59,69 @@ class _StdoutProxy:
 _stdout_proxy = _StdoutProxy()
 
 
-def _report_execution_progress(lineno: int, force: bool = False) -> None:
+def _emit_progress_frame(lineno: int) -> None:
     global _last_progress_at, _last_reported_line
+    # A newer frame supersedes any scheduled flush, and dropping the timer keeps a
+    # finished chunk's interpreter from being held open by a stray callback.
+    _cancel_progress_flush()
+    try:
+        _emit_protocol({"type": "execution_progress", "line": lineno, "total_lines": _PTC_USER_CODE_LINE_COUNT})
+        _last_reported_line = lineno
+        _last_progress_at = _ptc_time.monotonic()
+    except Exception:
+        pass
+
+
+def _cancel_progress_flush() -> None:
+    global _progress_flush_handle
+    if _progress_flush_handle is not None:
+        _progress_flush_handle.cancel()
+        _progress_flush_handle = None
+
+
+def _flush_pending_progress() -> None:
+    global _pending_progress_line, _progress_flush_handle
+    _progress_flush_handle = None
+    line = _pending_progress_line
+    _pending_progress_line = None
+    if line is not None:
+        _emit_progress_frame(line)
+
+
+def _schedule_progress_flush() -> None:
+    global _progress_flush_handle
+    try:
+        loop = _ptc_asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _cancel_progress_flush()
+    _progress_flush_handle = loop.call_later(_PTC_PROGRESS_INTERVAL_SECONDS, _flush_pending_progress)
+
+
+def _report_execution_progress(lineno: int, force: bool = False) -> None:
+    global _pending_progress_line
 
     # sys.settrace fires for every executed line. Emitting and flushing one JSON
     # frame per event can fill the pipe and starve the Node event loop/SIGCHLD
     # handling during tight loops. Repeated lines need no redraw, and changed
     # lines are capped at 20 updates/second.
-    if lineno == _last_reported_line:
+    #
+    # Suppressed lines are *coalesced*, never dropped: a chunk typically runs its
+    # first statements within a few milliseconds, and dropping those left the
+    # viewer's line arrow pinned at line 1 for the whole (long) await that
+    # followed. The newest suppressed line is flushed on a timer, so the arrow
+    # catches up as soon as the chunk yields back to the loop.
+    if lineno == _last_reported_line and not force:
         return
 
     now = _ptc_time.monotonic()
     if not force and _last_progress_at and now - _last_progress_at < _PTC_PROGRESS_INTERVAL_SECONDS:
+        _pending_progress_line = lineno
+        _schedule_progress_flush()
         return
 
-    try:
-        _emit_protocol({"type": "execution_progress", "line": lineno, "total_lines": _PTC_USER_CODE_LINE_COUNT})
-        _last_reported_line = lineno
-        _last_progress_at = now
-    except Exception:
-        pass
+    _pending_progress_line = None
+    _emit_progress_frame(lineno)
 
 
 def _trace_lines(frame, event, arg):
@@ -297,6 +342,7 @@ async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
         # the regular progress update was suppressed by the rate limit.
         if _current_line:
             _report_execution_progress(_current_line, force=True)
+        _cancel_progress_flush()
         images = _capture_figures()
         final_output = _stringify_output(output)
         total_output_chars = _stdout_proxy.total_chars + len(final_output)

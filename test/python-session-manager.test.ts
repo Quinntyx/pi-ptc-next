@@ -392,6 +392,46 @@ test("persistent session: an unserializable result is an error, not a session de
   }
 });
 
+test("persistent session: the line arrow catches up when a chunk blocks", { skip: !RUN_REAL }, async () => {
+  // A chunk runs its first statements within milliseconds; those progress frames
+  // used to be dropped by the rate limiter, leaving the viewer's arrow pinned at
+  // line 1 for the whole await that followed.
+  const manager = makeManager({}, { executionTimeoutMs: 30_000 });
+  const lines: Array<number | undefined> = [];
+  try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const chunk = [
+      "import asyncio",
+      "a = 1",
+      "b = 2",
+      "c = a + b",
+      "d = c * 2",
+      "await asyncio.sleep(1.0)",
+      "e = d + 1",
+      "return e",
+    ].join("\n");
+    await manager.execForeground(id, chunk, {
+      cwd: process.cwd(),
+      onUpdate: (update: { details?: { currentLine?: number } }) => {
+        lines.push(update.details?.currentLine);
+      },
+    });
+
+    const reported = lines.filter((line): line is number => typeof line === "number");
+    assert.ok(reported.length > 0, "expected progress updates");
+    assert.ok(
+      reported.includes(6),
+      `the await line must be reported before the chunk resumes, got ${JSON.stringify(reported)}`
+    );
+    assert.ok(
+      reported[reported.length - 1] >= 6,
+      `the chunk must not end by reporting an earlier line, got ${JSON.stringify(reported)}`
+    );
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
 function fakeCtx() {
   return { cwd: process.cwd(), hasUI: false };
 }

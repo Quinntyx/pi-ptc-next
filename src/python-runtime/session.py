@@ -96,6 +96,10 @@ def _ptc_build_cell(code: str, cell_name: str):
             func=_ptc_ast.Name(id="locals", ctx=_ptc_ast.Load()), args=[], keywords=[]
         ),
     )
+    # Borrow the last user statement's location: the wrapper's own bookkeeping must
+    # not be reported as a line (it otherwise inherits line 1 and makes the viewer's
+    # arrow jump back to the top at the end of every chunk).
+    _ptc_ast.copy_location(storage, body[-1])
     guarded = _ptc_ast.Try(
         body=body,
         handlers=[],
@@ -190,6 +194,7 @@ async def _ptc_exec_chunk(frame: dict) -> None:
         try:
             if _current_line:
                 _report_execution_progress(_current_line, force=True)
+            _cancel_progress_flush()
             images = _capture_figures()
             final_output = _stringify_output(result)
             total_output_chars = _stdout_proxy.total_chars + len(final_output)
