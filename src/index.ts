@@ -214,8 +214,9 @@ function buildToolDescription(currentSettings: PtcSettings, callableTools: ToolI
 
 Workflow:
 1. provision_python_session — start a persistent interpreter, get a session id. Optionally seed it by executing a Python file first.
-2. python_exec — run code chunks in that session. Imports, definitions, and variables persist across chunks. The cumulative code can be exported as a durable script at any time.
+2. python_exec — run code chunks in that session. It behaves like an interactive Python REPL that stays open: imports, variables, and defined functions carry over to later chunks and later turns, so import each module once and build on it. The cumulative code can be exported as a durable script at any time.
 3. python_session_to_script — write the session's cumulative code to a script file on disk, then edit/run it with normal tools.
+4. when a chunk's subagents are done and no longer needed, close them with subagents.finish() so their tmux windows do not pile up.
 
 Prefer python_exec for repo-wide analysis, repeated lookups, loops, grouping, ranking, counting, filtering, or any task with 3+ dependent tool calls. Use direct tools for one-file reads, one-off grep/find calls, or tiny lookups.
 
@@ -241,21 +242,24 @@ Python helpers currently available in this session:
 ${dockerBehavior}`;
 }
 
-const PROVISION_DESCRIPTION = `Start a persistent Python interpreter session and return its id. Code chunks sent to python_exec share one namespace, so imports and definitions persist.
+const PROVISION_DESCRIPTION = `Start a persistent Python session and return its id. Sessions work exactly like an interactive Python REPL: every python_exec chunk sent to the session runs in the same live interpreter namespace, so modules you import, variables you assign, and functions/classes you define all carry over to later chunks and later turns of the conversation.
 
-Takes an optional path to a Python file that is executed first, so the session can start from a prebuilt script (for example one exported earlier via python_session_to_script) and continue working in the resulting environment.`;
+Import each module ONCE per session — there is no need to re-import in later chunks; re-importing the same module repeatedly is wasteful and a sign the session was not reused. Likewise define helper functions once and call them from later chunks.
 
-const PYTHON_EXEC_DESCRIPTION = `Execute Python code in a persistent session. Chunks run in one shared namespace: imports, functions, and variables from earlier chunks remain available.
+Optionally pass a script path: a path to a Python file that is executed in the session before the id is returned, so the session can start from a prebuilt script (for example one exported earlier via python_session_to_script) and continue working in the resulting environment.
+
+Sessions stay alive until the conversation ends or /ptc kill, so reuse them across turns and across python_exec calls instead of provisioning a new one for each step.`;
+
+const PYTHON_EXEC_DESCRIPTION = `Run Python code inside a persistent, already-provisioned session — like typing into an interactive Python REPL that stays open between calls.
+
+Everything in the namespace carries over to later chunks and later conversation turns: modules imported earlier are still imported (do NOT re-import them), variables assigned earlier are still set, and functions/classes defined earlier are still callable. Write each chunk as the continuation of the live session — build on what is already there instead of rebuilding it.
 
 - session_id (required): id from provision_python_session. Unknown ids error with the list of live sessions.
-
-Runs synchronously and blocks until the chunk finishes — progress streams into the transcript, including a live view of any pi_subagents fan-out the code runs. Prefer doing all orchestration inside one chunk (spawn subagents, wait for them, aggregate, return the summary) so the viewer can render the whole fan-out.
-
-Rules:
 - Top-level await is available; do not call asyncio.run(...).
 - Return a compact final result; a returned dict/list is JSON-serialized automatically.
-- Intermediate tool results stay local unless printed or returned.
-- Errors do not kill the session: fix and retry in the same namespace.`;
+- Errors do not kill the session: fix and retry in the same namespace.
+
+Runs synchronously and blocks until the chunk finishes — progress streams into the transcript, including a live view of any pi_subagents fan-out the code runs. Prefer doing all orchestration inside one chunk (spawn subagents, wait for them, close them with subagents.finish(), aggregate, return the summary) so the viewer can render the whole fan-out and no subagent windows are left behind.`;
 
 const SCRIPT_EXPORT_DESCRIPTION = `Export the cumulative code of a python session as a durable script file on disk (default ./.pi/scripts/<name>.py). The script is assembled from every chunk executed in the session, in order, with cell separators and a header. Sessions that used top-level await are wrapped in async def main() + asyncio.run(main()).
 
