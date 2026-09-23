@@ -121,7 +121,7 @@ test("persistent session: unknown session id errors with live sessions", { skip:
 test("persistent session: subagent_state frames flow to the runtime hooks", { skip: !RUN_REAL }, async () => {
   const snapshots = [];
   const manager = makeManager({
-    onSubagentSnapshot: (sessionId, snapshot) => snapshots.push({ sessionId, snapshot }),
+    onSubagentSnapshot: (sessionId, _execId, snapshot) => snapshots.push({ sessionId, snapshot }),
   });
   try {
     const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });

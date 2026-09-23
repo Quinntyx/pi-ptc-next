@@ -1,5 +1,5 @@
 import type { Theme } from "@mariozechner/pi-coding-agent";
-import type { SubagentRuntimeSnapshot } from "../contracts/execution-types";
+import type { SubagentAgentRow, SubagentRuntimeSnapshot } from "../contracts/execution-types";
 // Shimmer sweep (pi-tool-tree style): a highlight band slides across the word.
 function shimmerWord(word: string, theme: Theme, now: number): string {
   if (!word) return "";
@@ -44,7 +44,31 @@ function agentCallsSegment(calls: number | null | undefined, theme: Theme): stri
   return theme.fg("muted", ` · ${calls} tool call${calls === 1 ? "" : "s"}`);
 }
 
-function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme: Theme): string[] {
+/**
+ * Rows relevant to the exec currently being streamed. An interpreter can be
+ * long-lived and its registry holds agents from earlier chunks (earlier PTC
+ * calls), so the viewer keeps:
+ *  - agents spawned in this exec, and
+ *  - agents of earlier execs that are still running (their results are still
+ *    awaited)
+ * and drops everything settled before this exec began.
+ */
+export function relevantAgents(snapshot: SubagentRuntimeSnapshot | undefined, execId?: string): SubagentAgentRow[] {
+  if (!snapshot || !Array.isArray(snapshot.agents)) {
+    return [];
+  }
+  if (!execId) {
+    return snapshot.agents; // no scoping context (e.g. the global runtime API)
+  }
+  return snapshot.agents.filter(
+    (agent) =>
+      agent.execScope === execId ||
+      agent.status === "running" ||
+      agent.status === "starting",
+  );
+}
+
+function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme: Theme, execId?: string): string[] {
   if (!snapshot || !Array.isArray(snapshot.agents) || snapshot.agents.length === 0) {
     return [];
   }
@@ -55,7 +79,17 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   // rate of subagent_state frames instead of the repaint rate.
   const wallNow = Date.now();
   const drift = snapshot.timestamp ? Math.max(0, wallNow - snapshot.timestamp) : 0;
-  const agents = snapshot.agents;
+  const agents = relevantAgents(snapshot, execId);
+  if (agents.length === 0) {
+    return [];
+  }
+  // Totals describe the filtered view, not the whole (possibly long-lived)
+  // interpreter registry.
+  const totals = {
+    running: agents.filter((a) => a.status === "running" || a.status === "starting").length,
+    settled: agents.filter((a) => a.status === "settled").length,
+    failed: agents.filter((a) => ["failed", "dead", "stopped"].includes(a.status)).length,
+  };
   const groups = snapshot.groups ?? {};
   const groupOrder: string[] = [];
   for (const agent of agents) {
@@ -66,7 +100,6 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   const withEmpty = groupOrder.filter((g) => g !== "").concat(groupOrder.filter((g) => g === ""));
 
   const lines: string[] = [];
-  const totals = snapshot.totals ?? {};
   for (const group of withEmpty) {
     const groupAgents = agents.filter((a) => (a.group ?? "") === group);
     const startedAt = groups[group] ?? Math.min(...groupAgents.map((a) => a.startedAt ?? wallNow));
@@ -151,6 +184,10 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   return lines;
 }
 
-export function renderSubagentPanel(snapshot: SubagentRuntimeSnapshot | undefined, theme: Theme): string[] {
-  return renderSubagentFan(snapshot, theme);
+export function renderSubagentPanel(
+  snapshot: SubagentRuntimeSnapshot | undefined,
+  theme: Theme,
+  execId?: string
+): string[] {
+  return renderSubagentFan(snapshot, theme, execId);
 }

@@ -380,6 +380,9 @@ async def _ptc_session_entry() -> None:
             continue
         task = _ptc_asyncio.ensure_future(_ptc_exec_chunk(frame))
         _ptc_current_chunk_task = task
+        # Attribute agents spawned during this chunk to it: the viewer only
+        # renders rows whose exec scope matches the exec being streamed.
+        _ptc_builtins.PTC_EXEC_SCOPE = frame.get("id") or ""
         try:
             await task
         except _ptc_asyncio.CancelledError:

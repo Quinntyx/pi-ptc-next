@@ -24,3 +24,37 @@ test("subagent fan panel renders groups, awaited arrow, and status lines", () =>
   assert.ok(plain.filter((l) => l === "    │").length >= 2); // rail continuation lines
   assert.ok(!plain.some((l) => l.includes("╰ synthesizing · ") && l.includes("tool call")));
 });
+
+test("the fan is scoped to the exec being streamed and settled rows freeze their runtime", () => {
+  const now = Date.now();
+  const hoursAgo = now - 1300 * 60_000;
+  const noopTheme = { fg: (_c, s) => s };
+  const snapshot = {
+    agents: [
+      // A batch from a previous PTC call in the same (long-lived) interpreter,
+      // settled long before this exec began.
+      { id: "old", name: "batch2-ds", group: "old batch", status: "settled", execScope: "exec_old", startedAt: hoursAgo, elapsedMs: 1300 * 60_000, label: "idle" },
+      // Spawned in the exec being streamed.
+      { id: "cur", name: "gktA-scaffold", group: "this exec", status: "running", execScope: "exec_cur", startedAt: now - 200_000, elapsedMs: 200_000, label: "exploring", labelElapsedMs: 90_000, labelCalls: 3, awaited: true },
+      // Spawned in an earlier exec but still awaited now.
+      { id: "hang", name: "carried-over", status: "running", execScope: "exec_prev", startedAt: now - 500_000, elapsedMs: 500_000 },
+    ],
+    totals: { running: 2, settled: 1, failed: 0 },
+    groups: { "old batch": hoursAgo, "this exec": now - 200_000 },
+    timestamp: now,
+  };
+
+  const lines = renderSubagentPanel(snapshot, noopTheme, "exec_cur");
+  const plain = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+  const text = plain.join("\n");
+
+  assert.ok(text.includes("gktA-scaffold"), "the current exec's agents render");
+  assert.ok(text.includes("carried-over"), "agents still awaited from earlier execs render");
+  assert.ok(!text.includes("batch2-ds"), "agents settled before this exec stay out");
+  assert.ok(!text.includes("1300m"), "no age-of-handle numbers");
+  // Frozen runtime: a running row ticks from its own start, not the registry's age.
+  assert.ok(plain.some((l) => l.includes("gktA-scaffold") && l.includes("3m 20s")), plain.join("\n"));
+
+  // Without scoping context (the global runtime API) everything is returned.
+  assert.ok(renderSubagentPanel(snapshot, noopTheme).length > 0);
+});

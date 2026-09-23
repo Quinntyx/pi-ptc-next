@@ -48,6 +48,8 @@ export interface SubagentAgentRow {
   id: string;
   name: string;
   group?: string | null;
+  /** Exec id of the python_exec chunk this agent was spawned in. */
+  execScope?: string | null;
   status: string;
   startedAt?: number;
   elapsedMs?: number;

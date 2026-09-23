@@ -73,7 +73,7 @@ interface PersistentProtocolOptions {
   terminateProcess: (signal: NodeJS.Signals) => boolean;
   /** Send a signal to the interpreter (SIGINT mirrors Ctrl-C). */
   sendSignal: (signal: NodeJS.Signals) => void;
-  onSubagentSnapshot?: (snapshot: SubagentRuntimeSnapshot) => void;
+  onSubagentSnapshot?: (execId: string, snapshot: SubagentRuntimeSnapshot) => void;
   /**
    * Fired when an interrupted chunk settles after the tool call was already
    * aborted by pi: pi rejects the call with its own AbortError immediately (it
@@ -197,6 +197,7 @@ class PersistentSessionProtocol {
 
   private buildDetails(overrides?: Partial<ExecutionDetails>): ExecutionDetails {
     return {
+      execId: this.execId,
       nestedToolCalls: this.nestedToolCalls,
       nestedToolNames: [...this.nestedToolNames],
       nestedResultChars: this.nestedResultChars,
@@ -337,7 +338,7 @@ class PersistentSessionProtocol {
       }
 
       case "subagent_state": {
-        this.options.onSubagentSnapshot?.(msg.snapshot as SubagentRuntimeSnapshot);
+        this.options.onSubagentSnapshot?.(this.execId, msg.snapshot as SubagentRuntimeSnapshot);
         this.emitUpdate({ subagentSnapshot: msg.snapshot as SubagentRuntimeSnapshot });
         return;
       }
@@ -630,7 +631,7 @@ interface SessionRecord {
 }
 
 export interface PythonSessionManagerHooks {
-  onSubagentSnapshot?: (sessionId: string, snapshot: SubagentRuntimeSnapshot) => void;
+  onSubagentSnapshot?: (sessionId: string, execId: string, snapshot: SubagentRuntimeSnapshot) => void;
   onBackgroundComplete?: (completion: BackgroundCompletion) => void;
   /** Report for a chunk interrupted after pi had already aborted the tool call. */
   onInterrupted?: (sessionId: string, text: string) => void;
@@ -745,9 +746,9 @@ export class PythonSessionManager {
       sendSignal: (signal) => {
         this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal);
       },
-      onSubagentSnapshot: (snapshot) => {
+      onSubagentSnapshot: (execId, snapshot) => {
         record.latestSnapshot = snapshot;
-        this.hooks.onSubagentSnapshot?.(sessionId, snapshot);
+        this.hooks.onSubagentSnapshot?.(sessionId, execId, snapshot);
       },
       onInterruptedReport: (text) => {
         // Kept for callers that cannot observe the tool result; pi records our

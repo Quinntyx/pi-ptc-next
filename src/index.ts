@@ -42,7 +42,7 @@ import {
   computeCodeViewStart,
   type CodeViewState,
 } from "./execution/code-view";
-import { renderSubagentPanel } from "./execution/subagent-panel";
+import { relevantAgents, renderSubagentPanel } from "./execution/subagent-panel";
 import {
   PythonSessionManager,
   UnknownSessionError,
@@ -159,7 +159,7 @@ function renderCompletedOutput(
     `[PTC] ${nestedStr}${avoidTok} • ${durationSec}s`
   ) + imgStr + sessionStr;
 
-  const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme);
+  const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
   const subagentBlock = subagentLines.length > 0 ? `\n${subagentLines.join("\n")}\n` : "";
 
   const rawBody = resultText || "(No output)";
@@ -552,7 +552,7 @@ function pythonExecTool(
         );
         // The subagent fan renders below the code view when the chunk spawned
         // subagents through pi_subagents.
-        const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme);
+        const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
         if (subagentLines.length > 0) {
           lines.push("");
           lines.push(...subagentLines);
@@ -718,7 +718,7 @@ function createSubagentRuntime(sessionManager: PythonSessionManager): SubagentRu
   const listeners = new Set<(payload: { sessionId: string; snapshot: SubagentRuntimeSnapshot }) => void>();
 
   const hooks: PythonSessionManagerHooks = {
-    onSubagentSnapshot: (sessionId, snapshot) => {
+    onSubagentSnapshot: (sessionId, _execId, snapshot) => {
       for (const listener of listeners) {
         try {
           listener({ sessionId, snapshot });
@@ -750,7 +750,12 @@ function createSubagentRuntime(sessionManager: PythonSessionManager): SubagentRu
   };
 }
 
-function updateSubagentFooter(sessionState: PtcSessionState, settings: PtcSettings): void {
+function updateSubagentFooter(
+  sessionState: PtcSessionState,
+  settings: PtcSettings,
+  snapshotOverride?: SubagentRuntimeSnapshot,
+  execId?: string
+): void {
   if (!settings.subagentFooter) {
     return;
   }
@@ -758,13 +763,14 @@ function updateSubagentFooter(sessionState: PtcSessionState, settings: PtcSettin
   if (!ctx?.hasUI) {
     return;
   }
-  const snapshot = sessionState.lastSubagentSnapshot;
-  if (!snapshot || snapshot.agents.length === 0) {
+  const snapshot = snapshotOverride ?? sessionState.lastSubagentSnapshot ?? undefined;
+  const relevant = relevantAgents(snapshot, execId);
+  if (relevant.length === 0) {
     ctx.ui.setStatus("ptc-subagents", undefined);
     return;
   }
-  const running = snapshot.totals?.running ?? snapshot.agents.filter((a) => a.status === "running" || a.status === "starting").length;
-  const settled = snapshot.totals?.settled ?? snapshot.agents.filter((a) => a.status === "settled").length;
+  const running = relevant.filter((a) => a.status === "running" || a.status === "starting").length;
+  const settled = relevant.filter((a) => a.status === "settled").length;
   const bits: string[] = [];
   if (running) bits.push(`● ${running} running`);
   if (settled) bits.push(`✓ ${settled} done`);
@@ -884,9 +890,9 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   }
 
   const sessionManager = new PythonSessionManager(sandboxManager, toolRegistry, settings, extensionRoot, {
-    onSubagentSnapshot: (_sessionId, snapshot) => {
+    onSubagentSnapshot: (_sessionId, execId, snapshot) => {
       sessionState.lastSubagentSnapshot = snapshot;
-      updateSubagentFooter(sessionState, settings);
+      updateSubagentFooter(sessionState, settings, snapshot, execId);
     },
     onInterrupted: (sessionId, text) => {
       // pi records our interrupt error as the tool result, so the model already has
