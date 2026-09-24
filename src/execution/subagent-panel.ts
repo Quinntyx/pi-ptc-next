@@ -1,23 +1,14 @@
 import type { Theme } from "@mariozechner/pi-coding-agent";
 import type { SubagentAgentRow, SubagentRuntimeSnapshot } from "../contracts/execution-types";
-// Shimmer sweep (pi-tool-tree style): a highlight band slides across the word.
-function shimmerWord(word: string, theme: Theme, now: number): string {
-  if (!word) return "";
-  const step = Math.floor(now / 120);
-  const n = word.length;
-  const head = (step % (n + 6)) - 3;
-  let out = "";
-  for (let i = 0; i < n; i++) {
-    const dist = Math.abs(i - head);
-    if (dist <= 1) {
-      out += theme.fg("accent", word[i]!);
-    } else if (dist <= 3) {
-      out += theme.fg("accent", word[i]!);
-    } else {
-      out += word[i]!;
-    }
-  }
-  return out;
+/**
+ * Shimmer sweep for a running action word, shared with the activity tree's label sweep
+ * (published on pi-tool-tree's API). Renders muted when that extension is absent.
+ */
+function shimmerWord(word: string, theme: Theme): string {
+	if (!word) return "";
+	const activity = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
+	if (typeof activity?.shimmerText === "function") return activity.shimmerText(word, theme);
+	return theme.fg("muted", word);
 }
 
 const PTC_CTX_LIMIT_FALLBACK = 200_000;
@@ -146,7 +137,7 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
       const word = agent.label ?? agent.phase;
       const detailBits: string[] = [];
       if (word) {
-        detailBits.push(running ? shimmerWord(word, theme, wallNow) : theme.fg("muted", word));
+        detailBits.push(running ? shimmerWord(word, theme) : theme.fg("muted", word));
       }
       if (labelElapsedMs) {
         detailBits.push(theme.fg("muted", ` · ${formatAgentSeconds(labelElapsedMs)}`));
