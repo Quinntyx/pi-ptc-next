@@ -31,6 +31,18 @@ pi install git:github.com/edxeth/pi-ptc-next
 
 This fork is published publicly as **pi-ptc-next** to distinguish it from the original `pi-ptc` repository while preserving clear attribution to Chris Egersdoerfer's upstream work.
 
+### pi_subagents auto-provisioning
+
+The Python half of the subagent workflow (`import pi_subagents` inside `python_exec` sessions) is provisioned automatically — it is **not** part of the npm install:
+
+- On session start the extension ensures `~/.cache/pi-ptc/python-env` exists (creating it with `uv venv` or `python3 -m venv` as needed) and installs `pi_subagents` editable into it.
+- Source resolution: a dev checkout at `~/docs/src/pi-subagents` (override `PTC_SUBAGENTS_SOURCE`) is preferred; otherwise a managed clone at `~/.cache/pi-ptc/pi-subagents` is cloned/updated from `PTC_SUBAGENTS_REPO_URL`.
+- The sync stamp lives inside this package's clone, so `pi update --extensions` (which resets and cleans package clones) triggers a fresh sync on the next session start — pi_subagents updates independently of pi-ptc-next releases.
+- Runs are serialized by a lock file, failures are stamped (no per-session retry storms), and everything is logged to `~/.cache/pi-ptc/subagents-sync.log`.
+- Spawned subagents skip provisioning entirely (the autoimport is excluded at depth ≥ 1 anyway).
+
+If you use a private pi-subagents repo, make sure your git credential helper can read it (the provisioner shells out to plain `git`).
+
 ## What using it feels like now
 
 Use it normally.
@@ -262,6 +274,9 @@ If a custom tool is marked code-execution-only, `pi-ptc-next` will register it b
 - `PTC_MAX_PYTHON_SESSIONS` — concurrent persistent interpreters (default: 4)
 - `PTC_SCRIPTS_DIR` — default export directory for `python_session_to_script` (default: `./.pi/scripts`)
 - `PTC_SUBAGENTS_PROFILE` — pi profile directory `pi_subagents` launches subagent instances with (default: `~/.config/pi/profiles/subagents`)
+- `PTC_SUBAGENTS_REPO_URL` — where the provisioner clones pi-subagents from (default: `https://git.quinntyx.dev/quinntyx/pi-subagents`)
+- `PTC_SUBAGENTS_SOURCE` — dev checkout of pi-subagents to install editable instead of the managed clone (default: `~/docs/src/pi-subagents` when present)
+- `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` — min interval between pi_subagents syncs (default: 24)
 - `PTC_SUBAGENT_FOOTER=false` — hide the subagent status footer element (for custom footers consuming the `pi-ptc:subagent-runtime` API)
 - `PTC_AUTO_RECOVER_MAX_ATTEMPTS=1` — bounded recovery cap; values above `1` are clamped back to `1`
 - `PTC_TRUSTED_READ_ONLY_TOOLS=query_db,fetch_metadata` — allowlisted custom tools treated as read-only when mutations are disabled

@@ -25,6 +25,7 @@ import {
   type PtcRecoveryState,
 } from "./recovery-state";
 import { createSandbox } from "./sandbox-manager";
+import { ensureSubagentsEnv } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
@@ -906,6 +907,16 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   });
   (globalThis as Record<string, unknown>).__ptcPythonSessionManager = sessionManager;
   (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] = createSubagentRuntime(sessionManager);
+
+  // Provision the pi_subagents runtime in the background: create the PTC venv
+  // when missing and install/refresh pi_subagents from git. The sync stamp
+  // lives inside this package's clone, so `pi update` (which resets and cleans
+  // the clone) triggers a fresh sync on the next session start.
+  if (!settings.useDocker && !process.env.PI_SUBAGENT_DEPTH) {
+    void ensureSubagentsEnv({ extensionRoot }).catch((error) => {
+      debugLog("pi_subagents provisioning failed", String(error));
+    });
+  }
 
   registerPtcCommand(pi, sessionManager, sessionState);
 
