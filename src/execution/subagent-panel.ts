@@ -55,7 +55,8 @@ export function relevantAgents(snapshot: SubagentRuntimeSnapshot | undefined, ex
     (agent) =>
       agent.execScope === execId ||
       agent.status === "running" ||
-      agent.status === "starting",
+      agent.status === "starting" ||
+      agent.status === "queued",
   );
 }
 
@@ -77,9 +78,10 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   // Totals describe the filtered view, not the whole (possibly long-lived)
   // interpreter registry.
   const totals = {
+    queued: agents.filter((a) => a.status === "queued").length,
     running: agents.filter((a) => a.status === "running" || a.status === "starting").length,
     settled: agents.filter((a) => a.status === "settled").length,
-    failed: agents.filter((a) => ["failed", "dead", "stopped"].includes(a.status)).length,
+    failed: agents.filter((a) => ["failed", "dead", "stopped", "cancelled"].includes(a.status)).length,
   };
   const groups = snapshot.groups ?? {};
   const groupOrder: string[] = [];
@@ -108,6 +110,13 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
       const branch = last ? "╰" : "├";
       const rail = (s: string) => theme.fg("muted", s);
       const gutter = agent.awaited ? theme.fg("accent", "  ▶ ") : "    ";
+
+      if (agent.status === "queued") {
+        lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", "… " + agent.name)}`);
+        lines.push(`    ${theme.fg("muted", last ? "  " : "│ ")}${theme.fg("muted", "╰ waiting for a pool slot")}`);
+        lines.push("");
+        return;
+      }
 
       if (agent.status === "starting") {
         lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", "○ " + agent.name)}`);
@@ -164,10 +173,12 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   }
 
   // footer summary
+  const queued = totals.queued ?? 0;
   const running = totals.running ?? agents.filter((a) => a.status === "running" || a.status === "starting").length;
   const settled = totals.settled ?? agents.filter((a) => a.status === "settled").length;
-  const failed = totals.failed ?? agents.filter((a) => ["failed", "dead", "stopped"].includes(a.status)).length;
+  const failed = totals.failed ?? agents.filter((a) => ["failed", "dead", "stopped", "cancelled"].includes(a.status)).length;
   const parts: string[] = [];
+  if (queued) parts.push(theme.fg("muted", `… ${queued} queued`));
   if (running) parts.push(theme.fg("success", `● ${running} running`));
   if (settled) parts.push(theme.fg("success", `✓ ${settled} done`));
   if (failed) parts.push(theme.fg("warning", `! ${failed} stopped/failed`));
