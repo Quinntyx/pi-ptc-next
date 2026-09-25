@@ -316,11 +316,6 @@ def _ptc_notebook_write(exec_count: int, code: str, *, stdout_text: str, echo_te
     Best-effort host artifact plumbing: a write failure never fails the cell.
     """
     if not _ptc_notebook_path:
-        try:
-            with open("/tmp/ptc-nb-err.log", "a") as _nb_err_handle:
-                _nb_err_handle.write("no notebook path set\n")
-        except Exception:
-            pass
         return
     try:
         import json as _nb_json
@@ -374,12 +369,8 @@ def _ptc_notebook_write(exec_count: int, code: str, *, stdout_text: str, echo_te
         with open(tmp_path, "w", encoding="utf-8") as handle:
             _nb_json.dump(notebook, handle, ensure_ascii=False, indent=1)
         _nb_os.replace(tmp_path, _ptc_notebook_path)
-    except Exception as _nb_error:
-        try:
-            with open("/tmp/ptc-nb-err.log", "a") as _nb_err_handle:
-                _nb_err_handle.write(repr(_nb_error) + "\n")
-        except Exception:
-            pass
+    except Exception:
+        pass  # artifact plumbing must never break the kernel
 
 
 def _ptc_emit_kernel_inspect(frame: dict) -> None:
