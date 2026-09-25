@@ -36,7 +36,7 @@ function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
   });
 }
 
-function resolvePythonExecutable(): string {
+export function resolvePythonExecutable(): string {
   if (process.env.PTC_PYTHON_EXECUTABLE) {
     return process.env.PTC_PYTHON_EXECUTABLE;
   }
@@ -49,6 +49,10 @@ function resolvePythonExecutable(): string {
 
 class SubprocessSandbox implements SandboxManager {
   private readonly children = new Set<ChildProcess>();
+
+  resolvePythonExecutable(): string {
+    return resolvePythonExecutable();
+  }
 
   spawn(code: string, cwd: string): ChildProcess {
     const pythonExe = resolvePythonExecutable();

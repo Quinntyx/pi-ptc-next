@@ -32,6 +32,9 @@ class _StdoutProxy:
         self._buffer = ""
         self.total_chars = 0
         self.accepted_chars = 0
+        # Per-cell transcript for the notebook writer (session.py resets it at
+        # the start of every cell).
+        self.cell_text = ""
 
     def write(self, text: str) -> int:
         if not text:
@@ -45,6 +48,7 @@ class _StdoutProxy:
         accepted = text[:remaining]
         self.accepted_chars += len(accepted)
         self._buffer += accepted
+        self.cell_text += accepted
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             _emit_protocol({"type": "stdout", "text": f"{line}\n"})

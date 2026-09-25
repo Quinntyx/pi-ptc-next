@@ -114,7 +114,7 @@ function buildPi({ eventHandlers, registered, activeTools }) {
       eventHandlers.set(event, handler);
     },
     getAllTools() {
-      return [{ name: "python_exec" }];
+      return [{ name: "exec_cell" }];
     },
     getActiveTools() {
       return [...activeTools];
@@ -245,7 +245,10 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
     const toolNames = registered.map((tool) => tool.name).sort();
-    assert.deepEqual(toolNames, ["provision_python_session", "python_exec", "python_session_to_script"]);
+    assert.deepEqual(
+      toolNames.sort(),
+      ["exec_cell", "inspect_kernel", "list_kernels", "provision_dependency", "provision_kernel"].sort(),
+    );
     assert.ok(commands.ptc);
     assert.equal(managerInstance.started, 1);
 
@@ -261,7 +264,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
   }
 });
 
-test("ptc extension auto-routes repo-wide analysis prompts toward python_exec", async () => {
+test("ptc extension auto-routes repo-wide analysis prompts toward exec_cell", async () => {
   const sandbox = {
     async cleanup() {},
     spawn() {
@@ -291,9 +294,9 @@ test("ptc extension auto-routes repo-wide analysis prompts toward python_exec", 
       systemPrompt: "base prompt",
     });
 
-    assert.deepEqual(activeTools, ["python_exec", "provision_python_session"]);
-    assert.match(routeResult.systemPrompt, /strong fit for python_exec/);
-    assert.match(routeResult.systemPrompt, /provision_python_session/);
+    assert.deepEqual(activeTools, ["exec_cell", "provision_kernel"]);
+    assert.match(routeResult.systemPrompt, /strong fit for exec_cell/);
+    assert.match(routeResult.systemPrompt, /provision_kernel/);
 
     eventHandlers.get("agent_end")();
     assert.deepEqual(activeTools, ["read", "grep"]);
@@ -352,7 +355,7 @@ test("ptc extension does not auto-route or auto-recover mutation prompts", async
     assert.equal(routeResult, undefined);
     assert.deepEqual(activeTools, ["read", "grep"]);
 
-    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    const pythonExecTool = registered.find((tool) => tool.name === "exec_cell");
     assert.ok(pythonExecTool);
 
     await assert.rejects(
@@ -407,7 +410,7 @@ test("ptc extension resets recovery state for each user request", async () => {
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    const pythonExecTool = registered.find((tool) => tool.name === "exec_cell");
     assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
@@ -485,7 +488,7 @@ test("ptc extension appends one targeted recovery message on the next turn after
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    const pythonExecTool = registered.find((tool) => tool.name === "exec_cell");
     assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
@@ -566,7 +569,7 @@ test("ptc extension does not append a second automatic recovery message after re
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    const pythonExecTool = registered.find((tool) => tool.name === "exec_cell");
     assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
@@ -610,7 +613,7 @@ test("ptc extension does not append a second automatic recovery message after re
   }
 });
 
-test("ptc extension includes recovery telemetry in successful python_exec details after one bounded retry", async () => {
+test("ptc extension includes recovery telemetry in successful exec_cell details after one bounded retry", async () => {
   const previousAutoRecover = process.env.PTC_AUTO_RECOVER;
   process.env.PTC_AUTO_RECOVER = "true";
 
@@ -651,7 +654,7 @@ test("ptc extension includes recovery telemetry in successful python_exec detail
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    const pythonExecTool = registered.find((tool) => tool.name === "exec_cell");
     assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });
@@ -700,7 +703,7 @@ test("ptc extension includes recovery telemetry in successful python_exec detail
   }
 });
 
-test("ptc extension includes first-path telemetry in non-recovered python_exec details", async () => {
+test("ptc extension includes first-path telemetry in non-recovered exec_cell details", async () => {
   const sandbox = {
     async cleanup() {},
     spawn() {
@@ -729,7 +732,7 @@ test("ptc extension includes first-path telemetry in non-recovered python_exec d
       systemPrompt: "base prompt",
     });
 
-    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    const pythonExecTool = registered.find((tool) => tool.name === "exec_cell");
     assert.ok(pythonExecTool);
 
     const result = await pythonExecTool.execute(
@@ -794,7 +797,7 @@ test("ptc extension does not auto-recover literal zero-match path failures", asy
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
-    const pythonExecTool = registered.find((tool) => tool.name === "python_exec");
+    const pythonExecTool = registered.find((tool) => tool.name === "exec_cell");
     assert.ok(pythonExecTool);
 
     eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base prompt" });

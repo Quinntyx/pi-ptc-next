@@ -8,12 +8,24 @@ export interface SandboxManager {
   /** Terminate one execution. Implementations may kill its whole process group. */
   terminate?(proc: ChildProcess, signal: NodeJS.Signals): boolean;
   getRuntimeWorkspaceRoot(cwd: string): string;
+  /** The python interpreter kernels run under (for provision_dependency). */
+  resolvePythonExecutable?(): string;
   cleanup(): Promise<void>;
 }
 
 export interface NormalizedToolResult {
   value: unknown;
   estimatedChars: number;
+}
+
+/** Structured namespace snapshot returned by inspect_kernel. */
+export interface KernelDigest {
+  cells: number;
+  imports: Array<{ name: string; module: string }>;
+  defs: string[];
+  classes: string[];
+  vars: Array<{ name: string; type: string }>;
+  changed?: Array<[string, string]>;
 }
 
 export interface RpcErrorPayload {

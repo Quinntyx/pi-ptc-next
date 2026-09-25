@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -9,7 +10,7 @@ import type {
   Theme,
   ToolRenderResultOptions,
 } from "@mariozechner/pi-coding-agent";
-import { Text, type Component } from "@mariozechner/pi-tui";
+import { Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { PtcPythonError } from "./execution/execution-errors";
 import { CustomToolManager } from "./custom-tool-manager";
 import { buildCodeExecutionRecoveryPrompt, classifyCodeExecutionFailure } from "./recovery-classifier";
@@ -214,14 +215,14 @@ function buildToolDescription(currentSettings: PtcSettings, callableTools: ToolI
   return `Persistent Python sessions with local programmatic tool calling.
 
 Workflow:
-1. provision_python_session — start a persistent interpreter, get a session id. Optionally seed it by executing a Python file first.
-2. python_exec — run code chunks in that session. It behaves like an interactive Python REPL that stays open: imports, variables, and defined functions carry over to later chunks and later turns, so import each module once and build on it. The cumulative code can be exported as a durable script at any time.
-3. python_session_to_script — write the session's cumulative code to a script file on disk, then edit/run it with normal tools.
-4. when a chunk's subagents are done and no longer needed, close them with subagents.finish() so their tmux windows do not pile up.
+1. provision_kernel — start a persistent Jupyter-like kernel bound to a notebook file (.ipynb). Throwaway scratch work still gets a notebook: pass a /tmp path.
+2. exec_cell — run cells in that kernel. It behaves exactly like a Jupyter kernel: imports, variables, functions, and classes carry over to later cells and later turns, so import each module once and build on it. The last bare expression of a cell echoes automatically. Every executed cell is appended to the notebook file on disk.
+3. inspect_kernel — see what the namespace already has; provision_dependency — install a missing package.
+4. when a workflow's subagents are done, close the pool with pool.close() so no tmux windows pile up — the echoed summary is the workflow report.
 
-Prefer python_exec for repo-wide analysis, repeated lookups, loops, grouping, ranking, counting, filtering, or any task with 3+ dependent tool calls. Use direct tools for one-file reads, one-off grep/find calls, or tiny lookups.
+Prefer exec_cell for repo-wide analysis, repeated lookups, loops, grouping, ranking, counting, filtering, or any task with 3+ dependent tool calls. Use direct tools for one-file reads, one-off grep/find calls, or tiny lookups.
 
-python_exec runs synchronously and streams progress — including a live viewer of any pi_subagents fan-out the chunk runs (agent status rows render under the code view while it executes). Prefer orchestrating an entire fan-out inside one chunk: spawn the subagents, wait for them, aggregate, return the summary.
+exec_cell runs synchronously and streams progress — including a live viewer of any pi_subagents fan-out the cell runs (agent status rows render under the code view while it executes). Prefer orchestrating an entire fan-out inside one cell: submit to pools, consume with pool.pop, close the pool, return the summary.
 
 Subagents: the autoimported pi_subagents module spawns real pi instances in tmux windows (AgentHandle / AgentSession). Ask it what is available before naming a model — subagents.capabilities(), subagents.best_model_match("astra").slug, subagents.thinking_levels() — then pass model=/thinking= to subagents.agent().
 
@@ -229,7 +230,7 @@ Important rules:
 - Top-level await is already available. Do not call asyncio.run(...).
 - Definitions persist across chunks: import once, define reusable functions once.
 - A chunk's output should be compact; large intermediates stay in the session.
-- When the logic stabilizes, export it with python_session_to_script instead of re-running long chunks.
+- Substantive, edited code belongs in files: write the file, then exec_cell(file=...) — %run semantics, tracebacks map to the real path. Re-run after editing; do not import session files as modules.
 
 Callable tool set for this session: ${callable}
 
@@ -243,28 +244,161 @@ Python helpers currently available in this session:
 ${dockerBehavior}`;
 }
 
-const PROVISION_DESCRIPTION = `Start a persistent Python session and return its id. Sessions work exactly like an interactive Python REPL: every python_exec chunk sent to the session runs in the same live interpreter namespace, so modules you import, variables you assign, and functions/classes you define all carry over to later chunks and later turns of the conversation.
+const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel and return its session id. The kernel requires a notebook file path (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
 
-Import each module ONCE per session — there is no need to re-import in later chunks; re-importing the same module repeatedly is wasteful and a sign the session was not reused. Likewise define helper functions once and call them from later chunks.
+- notebook (required): path to the .ipynb file (created if missing). Relative paths resolve against the cwd. For throwaway/scratch work, just pass a /tmp path (e.g. /tmp/scratch.ipynb) — throwaway kernels work exactly like durable ones.
+- The kernel works like a Jupyter kernel: imports, variables, functions, and classes persist between cells and between conversation turns. Do NOT re-import or redefine; build on what is there.
+- inspect_kernel shows what the namespace already has; provision_dependency installs a missing package into the kernel's environment.
 
-Optionally pass a script path: a path to a Python file that is executed in the session before the id is returned, so the session can start from a prebuilt script (for example one exported earlier via python_session_to_script) and continue working in the resulting environment.
+The kernel stays alive until the conversation ends or /ptc kill, so reuse one kernel across many cells and turns instead of provisioning a new one per step.`;
 
-Sessions stay alive until the conversation ends or /ptc kill, so reuse them across turns and across python_exec calls instead of provisioning a new one for each step.`;
+const EXEC_CELL_DESCRIPTION = `Execute a cell in a persistent Jupyter-like kernel (session_id from provision_kernel).
 
-const PYTHON_EXEC_DESCRIPTION = `Run Python code inside a persistent, already-provisioned session — like typing into an interactive Python REPL that stays open between calls.
+- State persists: imports, variables, functions, and classes from earlier cells are still there — never re-import, never redefine; write each cell as the continuation of the live namespace.
+- The last bare expression of a cell is echoed automatically (Out[n] semantics) — no print/return needed to see a value. Every result also ends with a [kernel] footer summarizing the namespace (cell count, defs, and what this cell added or changed).
+- Top-level await works; do not call asyncio.run(...). Errors never kill the kernel — fix and retry in the same namespace.
+- file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; re-run after editing). Tracebacks map to the real file. Prefer files for substantive, edited code; inline code for quick probes.
+- IPython magics (%timeit, !pip, ...) do not exist here — cells starting with % or ! are rejected before execution with the native equivalent.
+- confirm (optional): set true to ask the user for approval before running. Policy: run most cells immediately; set confirm=true for potentially destructive work (deleting/cleaning files, force git operations) or expensive workflows (large multi-stage subagent fan-outs). If the user said "run autonomously" or "don't prompt me", never set it.
 
-Everything in the namespace carries over to later chunks and later conversation turns: modules imported earlier are still imported (do NOT re-import them), variables assigned earlier are still set, and functions/classes defined earlier are still callable. Write each chunk as the continuation of the live session — build on what is already there instead of rebuilding it.
+Cells run synchronously and stream progress, including a live viewer of any pi_subagents fan-out. End subagent workflows with pool.close() — its echoed summary is the report.`;
 
-- session_id (required): id from provision_python_session. Unknown ids error with the list of live sessions.
-- Top-level await is available; do not call asyncio.run(...).
-- Return a compact final result; a returned dict/list is JSON-serialized automatically.
-- Errors do not kill the session: fix and retry in the same namespace.
+const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into the kernel environment shared by all kernels (uv-backed, fast).
 
-Runs synchronously and blocks until the chunk finishes — progress streams into the transcript, including a live view of any pi_subagents fan-out the code runs. Prefer doing all orchestration inside one chunk (spawn subagents, wait for them, close them with subagents.finish(), aggregate, return the summary) so the viewer can render the whole fan-out and no subagent windows are left behind.`;
+- package (required): the distribution name as pip knows it (e.g. "opencv-python", "scikit-learn") — not the import name.
+- Already-installed packages are a cheap no-op. If an install changes a distribution the running kernel already loaded, the result says so — a fresh kernel picks it up cleanly.
+- After installing, import the module in a cell as usual. ModuleNotFoundError in a cell usually means you need this tool.`;
 
-const SCRIPT_EXPORT_DESCRIPTION = `Export the cumulative code of a python session as a durable script file on disk (default ./.pi/scripts/<name>.py). The script is assembled from every chunk executed in the session, in order, with cell separators and a header. Sessions that used top-level await are wrapped in async def main() + asyncio.run(main()).
 
-After export, edit and run the script with normal tools (edit/bash/write/read). session_id defaults to the most recent session.`;
+
+function listKernelsTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+  return withActivityLabel({
+    name: "list_kernels",
+    label: "python",
+    description:
+      "List the live Jupyter-like kernels (sessions) with their ids, notebook paths, cell counts, and busy state. Use it to recover a session id or decide whether to reuse a kernel.",
+    parameters: Type.Object({}),
+    execute: async () => {
+      const kernels = sessionManager.list();
+      if (kernels.length === 0) {
+        return {
+          content: [{ type: "text", text: "No live kernels. Provision one with provision_kernel." }],
+          details: { kernelCount: 0 },
+        };
+      }
+      const lines = kernels.map((kernel) => {
+        const state = kernel.running ? "executing" : kernel.hasPendingBackground ? "background pending" : "idle";
+        const notebook = kernel.notebookPath ? ` · ${kernel.notebookPath}` : "";
+        return `${kernel.id} · ${state} · ${kernel.chunks} cell${kernel.chunks === 1 ? "" : "s"}${notebook}`;
+      });
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { kernelCount: kernels.length },
+      };
+    },
+  });
+}
+
+function inspectKernelTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+  return withActivityLabel({
+    name: "inspect_kernel",
+    label: "python",
+    description:
+      "Inspect what a kernel's namespace already has: imported modules, defined functions and classes, variables with type previews, and the cell count. Use it before writing a cell so you reuse what is there instead of re-importing or redefining.",
+    parameters: Type.Object({
+      session_id: Type.Optional(
+        Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
+      ),
+    }),
+    execute: async (_toolCallId, params) => {
+      const { session_id: requestedId } = params as { session_id?: string };
+      const kernels = sessionManager.list();
+      const kernelId = requestedId ?? kernels[0]?.id;
+      if (!kernelId) {
+        return {
+          content: [{ type: "text", text: "No live kernels. Provision one with provision_kernel." }],
+          details: { sessionId: null },
+        };
+      }
+      try {
+        const digest = await sessionManager.inspectKernel(kernelId, { timeoutMs: 15_000 });
+        const lines = [
+          `kernel ${kernelId} · ${digest.cells} cell${digest.cells === 1 ? "" : "s"}`,
+          digest.imports.length
+            ? `imports: ${digest.imports.map((entry) => (entry.name === entry.module ? entry.name : `${entry.name} (from ${entry.module})`)).join(", ")}`
+            : "imports: none yet",
+          digest.defs.length ? `functions: ${digest.defs.join(", ")}` : "functions: none yet",
+          digest.classes.length ? `classes: ${digest.classes.join(", ")}` : "classes: none yet",
+          digest.vars.length
+            ? `vars: ${digest.vars.map((entry) => `${entry.name} (${entry.type})`).join(", ")}`
+            : "vars: none yet",
+        ];
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { sessionId: kernelId, digest },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `inspect_kernel failed: ${error instanceof Error ? error.message : String(error)}` }],
+          details: { sessionId: kernelId },
+        };
+      }
+    },
+  });
+}
+
+function provisionDependencyTool(
+  sessionManager: PythonSessionManager,
+  sandboxManager: SandboxManager
+): PtcToolDefinition {
+  return withActivityLabel({
+    name: "provision_dependency",
+    label: "python",
+    description: PROVISION_DEPENDENCY_DESCRIPTION,
+    parameters: Type.Object({
+      package: Type.String({
+        description: 'Distribution name as pip/uv knows it (e.g. "opencv-python", "scikit-learn") — not the import name.',
+      }),
+    }),
+    execute: async (_toolCallId, params, signal) => {
+      const { package: packageName } = params as { package?: string };
+      if (!packageName || !packageName.trim()) {
+        return { content: [{ type: "text", text: "provision_dependency requires a package name." }], details: {} };
+      }
+      const pythonExecutable = sandboxManager.resolvePythonExecutable
+        ? sandboxManager.resolvePythonExecutable()
+        : "python3";
+      try {
+        const result = await execFilePtc("uv", ["pip", "install", "--python", pythonExecutable, packageName.trim()], {
+          timeoutMs: 180_000,
+          signal,
+        });
+        const output = (result.stdout + result.stderr).trim();
+        const changed = /installed|uninstalled/i.test(output);
+        const lines = [
+          `provision_dependency ${packageName.trim()}: ${changed ? "installed/updated" : "already satisfied"}.`,
+          output ? output.slice(-2000) : "",
+          changed
+            ? "Note: kernels already running keep their loaded versions; a fresh kernel picks up the new ones."
+            : "",
+        ].filter(Boolean);
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { package: packageName.trim(), changed },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{
+            type: "text",
+            text: `provision_dependency failed for ${packageName.trim()}: ${message}\nIf the distribution name looks wrong, check it (the import name and the distribution name often differ, e.g. cv2 → opencv-python, PIL → pillow, sklearn → scikit-learn).`,
+          }],
+          details: { package: packageName.trim(), error: message },
+        };
+      }
+    },
+  });
+}
 
 // ============================================================================
 // Session state + tool construction
@@ -304,7 +438,7 @@ function applyAutoRouting(
   }
 
   const allTools = pi.getAllTools();
-  if (!allTools.some((tool) => tool.name === "python_exec")) {
+  if (!allTools.some((tool) => tool.name === "exec_cell")) {
     return undefined;
   }
 
@@ -313,23 +447,23 @@ function applyAutoRouting(
   const activeTools = pi.getActiveTools();
   const routableToolNames = new Set(toolRegistry.getAutoRoutableToolNames(sessionState.currentCwd, settings));
   const nextActiveTools = activeTools.filter((name) => !routableToolNames.has(name));
-  if (!nextActiveTools.includes("python_exec")) {
-    nextActiveTools.push("python_exec");
+  if (!nextActiveTools.includes("exec_cell")) {
+    nextActiveTools.push("exec_cell");
   }
-  if (!nextActiveTools.includes("provision_python_session")) {
-    nextActiveTools.push("provision_python_session");
+  if (!nextActiveTools.includes("provision_kernel")) {
+    nextActiveTools.push("provision_kernel");
   }
 
   if (!areToolListsEqual(activeTools, nextActiveTools)) {
     sessionState.activeToolsBeforeRouting = activeTools;
     pi.setActiveTools(nextActiveTools);
-    debugLog("Auto-routed prompt to python_exec", { prompt, activeTools, nextActiveTools });
+    debugLog("Auto-routed prompt to exec_cell", { prompt, activeTools, nextActiveTools });
   }
 
   return {
     systemPrompt:
       `${currentSystemPrompt}\n\n` +
-      "This request is a strong fit for python_exec. Provision a python session first (provision_python_session), keep large intermediate results inside the session, and prefer python_exec for the work.",
+      "This request is a strong fit for exec_cell. Provision a kernel first (provision_kernel), keep large intermediate results inside the kernel namespace, and prefer exec_cell for the work.",
   };
 }
 
@@ -339,7 +473,7 @@ function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessi
   }
 
   pi.setActiveTools(sessionState.activeToolsBeforeRouting);
-  debugLog("Restored active tools after python_exec routing", {
+  debugLog("Restored active tools after exec_cell routing", {
     restored: sessionState.activeToolsBeforeRouting,
   });
   sessionState.activeToolsBeforeRouting = null;
@@ -349,37 +483,203 @@ function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessi
 // Tools
 // ============================================================================
 
-function provisionPythonSessionTool(
+// ============================================================================
+// Cell approval gate (exec_cell confirm=true)
+// ============================================================================"""
+
+function execFilePtc(
+  command: string,
+  args: string[],
+  options: { timeoutMs?: number; signal?: AbortSignal }
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      command,
+      args,
+      { timeout: options.timeoutMs, killSignal: "SIGTERM", maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (options.signal?.aborted) {
+          reject(new Error("provision_dependency aborted"));
+          return;
+        }
+        if (error && typeof (error as { code?: unknown }).code === "undefined") {
+          reject(error);
+          return;
+        }
+        // uv exits non-zero for resolution failures; surface stdout/stderr and
+        // let the caller decide from the output text.
+        resolve({ stdout: String(stdout), stderr: String(stderr) });
+      }
+    );
+  });
+}
+
+interface CellApprovalDecision {
+  action: "approve" | "reject";
+  note?: string;
+}
+
+const CELL_APPROVAL_OPTIONS = [
+  { value: "approve", label: "Approve — run this cell" },
+  { value: "reject", label: "Reject — do not run it" },
+  { value: "note", label: "Reject with note — tell the model why" },
+] as const;
+
+/**
+ * Questionnaire-style approval box: shows the cell code, then Approve /
+ * Reject / Reject with note. Resolves when the user decides (Esc = reject).
+ */
+async function requestCellApproval(
+  ctx: ExtensionContext,
+  sessionId: string,
+  code: string
+): Promise<CellApprovalDecision> {
+  if (!ctx.hasUI) {
+    // No UI to ask in: fail closed with an explanatory result.
+    return { action: "reject", note: "approval requested but no UI is available in this mode" };
+  }
+
+  try {
+    return await ctx.ui.custom<CellApprovalDecision>((tui, theme, _kb, done) => {
+      let optionIndex = 0;
+      let inputMode = false;
+      let cachedLines: string[] | undefined;
+      const editorTheme: EditorTheme = {
+        borderColor: (style: string) => theme.fg("accent", style),
+        selectList: {
+          selectedPrefix: (style: string) => theme.fg("accent", style),
+          selectedText: (style: string) => theme.fg("accent", style),
+          description: (style: string) => theme.fg("muted", style),
+          scrollInfo: (style: string) => theme.fg("dim", style),
+          noMatch: (style: string) => theme.fg("warning", style),
+        },
+      };
+      const editor = new Editor(tui, editorTheme);
+      editor.onSubmit = (value: string) => {
+        const note = value.trim() || "(no note)";
+        done({ action: "reject", note });
+      };
+
+      const previewLines = code.split("\n");
+      const maxPreview = 24;
+      const truncated = previewLines.length > maxPreview;
+
+      function refresh() {
+        cachedLines = undefined;
+        tui.requestRender();
+      }
+
+      function render(width: number): string[] {
+        if (cachedLines) return cachedLines;
+        const renderWidth: number = Math.max(1, width);
+        const lines: string[] = [];
+        lines.push(theme.fg("accent", "┌─ cell approval ─ kernel " + sessionId + " " + "─".repeat(Math.max(0, renderWidth - 22 - sessionId.length))));
+        lines.push(theme.fg("muted", `│ ${previewLines.length} line${previewLines.length === 1 ? "" : "s"}${truncated ? ` (showing first ${maxPreview})` : ""}`));
+        for (const line of previewLines.slice(0, maxPreview)) {
+          for (const wrapped of wrapTextWithAnsi("│ " + line, renderWidth)) {
+            lines.push(wrapped);
+          }
+        }
+        if (truncated) {
+          lines.push(theme.fg("muted", `│ … ${previewLines.length - maxPreview} more lines`));
+        }
+        lines.push(theme.fg("accent", "└" + "─".repeat(Math.max(0, renderWidth - 2)) + "┘"));
+        lines.push("");
+        CELL_APPROVAL_OPTIONS.forEach((option, index) => {
+          const selected = !inputMode && index === optionIndex;
+          const marker = selected ? theme.fg("accent", "❯ ") : "  ";
+          const label = selected ? theme.fg("accent", option.label) : theme.fg("muted", option.label);
+          lines.push(`${marker}${label}`);
+        });
+        if (inputMode) {
+          lines.push(theme.fg("muted", "Why reject? (Enter to submit)"));
+          lines.push(...editor.getLines());
+        }
+        lines.push(theme.fg("dim", "↑/↓ select · Enter confirm · y approve · n reject · Esc reject"));
+        return lines;
+      }
+
+      function handleInput(data: string): void {
+        if (inputMode) {
+          editor.handleInput(data);
+          refresh();
+          return;
+        }
+        if (data === "\x1b[A" || data === "k") {
+          optionIndex = (optionIndex + CELL_APPROVAL_OPTIONS.length - 1) % CELL_APPROVAL_OPTIONS.length;
+          refresh();
+          return;
+        }
+        if (data === "\x1b[B" || data === "j") {
+          optionIndex = (optionIndex + 1) % CELL_APPROVAL_OPTIONS.length;
+          refresh();
+          return;
+        }
+        if (data === "y") {
+          done({ action: "approve" });
+          return;
+        }
+        if (data === "n") {
+          done({ action: "reject" });
+          return;
+        }
+        if (matchesKey(data, Key.return)) {
+          const selected = CELL_APPROVAL_OPTIONS[optionIndex];
+          if (selected.value === "approve") {
+            done({ action: "approve" });
+          } else if (selected.value === "note") {
+            inputMode = true;
+            editor.setText("");
+            refresh();
+          } else {
+            done({ action: "reject" });
+          }
+          return;
+        }
+        if (matchesKey(data, Key.escape)) {
+          done({ action: "reject" });
+        }
+      }
+
+      void visibleWidth;
+      return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
+    });
+  } catch (error) {
+    // A broken dialog must not run the cell unasked.
+    return {
+      action: "reject",
+      note: `approval dialog failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+
+
+function provisionKernelTool(
   pi: ExtensionAPI,
   sessionManager: PythonSessionManager,
   sessionState: PtcSessionState
 ): PtcToolDefinition {
   return withActivityLabel({
-    name: "provision_python_session",
+    name: "provision_kernel",
     label: "python",
     description: PROVISION_DESCRIPTION,
     parameters: Type.Object({
-      script: Type.Optional(
-        Type.String({
-          description:
-            "Optional path to a Python file executed in the session before the id is returned. Use a prebuilt script (e.g. from python_session_to_script) to start from a prepared environment.",
-        })
-      ),
+      notebook: Type.String({
+        description:
+          "Path to the .ipynb notebook file bound to this kernel (created if missing; .ipynb appended when omitted). Every executed cell is appended to it live. For throwaway scratch work pass a /tmp path.",
+      }),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { script } = params as { script?: string };
-      let scriptCode: string | undefined;
-      if (script) {
-        const scriptPath = path.isAbsolute(script) ? script : path.resolve(ctx.cwd, script);
-        try {
-          scriptCode = fs.readFileSync(scriptPath, "utf-8");
-        } catch (error) {
-          return {
-            content: [{ type: "text", text: `Failed to read script ${script}: ${error instanceof Error ? error.message : String(error)}` }],
-            details: { sessionId: null, error: "script-read-failed" },
-          };
-        }
+      const { notebook } = params as { notebook?: string };
+      if (!notebook || !notebook.trim()) {
+        return {
+          content: [{ type: "text", text: "provision_kernel requires a notebook path (.ipynb). For scratch work use a /tmp path." }],
+          details: { sessionId: null },
+        };
       }
+      const resolved = path.isAbsolute(notebook) ? notebook : path.resolve(ctx.cwd, notebook);
+      const notebookPath = resolved.endsWith(".ipynb") ? resolved : `${resolved}.ipynb`;
 
       try {
         const { id, scriptError } = await sessionManager.provision({
@@ -388,22 +688,26 @@ function provisionPythonSessionTool(
           signal,
           onUpdate,
           parentToolCallId: toolCallId,
-          script: scriptCode,
+          notebookPath,
         });
 
-        const lines = [`Provisioned python session ${id}. Send code chunks with python_exec (session_id: ${id}).`];
+        const lines = [
+          `Provisioned kernel ${id} — notebook ${notebookPath}.`,
+          `Run cells with exec_cell (session_id: ${id}); every cell is appended to the notebook.`,
+        ];
         if (scriptError) {
           lines.push(
-            `The seeding script failed (the session is still usable):`,
+            `The seeding script failed (the kernel is still usable):`,
             scriptError.message,
             ...(scriptError.traceback ? [scriptError.traceback] : []),
-            `Inspect the error with python_exec in session ${id} and repair as needed.`
+            `Inspect the error with exec_cell in kernel ${id} and repair as needed.`
           );
         }
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: {
             sessionId: id,
+            notebookPath,
             scriptError: scriptError ? scriptError.message : undefined,
             nestedToolCalls: 0,
             nestedToolNames: [],
@@ -416,45 +720,91 @@ function provisionPythonSessionTool(
         };
       } catch (error) {
         return {
-          content: [{ type: "text", text: `Failed to provision python session: ${error instanceof Error ? error.message : String(error)}` }],
+          content: [{ type: "text", text: `Failed to provision kernel: ${error instanceof Error ? error.message : String(error)}` }],
           details: { sessionId: null },
         };
       }
     },
     renderResult(result: AgentToolResult<unknown>, { isPartial }: ToolRenderResultOptions, theme: Theme) {
-      const details = result.details as { sessionId?: string; scriptError?: string } | undefined;
+      const details = result.details as { sessionId?: string; notebookPath?: string; scriptError?: string } | undefined;
       if (isPartial) {
-        return new Text(theme.fg("muted", "Provisioning python session..."), 0, 0);
+        return new Text(theme.fg("muted", "Provisioning kernel..."), 0, 0);
       }
-      const sessionLine = details?.sessionId ? theme.fg("success", `session ${details.sessionId}`) : "";
+      const sessionLine = details?.sessionId
+        ? theme.fg("success", `kernel ${details.sessionId}`) + (details.notebookPath ? theme.fg("muted", ` · ${details.notebookPath}`) : "")
+        : "";
       return new Text(`${sessionLine ? `${theme.fg("muted", "[PTC]")} ${sessionLine}\n` : ""}${result.content.map((c) => (c.type === "text" ? c.text : "")).join("")}`, 0, 0);
     },
   });
 }
 
-function pythonExecTool(
+function execCellTool(
   pi: ExtensionAPI,
   sessionManager: PythonSessionManager,
   settings: PtcSettings,
   sessionState: PtcSessionState
 ): PtcToolDefinition {
   return withActivityLabel({
-    name: "python_exec",
+    name: "exec_cell",
     label: "python",
-    description: PYTHON_EXEC_DESCRIPTION,
+    description: EXEC_CELL_DESCRIPTION,
     parameters: Type.Object({
-      session_id: Type.String({ description: "Session id from provision_python_session." }),
-      code: Type.String({
-        description:
-          "Python code to execute in the session. Top-level await is supported; do not call asyncio.run(...). Definitions persist across chunks; return a compact final result.",
-      }),
+      session_id: Type.String({ description: "Session id from provision_kernel." }),
+      code: Type.Optional(
+        Type.String({
+          description:
+            "The cell's Python code. Exactly one of code/file is required. Top-level await works; the last bare expression echoes automatically (Out[n]); do not call asyncio.run(...).",
+        })
+      ),
+      file: Type.Optional(
+        Type.String({
+          description:
+            "Path to a .py file executed inside the kernel instead of inline code (IPython %run semantics). Prefer for substantive, edited code; re-run after editing.",
+        })
+      ),
+      confirm: Type.Optional(
+        Type.Boolean({
+          description:
+            "Ask the user for approval before running. Only for destructive work (deleting/cleaning files, force git ops) or expensive workflows (large multi-stage fan-outs). Never set it when the user said 'run autonomously' or 'don't prompt me'.",
+        })
+      ),
     }),
         execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-          const { session_id: sessionId, code } = params as {
+          const { session_id: sessionId, code, file: cellFile, confirm: needsConfirmation } = params as {
             session_id: string;
-            code: string;
+            code?: string;
+            file?: string;
+            confirm?: boolean;
           };
+          if (!code && !cellFile) {
+            return {
+              content: [{ type: "text", text: "exec_cell requires exactly one of code or file." }],
+              details: { sessionId },
+            };
+          }
+          if (code && cellFile) {
+            return {
+              content: [{ type: "text", text: "exec_cell takes code or file, not both." }],
+              details: { sessionId },
+            };
+          }
           const recoveryState = getRequestRecoveryState(sessionState);
+
+          if (needsConfirmation) {
+            const previewCode = code ?? `exec_cell(file: ${cellFile})`;
+            const decision = await requestCellApproval(ctx, sessionId, previewCode);
+            if (decision.action === "reject") {
+              return {
+                content: [{
+                  type: "text",
+                  text: decision.note
+                    ? `Cell rejected by user — note: ${decision.note}`
+                    : "Cell rejected by user.",
+                }],
+                details: { sessionId, rejected: true },
+              };
+            }
+          }
     
           // background/wait_for modes are WIP (deferred): synchronous runs make the
           // live subagent viewer straightforward. The manager keeps the machinery
@@ -465,7 +815,7 @@ function pythonExecTool(
       sessionState.lastCtx = ctx;
 
       try {
-        const execOptions = { cwd: ctx.cwd, ctx, signal, onUpdate, parentToolCallId: toolCallId };
+        const execOptions = { cwd: ctx.cwd, ctx, signal, onUpdate, parentToolCallId: toolCallId, file: cellFile };
         sessionState.activeForegroundToolCallId = toolCallId;
         sessionState.activeForegroundSessionId = sessionId;
 
@@ -488,7 +838,8 @@ function pythonExecTool(
         }, 120);
         repaint.unref?.();
 
-        const execPromise = sessionManager.execForeground(sessionId, code, {
+        const cellCode = code ?? "(exec_cell file mode)\n";
+        const execPromise = sessionManager.execForeground(sessionId, cellCode, {
           ...execOptions,
           onUpdate: streamingOnUpdate,
         });
@@ -582,58 +933,6 @@ function pythonExecTool(
         .join("");
 
       return renderCompletedOutput(text, details, theme);
-    },
-  });
-}
-
-function pythonSessionToScriptTool(sessionManager: PythonSessionManager): PtcToolDefinition {
-  return withActivityLabel({
-    name: "python_session_to_script",
-    label: "python",
-    description: SCRIPT_EXPORT_DESCRIPTION,
-    parameters: Type.Object({
-      session_id: Type.Optional(
-        Type.String({ description: "Session id; defaults to the most recent session." })
-      ),
-      path: Type.Optional(
-        Type.String({ description: "Absolute or cwd-relative target file path; defaults to ./.pi/scripts/<name>." })
-      ),
-      name: Type.Optional(
-        Type.String({ description: "Script file name when path is not given; defaults to ptc-session-<session_id>.py." })
-      ),
-    }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-      const { session_id: requestedId, path: targetPath, name } = params as {
-        session_id?: string;
-        path?: string;
-        name?: string;
-      };
-      const summaries = sessionManager.list();
-      const sessionId = requestedId ?? summaries[0]?.id;
-      if (!sessionId) {
-        return { content: [{ type: "text", text: "No python sessions to export. Provision one with provision_python_session first." }], details: {} };
-      }
-      try {
-        const result = await sessionManager.toScript(sessionId, { cwd: ctx.cwd, path: targetPath, name });
-        return {
-          content: [{
-            type: "text",
-            text: `Exported ${result.cells} cell${result.cells === 1 ? "" : "s"}${result.wrappedAsync ? " (async-wrapped)" : ""} to ${result.path}. Edit it with edit/write tools and run it with bash.`,
-          }],
-          details: { sessionId, scriptPath: result.path, cells: result.cells, wrappedAsync: result.wrappedAsync },
-        };
-      } catch (error) {
-        return { content: [{ type: "text", text: describeSessionError(error, sessionManager) }], details: { sessionId } };
-      }
-    },
-    renderResult(result: AgentToolResult<unknown>, { isPartial }: ToolRenderResultOptions, theme: Theme) {
-      if (isPartial) {
-        return new Text(theme.fg("muted", "Exporting session script..."), 0, 0);
-      }
-      const details = result.details as { scriptPath?: string } | undefined;
-      const pathLine = details?.scriptPath ? theme.fg("success", details.scriptPath) : "";
-      const text = result.content.map((c) => (c.type === "text" ? c.text : "")).join("");
-      return new Text(`${pathLine ? `${theme.fg("muted", "[PTC]")} ${pathLine}\n` : ""}${text}`, 0, 0);
     },
   });
 }
@@ -804,6 +1103,7 @@ async function handleSessionStart(
   toolRegistry: ToolRegistry,
   settings: PtcSettings,
   sessionManager: PythonSessionManager,
+  sandboxManager: SandboxManager,
   _event: unknown,
   ctx: ExtensionContext
 ): Promise<void> {
@@ -813,9 +1113,11 @@ async function handleSessionStart(
     sessionState.customToolsStarted = true;
   }
 
-  pi.registerTool(provisionPythonSessionTool(pi, sessionManager, sessionState));
-  pi.registerTool(pythonExecTool(pi, sessionManager, settings, sessionState));
-  pi.registerTool(pythonSessionToScriptTool(sessionManager));
+  pi.registerTool(provisionKernelTool(pi, sessionManager, sessionState));
+  pi.registerTool(execCellTool(pi, sessionManager, settings, sessionState));
+  pi.registerTool(listKernelsTool(sessionManager));
+  pi.registerTool(inspectKernelTool(sessionManager));
+  pi.registerTool(provisionDependencyTool(sessionManager, sandboxManager));
 }
 
 function handleBeforeAgentStart(
@@ -913,7 +1215,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     onInterrupted: (sessionId, text) => {
       // pi records our interrupt error as the tool result, so the model already has
       // the stack. This hook exists for hosts that drop tool results; keep it quiet.
-      debugLog(`python_exec interrupt report for ${sessionId}`, text.slice(0, 200));
+      debugLog(`exec_cell interrupt report for ${sessionId}`, text.slice(0, 200));
     },
   });
   (globalThis as Record<string, unknown>).__ptcPythonSessionManager = sessionManager;
@@ -942,7 +1244,8 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     pi,
     toolRegistry,
     settings,
-    sessionManager
+    sessionManager,
+    sandboxManager
   );
   const onBeforeAgentStart = handleBeforeAgentStart.bind(undefined, pi, toolRegistry, settings, sessionState);
   const onContext = handleContext.bind(undefined, sessionState);

@@ -73,7 +73,7 @@ class RpcClient:
             self.disconnected.set()
 
     def _handle_response(self, response: Dict[str, Any]) -> None:
-        if response.get("type") in ("exec", "export_script"):
+        if response.get("type") in ("exec", "export_script", "inspect"):
             handler = self.exec_handler
             if handler is not None:
                 handler(response)

@@ -15,6 +15,7 @@ import { buildSessionPrelude } from "./execution/session-prelude";
 import { loadPythonRuntimeSources } from "./execution/runtime-assets";
 import type {
   CodeExecutionResult,
+  KernelDigest,
   ExecutionDetails,
   SandboxManager,
   ScriptExportResult,
@@ -34,6 +35,10 @@ export interface SessionExecOptions {
   signal?: AbortSignal;
   onUpdate?: ToolUpdateCallback;
   parentToolCallId?: string;
+  /** Live notebook artifact the executed cell is appended to. */
+  notebookPath?: string;
+  /** File mode: execute this file's contents inside the kernel (%run semantics). */
+  file?: string;
 }
 
 export interface SessionSummary {
@@ -43,6 +48,7 @@ export interface SessionSummary {
   chunks: number;
   hasPendingBackground: boolean;
   running: boolean;
+  notebookPath: string | undefined;
 }
 
 export interface BackgroundCompletion {
@@ -99,6 +105,8 @@ class PersistentSessionProtocol {
   private chunkLines: string[] = [];
   private execId = "";
   private execStartedAt = Date.now();
+  private notebookPath: string | undefined = undefined;
+  private cellFile: string | undefined = undefined;
   // Final subagent snapshot of the running exec; stamped onto exec_done so the
   // completed tool render keeps the subagent panel (live updates carry it, the
   // final frame used to drop it).
@@ -121,6 +129,9 @@ class PersistentSessionProtocol {
   private execRejectRef?: (error: Error) => void;
   private scriptExportId = "";
   private scriptExportResolve?: (result: ScriptExportResult) => void;
+  private inspectId = "";
+  private inspectResolve?: (digest: KernelDigest) => void;
+  private inspectReject?: (error: Error) => void;
   private scriptExportReject?: (error: Error) => void;
   private pendingInterrupt?: { kind: InterruptKind; message: string };
   private interruptGraceTimer?: NodeJS.Timeout;
@@ -348,6 +359,18 @@ class PersistentSessionProtocol {
         return;
       }
 
+      case "kernel_inspected": {
+        if (msg.id !== this.inspectId) {
+          return; // stale frame
+        }
+        const resolveInspect = this.inspectResolve;
+        this.inspectResolve = undefined;
+        this.inspectReject = undefined;
+        this.inspectId = "";
+        resolveInspect?.(msg.digest as KernelDigest);
+        return;
+      }
+
       case "script_exported": {
         if (msg.id !== this.scriptExportId) {
           return; // stale frame
@@ -558,7 +581,15 @@ class PersistentSessionProtocol {
     this.execTimeoutMs = timeoutMs;
     this.armExecTimeout();
 
-    this.send({ type: "exec", id: this.execId, code, user_code_line_count: this.chunkLines.length });
+    this.send({
+      type: "exec",
+      id: this.execId,
+      code,
+      user_code_line_count: this.chunkLines.length,
+      notebook: this.notebookPath,
+      source_path: this.cellFile,
+    });
+    this.cellFile = undefined;
     return promise;
   }
 
@@ -591,11 +622,45 @@ class PersistentSessionProtocol {
     return promise;
   }
 
+  /** Ask the interpreter for a structured snapshot of the user namespace. */
+  async inspectKernel(timeoutMs: number | undefined): Promise<KernelDigest> {
+    if (this.execResolve) {
+      throw new PythonSessionError("kernel is busy executing a cell; inspect after it finishes");
+    }
+    this.inspectId = `inspect_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+    const promise = new Promise<KernelDigest>((resolve, reject) => {
+      this.inspectResolve = resolve;
+      this.inspectReject = reject;
+    });
+    let timeout: NodeJS.Timeout | undefined;
+    if (timeoutMs !== undefined) {
+      timeout = setTimeout(() => {
+        this.inspectReject?.(new Error(`kernel inspect timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+      }, timeoutMs);
+      timeout.unref?.();
+    }
+    void promise.finally(() => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    });
+    this.send({ type: "inspect", id: this.inspectId });
+    return promise;
+  }
+
   currentExecPromise(): Promise<CodeExecutionResult> | null {
     return this.execResolve || this.backgrounded ? this.currentExecPromiseField ?? null : null;
   }
 
   /** Convert the running exec to a background run (stops streaming updates). */
+  setNotebookPath(notebookPath: string | undefined): void {
+    this.notebookPath = notebookPath;
+  }
+
+  setCellFile(cellFile: string | undefined): void {
+    this.cellFile = cellFile;
+  }
+
   setBackgrounded(flag: boolean): void {
     this.backgrounded = flag;
     if (flag) {
@@ -622,6 +687,7 @@ class PersistentSessionProtocol {
 
 interface SessionRecord {
   id: string;
+  notebookPath?: string;
   proc: ChildProcess;
   protocol: PersistentSessionProtocol;
   chunks: string[];
@@ -665,6 +731,7 @@ export class PythonSessionManager {
         chunks: session.chunks.length,
         hasPendingBackground: [...session.background.values()].some((entry) => entry.status === "pending"),
         running: Boolean(session.protocol.currentExecId()),
+        notebookPath: session.notebookPath,
       }));
   }
 
@@ -691,6 +758,15 @@ export class PythonSessionManager {
     return null;
   }
 
+  /** Structured snapshot of a kernel's user-created namespace. */
+  async inspectKernel(
+    sessionId: string,
+    options: { timeoutMs?: number } = {}
+  ): Promise<KernelDigest> {
+    const record = this.require(sessionId);
+    return record.protocol.inspectKernel(options.timeoutMs);
+  }
+
   /** All subagent snapshots across sessions (sessions may each have their own). */
   allSubagentSnapshots(): Array<{ sessionId: string; snapshot: SubagentRuntimeSnapshot }> {
     const result: Array<{ sessionId: string; snapshot: SubagentRuntimeSnapshot }> = [];
@@ -710,6 +786,7 @@ export class PythonSessionManager {
     onUpdate?: ToolUpdateCallback;
     parentToolCallId?: string;
     script?: string;
+    notebookPath?: string;
   }): Promise<{ id: string; scriptError?: PtcPythonError }> {
     const liveCount = [...this.sessions.values()].filter((session) => !session.killed).length;
     if (liveCount >= this.settings.maxPythonSessions) {
@@ -775,9 +852,13 @@ export class PythonSessionManager {
       pendingJobs: 0,
       background: new Map(),
       latestSnapshot: null,
+      notebookPath: options.notebookPath,
     };
 
     await protocol.waitReady(15_000);
+    if (options.notebookPath) {
+      protocol.setNotebookPath(options.notebookPath);
+    }
 
     this.sessions.set(sessionId, record);
     this.recency = this.recency.filter((id) => id !== sessionId);
@@ -827,8 +908,8 @@ export class PythonSessionManager {
     }
     record.pendingJobs += 1;
     const job = record.queue.then(
-      () => this.execChunk(record, code, false, options.onUpdate, options.signal),
-      () => this.execChunk(record, code, false, options.onUpdate, options.signal)
+      () => this.execChunk(record, code, false, options.onUpdate, options.signal, options.file, options.notebookPath),
+      () => this.execChunk(record, code, false, options.onUpdate, options.signal, options.file, options.notebookPath)
     );
     // Advance the queue regardless of this job's outcome so a failed exec cannot
     // wedge every later call on the session.
@@ -1008,7 +1089,9 @@ export class PythonSessionManager {
     code: string,
     backgrounded: boolean,
     onUpdate?: ToolUpdateCallback,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    cellFile?: string,
+    notebookPath?: string
   ): Promise<CodeExecutionResult> {
     validateUserCode(code);
     if (record.killed || record.proc.exitCode !== null) {
@@ -1020,6 +1103,10 @@ export class PythonSessionManager {
     record.lastUsedAt = Date.now();
     record.chunks.push(code);
     record.protocol.setUpdateHandler(onUpdate);
+    record.protocol.setNotebookPath(notebookPath ?? record.notebookPath);
+    if (cellFile) {
+      record.protocol.setCellFile(cellFile);
+    }
 
     // An aborted tool call interrupts the running chunk (Ctrl-C semantics) and
     // leaves the session interactive, so its namespace and any subagents the

@@ -61,10 +61,10 @@ test("persistent session: definition persists across chunks and returns work", {
     const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
 
     const first = await manager.execForeground(id, "def double(x):\n    return x * 2\nreturn 'defined'", {});
-    assert.equal(first.output, "defined");
+    assert.match(first.output, /^defined/);
 
     const second = await manager.execForeground(id, "result = [d for d in [double(1), double(2), double(3)]]\nreturn result", {});
-    assert.deepEqual(JSON.parse(second.output), [2, 4, 6]);
+    assert.deepEqual(JSON.parse(second.output.split("\n\n[kernel]")[0]), [2, 4, 6]);
   } finally {
     await manager.disposeAll();
   }
@@ -80,10 +80,10 @@ test("persistent session: top-level await chunk works and later chunks see its l
       "await asyncio.sleep(0.01)\nvalue = 'awaited'\nreturn value",
       {}
     );
-    assert.equal(awaited.output, "awaited");
+    assert.match(awaited.output, /^awaited/);
 
     const uses = await manager.execForeground(id, "return value", {});
-    assert.equal(uses.output, "awaited");
+    assert.match(uses.output, /^awaited/);
   } finally {
     await manager.disposeAll();
   }
@@ -100,7 +100,7 @@ test("persistent session: exec errors do not kill the session", { skip: !RUN_REA
     );
 
     const recovered = await manager.execForeground(id, "x = 1\nreturn x", {});
-    assert.equal(recovered.output, "1");
+    assert.match(recovered.output, /^1\n/);
   } finally {
     await manager.disposeAll();
   }
@@ -271,7 +271,7 @@ test("persistent session: subagent activity re-arms the idle timeout", { skip: !
       }
     );
 
-    assert.equal(result.output, "survived");
+    assert.match(result.output, /^survived/);
     assert.equal(manager.list().length, 1, "session should still be live");
     assert.ok(updates.length > 0);
   } finally {
@@ -297,7 +297,7 @@ test("persistent session: idle timeout interrupts the chunk and keeps the sessio
     // Ctrl-C semantics: the interpreter stays interactive with its state intact.
     assert.equal(manager.list().length, 1, "session should survive the interrupt");
     const after = await manager.execForeground(id, "return kept", { cwd: process.cwd() });
-    assert.equal(after.output, "survived");
+    assert.match(after.output, /^survived/);
   } finally {
     await manager.disposeAll();
   }
@@ -321,8 +321,8 @@ test("persistent session: parallel python_exec calls are serialized and both ret
     });
     const [a, b] = await Promise.all([first, second]);
 
-    assert.equal(a.output, "first");
-    assert.equal(b.output, "second");
+    assert.match(a.output, /^first/);
+    assert.match(b.output, /^second/);
     assert.ok(
       queuedNotices.some((text) => text.includes("Queued")),
       `a chunk waiting behind another should announce that: ${JSON.stringify(queuedNotices)}`
@@ -330,7 +330,7 @@ test("persistent session: parallel python_exec calls are serialized and both ret
 
     // The session stays usable afterwards.
     const third = await manager.execForeground(id, "return 'third'", { cwd: process.cwd() });
-    assert.equal(third.output, "third");
+    assert.match(third.output, /^third/);
   } finally {
     await manager.disposeAll();
   }
@@ -359,7 +359,7 @@ test("persistent session: aborting interrupts the chunk but keeps the session us
     // The session keeps running with its namespace intact (Ctrl-C semantics).
     assert.equal(manager.list().length, 1, "aborted session should survive");
     const after = await manager.execForeground(id, "return before + 1", { cwd: process.cwd() });
-    assert.equal(after.output, "42");
+    assert.match(after.output, /^42/);
   } finally {
     await manager.disposeAll();
   }
@@ -403,7 +403,7 @@ test("persistent session: an unserializable result is an error, not a session de
 
     assert.equal(manager.list().length, 1, "session must survive an unserializable result");
     const after = await manager.execForeground(id, "return kept", { cwd: process.cwd() });
-    assert.equal(after.output, "still-here");
+    assert.match(after.output, /^still-here/);
   } finally {
     await manager.disposeAll();
   }
@@ -452,3 +452,109 @@ test("persistent session: the line arrow catches up when a chunk blocks", { skip
 function fakeCtx() {
   return { cwd: process.cwd(), hasUI: false };
 }
+
+test("kernel: trailing expression echoes, digest footer, magic guard, notebook", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	try {
+		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+
+		// Auto-echo: trailing expression is displayed without print/return.
+		const echoed = await manager.execForeground(id, "21 * 2", {});
+		assert.match(echoed.output, /Out\[\d+\]: 42/);
+		assert.match(echoed.output, /\n\n\[kernel\] cell 1/);
+
+		// None results echo nothing; digest still present.
+		const silent = await manager.execForeground(id, "x = 5", {});
+		assert.doesNotMatch(silent.output, /Out\[/);
+		assert.match(silent.output, /\[kernel\] cell 2 · \+x/);
+
+		// Magic guard: rejected before execution, counter not advanced.
+		await assert.rejects(
+			manager.execForeground(id, "%timeit sum(range(10))", {}),
+			(error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				return /MagicError/.test(message) && /not written to the notebook/.test(message);
+			},
+		);
+		const afterMagic = await manager.execForeground(id, "pass", {});
+		assert.match(afterMagic.output, /\[kernel\] cell 3\b/, "rejected cells must not advance the counter");
+
+		// ModuleNotFoundError carries the provision_dependency hint.
+		await assert.rejects(
+			manager.execForeground(id, "import definitely_not_a_real_module_xyz", {}),
+			(error: unknown) => /provision_dependency/.test(error instanceof Error ? error.message : String(error)),
+		);
+	} finally {
+		await manager.disposeAll();
+	}
+});
+
+test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-nb-"));
+	const notebookPath = path.join(tempDir, "scratch.ipynb");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+		await manager.execForeground(id, "a = 1\nprint('hello from cell')\na + 1", { notebookPath });
+		await assert.rejects(
+			manager.execForeground(id, "raise ValueError('boom')", { notebookPath }),
+			(error: unknown) => /ValueError/.test(error instanceof Error ? error.message : String(error)),
+		);
+		await assert.rejects(
+			manager.execForeground(id, "%magic garbage", { notebookPath }),
+			(error: unknown) => /MagicError/.test(error instanceof Error ? error.message : String(error)),
+		);
+
+		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf-8"));
+		assert.equal(notebook.nbformat, 4);
+		assert.equal(notebook.cells.length, 2, "magic-rejected cells must not be written");
+
+		const [ok, failed] = notebook.cells;
+		assert.equal(ok.cell_type, "code");
+		assert.equal(ok.execution_count, 1);
+		const kinds = ok.outputs.map((o: { output_type: string }) => o.output_type);
+		assert.ok(kinds.includes("stream"), "stdout captured");
+		assert.ok(kinds.includes("execute_result"), "echo captured as execute_result");
+		assert.match(ok.outputs.find((o: { output_type: string }) => o.output_type === "stream").text.join(""), /hello from cell/);
+		assert.equal(failed.outputs[0].output_type, "error");
+		assert.equal(failed.outputs[0].ename, "ValueError");
+	} finally {
+		await manager.disposeAll();
+	}
+});
+
+test("kernel: file mode executes a file inside the kernel with real-path tracebacks", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-file-"));
+	const cellFile = path.join(tempDir, "cell.py");
+	fs.writeFileSync(cellFile, "value = 'from-file'\n1 / 0\n");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+		await assert.rejects(
+			manager.execForeground(id, "ignored", { file: cellFile }),
+			(error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				return /ZeroDivisionError/.test(message) && /cell\.py/.test(message);
+			},
+		);
+		// definitions from the file persist in the kernel namespace
+		const after = await manager.execForeground(id, "return value", {});
+		assert.match(after.output, /^from-file/);
+	} finally {
+		await manager.disposeAll();
+	}
+});
+
+test("kernel: inspect returns the user-created namespace", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	try {
+		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+		await manager.execForeground(id, "import json as j\ndef thing():\n    return 1", {});
+		const inspected = await manager.inspectKernel(id);
+		assert.ok(inspected.defs.includes("thing"));
+		assert.ok(inspected.imports.some((entry: { name: string }) => entry.name === "j"));
+		assert.ok(inspected.cells >= 1);
+	} finally {
+		await manager.disposeAll();
+	}
+});
