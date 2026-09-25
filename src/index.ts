@@ -43,7 +43,7 @@ import {
   computeCodeViewStart,
   type CodeViewState,
 } from "./execution/code-view";
-import { relevantAgents, renderSubagentPanel } from "./execution/subagent-panel";
+import { relevantAgents, renderSubagentNotification, renderSubagentPanel } from "./execution/subagent-panel";
 import {
   PythonSessionManager,
   UnknownSessionError,
@@ -501,6 +501,17 @@ function pythonExecTool(
         noteCodeExecutionSuccess(recoveryState);
         if (result.details.estimatedAvoidedTokens > 0) {
           ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
+        }
+        // Persist the subagent fan as a transcript notification: finished tool
+        // results collapse into grouped one-line rows, so a workflow would
+        // otherwise vanish the moment the chunk returns.
+        const notification = renderSubagentNotification(result.details.subagentSnapshot, result.details.execId);
+        if (notification) {
+          try {
+            pi.sendMessage({ customType: "subagent-notification", content: notification, display: true }, { triggerTurn: false });
+          } catch {
+            // never break the tool over transcript plumbing
+          }
         }
         const content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }> = [
           { type: "text", text: result.output || "(No output)" },

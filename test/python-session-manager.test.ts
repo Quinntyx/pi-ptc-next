@@ -139,6 +139,23 @@ test("persistent session: subagent_state frames flow to the runtime hooks", { sk
   }
 });
 
+test("persistent session: the final result carries the last subagent snapshot", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	try {
+		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+		const result = await manager.execForeground(
+			id,
+			"import builtins\nemit = getattr(builtins, 'PTC_STATE_EMIT', None)\nassert emit is not None, 'bridge missing'\nemit({'agents': [{'id': 'a1', 'name': 'probe', 'status': 'settled'}], 'totals': {'settled': 1}})\nreturn 'done'",
+			{}
+		);
+		assert.ok(result.details.subagentSnapshot, "final details must include the snapshot");
+		assert.equal(result.details.subagentSnapshot.agents[0].name, "probe");
+		assert.equal(result.details.execId.length > 0, true);
+	} finally {
+		await manager.disposeAll();
+	}
+});
+
 test("persistent session: script export writes a durable, runnable file", { skip: !RUN_REAL }, async () => {
   const manager = makeManager();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-script-"));

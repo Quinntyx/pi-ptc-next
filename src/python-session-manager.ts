@@ -99,6 +99,10 @@ class PersistentSessionProtocol {
   private chunkLines: string[] = [];
   private execId = "";
   private execStartedAt = Date.now();
+  // Final subagent snapshot of the running exec; stamped onto exec_done so the
+  // completed tool render keeps the subagent panel (live updates carry it, the
+  // final frame used to drop it).
+  private lastSubagentSnapshot?: SubagentRuntimeSnapshot;
   private execResolve?: (result: CodeExecutionResult) => void;
   private execReject?: (error: Error) => void;
   private execTimeout?: NodeJS.Timeout;
@@ -308,7 +312,7 @@ class PersistentSessionProtocol {
         this.finish({
           output: this.buildFinalOutput(finalOutput, totalChars),
           images: (msg.images as never[] | undefined) ?? undefined,
-          details: this.buildDetails({ execId: this.execId }),
+          details: this.buildDetails({ execId: this.execId, subagentSnapshot: this.lastSubagentSnapshot }),
         });
         return;
       }
@@ -338,6 +342,7 @@ class PersistentSessionProtocol {
       }
 
       case "subagent_state": {
+        this.lastSubagentSnapshot = msg.snapshot as SubagentRuntimeSnapshot;
         this.options.onSubagentSnapshot?.(this.execId, msg.snapshot as SubagentRuntimeSnapshot);
         this.emitUpdate({ subagentSnapshot: msg.snapshot as SubagentRuntimeSnapshot });
         return;
@@ -540,6 +545,7 @@ class PersistentSessionProtocol {
     this.currentLine = undefined;
     this.totalLines = undefined;
     this.activeTool = undefined;
+    this.lastSubagentSnapshot = undefined;
     this.backgrounded = backgrounded;
 
     const promise = new Promise<CodeExecutionResult>((resolve, reject) => {

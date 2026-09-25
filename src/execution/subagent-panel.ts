@@ -126,7 +126,11 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
       }
 
       const running = agent.status === "running";
-      const light = running ? theme.fg("success", "●") : agent.status === "settled" ? theme.fg("success", "✓") : theme.fg("warning", "!");
+      const light = running
+        ? theme.fg("success", "●")
+        : agent.status === "settled" || agent.status === "closed"
+          ? theme.fg("success", "✓")
+          : theme.fg("warning", "!");
       // Running values tick with the wall clock between snapshots; settled ones are final.
       const elapsedMs = (agent.elapsedMs ?? 0) + (running ? drift : 0);
       const labelElapsedMs =
@@ -192,4 +196,39 @@ export function renderSubagentPanel(
   execId?: string
 ): string[] {
   return renderSubagentFan(snapshot, theme, execId);
+}
+
+/**
+ * Plain-text notification for a finished exec, emitted as a
+ * "subagent-notification" custom message so the completed workflow stays
+ * visible in the transcript (pi-tool-tree frames these; tool results collapse
+ * into grouped one-line rows). Uses the vocabulary pi-tool-tree's formatter
+ * expects: a glyph header, metadata lines, then "⎿" detail lines.
+ */
+export function renderSubagentNotification(snapshot: SubagentRuntimeSnapshot | undefined, execId?: string): string | null {
+  const agents = relevantAgents(snapshot, execId);
+  if (agents.length === 0) {
+    return null;
+  }
+  const statusGlyph = (status: string): string => {
+    if (status === "settled" || status === "closed") return "✓";
+    if (status === "failed" || status === "dead") return "✗";
+    if (status === "cancelled" || status === "stopped") return "■";
+    return "●";
+  };
+  const lines: string[] = [];
+  const done = agents.filter((a) => a.status === "settled" || a.status === "closed").length;
+  const failed = agents.filter((a) => ["failed", "dead", "stopped", "cancelled"].includes(a.status)).length;
+  const stillGoing = agents.filter((a) => ["queued", "starting", "running"].includes(a.status)).length;
+  const headerBits = [`${done} done`];
+  if (failed) headerBits.push(`${failed} failed`);
+  if (stillGoing) headerBits.push(`${stillGoing} still working`);
+  lines.push(`${stillGoing ? "●" : failed ? "✗" : "✓"} subagents · ${headerBits.join(" · ")}`);
+  for (const agent of agents) {
+    const bits = [`${formatAgentSeconds(agent.elapsedMs) || "—"}`, `${agent.toolCalls || 0} calls`];
+    const ctx = agent.ctx;
+    if (ctx?.percent !== undefined && ctx.percent !== null) bits.push(`ctx ${Math.round(ctx.percent)}%`);
+    lines.push(`⎿ ${statusGlyph(agent.status)} ${agent.name} · ${bits.join(" · ")}`);
+  }
+  return lines.join("\n");
 }
