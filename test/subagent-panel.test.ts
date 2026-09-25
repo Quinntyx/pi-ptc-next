@@ -58,3 +58,71 @@ test("the fan is scoped to the exec being streamed and settled rows freeze their
   // Without scoping context (the global runtime API) everything is returned.
   assert.ok(renderSubagentPanel(snapshot, noopTheme).length > 0);
 });
+
+test("declared stages with no agents render as idle, matching the live header style", () => {
+  const now = Date.now();
+  const noopTheme = { fg: (_c, s) => s };
+  const snapshot = {
+    agents: [
+      { id: "a", name: "review-runtime-a", group: "review", status: "running", execScope: "exec_cur", startedAt: now - 60_000, elapsedMs: 60_000, toolCalls: 2, awaited: false },
+      { id: "b", name: "review-runtime-b", group: "review", status: "running", execScope: "exec_cur", startedAt: now - 55_000, elapsedMs: 55_000, toolCalls: 1, awaited: false },
+    ],
+    totals: { running: 2, settled: 0, failed: 0 },
+    groups: { review: now - 60_000 },
+    pools: [
+      {
+        id: "p1", name: "two-pass", status: "open", concurrency: 6, running: 2, queued: 0, results: 0,
+        startedAt: now - 60_000,
+        stages: [
+          { id: "s1", name: "review", slots: 4, queued: 0, running: 2, submitted: 2, settled: 0, failed: 0, cancelled: 0, startedAt: now - 60_000 },
+          { id: "s2", name: "adjudicate", slots: 2, queued: 0, running: 0, submitted: 0, settled: 0, failed: 0, cancelled: 0, startedAt: now - 59_000 },
+        ],
+      },
+    ],
+    timestamp: now,
+  };
+
+  const lines = renderSubagentPanel(snapshot, noopTheme, "exec_cur");
+  const plain = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+  const text = plain.join("\n");
+
+  // the idle stage renders with the same header shape as live stages
+  // (dot replaced by a checkmark) and an "idle" detail row — not the
+  // bracketed ad-hoc styling.
+  assert.ok(plain.some((l) => l.trim().startsWith("✓ adjudicate ·")), plain.join("\n"));
+  assert.ok(text.includes("╰ idle"), plain.join("\n"));
+  assert.ok(!text.includes("[2 slots]"), "no ad-hoc slot brackets");
+  assert.ok(!text.includes("no tasks yet"), "no ad-hoc idle text");
+  // the review stage has agents, so it renders its group, not an idle row
+  assert.ok(plain.some((l) => l.trim().startsWith("● review ·")));
+  assert.ok(!text.includes("4/4 done (earlier cell)"));
+  // footer unaffected by idle stages
+  assert.ok(text.includes("2 running"));
+});
+
+test("a stage whose agents settled in an earlier cell shows its tally, styled identically", () => {
+  const now = Date.now();
+  const noopTheme = { fg: (_c, s) => s };
+  const snapshot = {
+    agents: [],
+    totals: { running: 0, settled: 0, failed: 0 },
+    groups: {},
+    pools: [
+      {
+        id: "p1", name: "wf", status: "open", concurrency: 4, running: 0, queued: 0, results: 0,
+        startedAt: now - 300_000,
+        stages: [
+          { id: "s1", name: "build", slots: 2, queued: 0, running: 0, submitted: 4, settled: 4, failed: 0, cancelled: 0, startedAt: now - 300_000 },
+        ],
+      },
+    ],
+    timestamp: now,
+  };
+
+  const lines = renderSubagentPanel(snapshot, noopTheme, "exec_cur");
+  const plain = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+  const text = plain.join("\n");
+  assert.ok(plain.some((l) => l.trim().startsWith("✓ build ·")), text);
+  assert.ok(text.includes("╰ 4/4 done (earlier cell)"), text);
+  assert.ok(!text.includes("[2 slots]"));
+});

@@ -81,6 +81,31 @@ export interface SubagentAgentRow {
   ctx?: { tokens?: number | null; limit?: number | null; percent?: number | null } | null;
 }
 
+export interface SubagentPoolStageState {
+  id: string;
+  name: string;
+  slots: number;
+  queued: number;
+  running: number;
+  submitted: number;
+  settled: number;
+  failed: number;
+  cancelled: number;
+  startedAt: number;
+}
+
+export interface SubagentPoolState {
+  id: string;
+  name: string;
+  status: "open" | "closed";
+  concurrency: number;
+  running: number;
+  queued: number;
+  results: number;
+  stages: SubagentPoolStageState[];
+  startedAt: number;
+}
+
 export interface SubagentRuntimeSnapshot {
   pid?: number;
   depth?: number;
@@ -88,6 +113,8 @@ export interface SubagentRuntimeSnapshot {
   totals?: { running?: number; settled?: number; failed?: number };
   /** phase label -> epoch ms when subagents.phase() was called */
   groups?: Record<string, number>;
+  /** Live pools with their declared stages (idle stages render in the panel). */
+  pools?: SubagentPoolState[];
   timestamp?: number;
 }
 

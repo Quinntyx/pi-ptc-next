@@ -61,7 +61,16 @@ export function relevantAgents(snapshot: SubagentRuntimeSnapshot | undefined, ex
 }
 
 function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme: Theme, execId?: string): string[] {
-  if (!snapshot || !Array.isArray(snapshot.agents) || snapshot.agents.length === 0) {
+  // A pool's declared stages render even with no agents (idle rows), so a
+  // workflow whose cells have not reached pass two yet still shows its shape.
+  const declaredStages = (snapshot?.pools ?? [])
+    .filter((pool) => pool.status !== "closed")
+    .flatMap((pool) => pool.stages ?? []);
+  if (
+    !snapshot ||
+    !Array.isArray(snapshot.agents) ||
+    (snapshot.agents.length === 0 && declaredStages.length === 0)
+  ) {
     return [];
   }
 
@@ -72,7 +81,7 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   const wallNow = Date.now();
   const drift = snapshot.timestamp ? Math.max(0, wallNow - snapshot.timestamp) : 0;
   const agents = relevantAgents(snapshot, execId);
-  if (agents.length === 0) {
+  if (agents.length === 0 && declaredStages.length === 0) {
     return [];
   }
   // Totals describe the filtered view, not the whole (possibly long-lived)
@@ -176,6 +185,27 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
     lines.push("");
   }
 
+  // Declared stages with no agents in this view still render — same header and
+  // rails as live stages, with the dot replaced by a checkmark — so the
+  // workflow's structure is always visible: an empty stage is distinguishable
+  // from a stage the orchestrating cell never created.
+  const renderedGroups = new Set(withEmpty.filter(Boolean));
+  for (const pool of snapshot.pools ?? []) {
+    if (pool.status === "closed") continue;
+    for (const stage of pool.stages ?? []) {
+      if (renderedGroups.has(stage.name)) continue;
+      renderedGroups.add(stage.name);
+      const stageElapsed = formatAgentSeconds(wallNow - (stage.startedAt ?? wallNow));
+      lines.push(`    ${theme.fg("success", "✓")} ${theme.fg("muted", stage.name)} ${theme.fg("muted", `· ${stageElapsed}`)}`);
+      const detail =
+        stage.submitted === 0
+          ? "idle"
+          : `${stage.settled}/${stage.submitted} done (earlier cell)`;
+      lines.push(`    ${theme.fg("muted", "╰")} ${theme.fg("muted", detail)}`);
+      lines.push("");
+    }
+  }
+
   // footer summary
   const queued = totals.queued ?? 0;
   const running = totals.running ?? agents.filter((a) => a.status === "running" || a.status === "starting").length;
@@ -186,7 +216,9 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
   if (running) parts.push(theme.fg("success", `● ${running} running`));
   if (settled) parts.push(theme.fg("success", `✓ ${settled} done`));
   if (failed) parts.push(theme.fg("warning", `! ${failed} stopped/failed`));
-  lines.push(theme.fg("muted", "subagents: ") + parts.join(theme.fg("muted", " · ")));
+  if (parts.length > 0) {
+    lines.push(theme.fg("muted", "subagents: ") + parts.join(theme.fg("muted", " · ")));
+  }
   return lines;
 }
 
