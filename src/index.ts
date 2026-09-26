@@ -222,7 +222,7 @@ Workflow:
 
 Prefer exec_cell for repo-wide analysis, repeated lookups, loops, grouping, ranking, counting, filtering, or any task with 3+ dependent tool calls. Use direct tools for one-file reads, one-off grep/find calls, or tiny lookups.
 
-exec_cell runs synchronously and streams progress — including a live viewer of any pi_subagents fan-out the cell runs (agent status rows render under the code view while it executes). Prefer orchestrating an entire fan-out inside one cell: submit to pools, consume with pool.pop, close the pool, return the summary.
+exec_cell runs synchronously and streams progress — including a live viewer of any pi_subagents fan-out the cell runs (agent status rows render under the code view while it executes). Prefer orchestrating an entire fan-out inside one cell: submit to pools, consume with pool.pop, close the pool, return the summary. For orchestrated workflow policy (approval, autonomy), see the pi-subagents skill.
 
 Subagents: the autoimported pi_subagents module spawns real pi instances in tmux windows (AgentHandle / AgentSession). Ask it what is available before naming a model — subagents.capabilities(), subagents.best_model_match("astra").slug, subagents.thinking_levels() — then pass model=/thinking= to subagents.agent().
 
@@ -230,7 +230,7 @@ Important rules:
 - Top-level await is already available. Do not call asyncio.run(...).
 - Definitions persist across chunks: import once, define reusable functions once.
 - A chunk's output should be compact; large intermediates stay in the session.
-- Substantive, edited code belongs in files: write the file, then exec_cell(file=...) — %run semantics, tracebacks map to the real path. Re-run after editing; do not import session files as modules.
+- Keep code in cells: the notebook on disk is the durable, re-runnable record — don't create .py files unless the user asks.
 
 Callable tool set for this session: ${callable}
 
@@ -257,9 +257,9 @@ const EXEC_CELL_DESCRIPTION = `Execute a cell in a persistent Jupyter-like kerne
 - State persists: imports, variables, functions, and classes from earlier cells are still there — never re-import, never redefine; write each cell as the continuation of the live namespace.
 - The last bare expression of a cell is echoed automatically (Out[n] semantics) — no print/return needed to see a value. Every result also ends with a [kernel] footer summarizing the namespace (cell count, defs, and what this cell added or changed).
 - Top-level await works; do not call asyncio.run(...). Errors never kill the kernel — fix and retry in the same namespace.
-- file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; re-run after editing). Tracebacks map to the real file. Prefer files for substantive, edited code; inline code for quick probes.
+- file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; tracebacks map to the real file). Prefer cells: the notebook on disk is already the durable record.
 - IPython magics (%timeit, !pip, ...) do not exist here — cells starting with % or ! are rejected before execution with the native equivalent.
-- confirm (optional): set true to ask the user for approval before running. Policy: run most cells immediately; set confirm=true for potentially destructive work (deleting/cleaning files, force git operations) or expensive workflows (large multi-stage subagent fan-outs). If the user said "run autonomously" or "don't prompt me", never set it.
+- confirm (optional): set true to ask the user for approval before running. The popup shows only the cell body. Run most cells immediately; set confirm=true for destructive work. Never set it when the user said "run autonomously" or "don't prompt me". Approval/autonomy policy for orchestrated workflows: see the pi-subagents skill.
 
 Cells run synchronously and stream progress, including a live viewer of any pi_subagents fan-out. End subagent workflows with pool.close() — its echoed summary is the report.`;
 
@@ -759,13 +759,13 @@ function execCellTool(
       file: Type.Optional(
         Type.String({
           description:
-            "Path to a .py file executed inside the kernel instead of inline code (IPython %run semantics). Prefer for substantive, edited code; re-run after editing.",
+            "Path to a .py file executed inside the kernel instead of inline code (IPython %run semantics; tracebacks map to the real path). Prefer cells — the notebook on disk is the durable artifact.",
         })
       ),
       confirm: Type.Optional(
         Type.Boolean({
           description:
-            "Ask the user for approval before running. Only for destructive work (deleting/cleaning files, force git ops) or expensive workflows (large multi-stage fan-outs). Never set it when the user said 'run autonomously' or 'don't prompt me'.",
+            "Ask the user for approval before running. The popup shows only the code parameter. Never set it when the user said 'run autonomously' or 'don't prompt me'.",
         })
       ),
     }),

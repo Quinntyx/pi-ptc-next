@@ -25,11 +25,15 @@
   "files": [
     "dist",
     "src/python-runtime",
-    "tools"
+    "tools",
+    "skills"
   ],
   "pi": {
     "extensions": [
       "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "scripts": {
