@@ -56,7 +56,8 @@
   },
   "dependencies": {
     "@mariozechner/pi-tui": "^0.55.1",
-    "@sinclair/typebox": "^0.34.41"
+    "@sinclair/typebox": "^0.34.41",
+    "shiki": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

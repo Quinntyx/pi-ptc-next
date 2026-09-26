@@ -67,7 +67,8 @@ the next cell resumes with `pool.pop()`.
 # Confirmation and autonomy
 
 - The `exec_cell` confirm popup is a self-contained review surface: it shows
-  only the cell body (first ~24 lines) and nothing else the model can see
+  only the cell body — rendered in a scrollable, syntax-highlighted viewport
+  (Shiki, PgUp/PgDn to scroll) — and nothing else the model can see
   (file contents, tool output). Everything the user is meant to review must
   live inside the cell itself.
 - Never confirm a wrapper call (e.g. `await main()`) whose logic lives in a

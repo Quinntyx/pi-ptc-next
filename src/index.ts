@@ -259,7 +259,7 @@ const EXEC_CELL_DESCRIPTION = `Execute a cell in a persistent Jupyter-like kerne
 - Top-level await works; do not call asyncio.run(...). Errors never kill the kernel — fix and retry in the same namespace.
 - file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; tracebacks map to the real file). Prefer cells: the notebook on disk is already the durable record.
 - IPython magics (%timeit, !pip, ...) do not exist here — cells starting with % or ! are rejected before execution with the native equivalent.
-- confirm (optional): set true to ask the user for approval before running. The popup shows only the cell body. Run most cells immediately; set confirm=true for destructive work. Never set it when the user said "run autonomously" or "don't prompt me". Approval/autonomy policy for orchestrated workflows: see the pi-subagents skill.
+- confirm (optional): set true to ask the user for approval before running. The popup shows the full cell body in a Shiki-syntax-highlighted, scrollable viewport (PgUp/PgDn to scroll). Run most cells immediately; set confirm=true for destructive work. Never set it when the user said "run autonomously" or "don't prompt me". Approval/autonomy policy for orchestrated workflows: see the pi-subagents skill.
 
 Cells run synchronously and stream progress, including a live viewer of any pi_subagents fan-out. End subagent workflows with pool.close() — its echoed summary is the report.`;
 
@@ -479,6 +479,82 @@ function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessi
   sessionState.activeToolsBeforeRouting = null;
 }
 
+// Shiki syntax highlighting for the cell-approval preview. Shiki is ESM-only
+// while this package compiles to CJS, so it is loaded through a native dynamic
+// import (works under jiti and plain Node alike) with a graceful fallback to
+// unhighlighted text if the load or highlighting fails.
+interface ShikiToken {
+  content: string;
+  color?: string;
+  fontStyle?: number;
+}
+
+const nativeImport = new Function("m", "return import(m)") as (m: string) => Promise<any>;
+
+function hexToAnsiFg(hex: string): string | null {
+  const match = /^#([0-9a-fA-F]{6})$/.exec(hex.trim());
+  if (!match) return null;
+  const value = parseInt(match[1], 16);
+  return `\x1b[38;2;${(value >> 16) & 0xff};${(value >> 8) & 0xff};${value & 0xff}m`;
+}
+
+function tokenFontAnsi(fontStyle: number | undefined): string {
+  // Shiki FontStyle bits: Italic = 1, Bold = 2, Underline = 4.
+  let out = "";
+  if (fontStyle && fontStyle & 1) out += "\x1b[3m";
+  if (fontStyle && fontStyle & 2) out += "\x1b[1m";
+  if (fontStyle && fontStyle & 4) out += "\x1b[4m";
+  return out;
+}
+
+let highlighterPromise: Promise<any> | null = null;
+
+function getHighlighter(): Promise<any> | null {
+  if (!highlighterPromise) {
+    const themeName = process.env.PTC_CODE_THEME || "github-dark";
+    highlighterPromise = nativeImport("shiki")
+      .then((shiki: any) => shiki.createHighlighter({ themes: [themeName], langs: ["python"] }))
+      .catch((error: unknown) => {
+        debugLog(`shiki unavailable, approval preview falls back to plain text: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      });
+  }
+  return highlighterPromise;
+}
+
+const highlightCache = new Map<string, string[]>();
+
+/** Highlight Python cell code to ANSI-colored lines; null if highlighting is unavailable. */
+async function highlightCellCode(code: string): Promise<string[] | null> {
+  const cached = highlightCache.get(code);
+  if (cached) return cached;
+  try {
+    const highlighter = await getHighlighter();
+    if (!highlighter) return null;
+    const themeName = process.env.PTC_CODE_THEME || "github-dark";
+    const { tokens }: { tokens: ShikiToken[][] } = highlighter.codeToTokens(code, {
+      lang: "python",
+      theme: themeName,
+    });
+    const lines = tokens.map((line) => {
+      let out = "";
+      for (const token of line) {
+        const color = token.color ? hexToAnsiFg(token.color) : null;
+        const font = tokenFontAnsi(token.fontStyle);
+        if (color || font) out += (color ?? "") + font + token.content + "\x1b[0m";
+        else out += token.content;
+      }
+      return out;
+    });
+    if (highlightCache.size > 8) highlightCache.clear();
+    highlightCache.set(code, lines);
+    return lines;
+  } catch (error) {
+    debugLog(`shiki highlighting failed, approval preview falls back to plain text: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
 // ============================================================================
 // Tools
 // ============================================================================
@@ -539,11 +615,19 @@ async function requestCellApproval(
     return { action: "reject", note: "approval requested but no UI is available in this mode" };
   }
 
+  // Highlight once, up-front (before the sync TUI renderer runs). Falls back
+  // to plain text if Shiki is unavailable.
+  const highlightedLines = await highlightCellCode(code);
+  const previewLines = highlightedLines ?? code.split("\n");
+  const isHighlighted = highlightedLines !== null;
+
   try {
     return await ctx.ui.custom<CellApprovalDecision>((tui, theme, _kb, done) => {
       let optionIndex = 0;
       let inputMode = false;
       let cachedLines: string[] | undefined;
+      const viewportRows = 24; // visible code rows; the box scrolls instead of truncating
+      let rowOffset = 0;
       const editorTheme: EditorTheme = {
         borderColor: (style: string) => theme.fg("accent", style),
         selectList: {
@@ -560,9 +644,23 @@ async function requestCellApproval(
         done({ action: "reject", note });
       };
 
-      const previewLines = code.split("\n");
-      const maxPreview = 24;
-      const truncated = previewLines.length > maxPreview;
+      // Wrapped rows over the whole document, rebuilt when the width changes.
+      let cachedRows: { text: string; line: number }[] | undefined;
+      let cachedRowsWidth = -1;
+
+      function buildRows(renderWidth: number): void {
+        const innerWidth = Math.max(1, renderWidth - 3);
+        const gutterWidth = Math.max(1, String(previewLines.length).length);
+        const rows: { text: string; line: number }[] = [];
+        for (let i = 0; i < previewLines.length; i++) {
+          const num = theme.fg("dim", String(i + 1).padStart(gutterWidth));
+          for (const wrapped of wrapTextWithAnsi(num + "  " + previewLines[i], innerWidth)) {
+            rows.push({ text: wrapped, line: i });
+          }
+        }
+        cachedRows = rows;
+        cachedRowsWidth = renderWidth;
+      }
 
       function refresh() {
         cachedLines = undefined;
@@ -572,16 +670,24 @@ async function requestCellApproval(
       function render(width: number): string[] {
         if (cachedLines) return cachedLines;
         const renderWidth: number = Math.max(1, width);
+        if (!cachedRows || cachedRowsWidth !== renderWidth) buildRows(renderWidth);
+        const rows = cachedRows!;
+
+        // Clamp the scroll window so the bottom of the code is reachable.
+        rowOffset = Math.max(0, Math.min(rowOffset, Math.max(0, rows.length - viewportRows)));
+        const visible = rows.slice(rowOffset, rowOffset + viewportRows);
+
         const lines: string[] = [];
         lines.push(theme.fg("accent", "┌─ cell approval ─ kernel " + sessionId + " " + "─".repeat(Math.max(0, renderWidth - 22 - sessionId.length))));
-        lines.push(theme.fg("muted", `│ ${previewLines.length} line${previewLines.length === 1 ? "" : "s"}${truncated ? ` (showing first ${maxPreview})` : ""}`));
-        for (const line of previewLines.slice(0, maxPreview)) {
-          for (const wrapped of wrapTextWithAnsi("│ " + line, renderWidth)) {
-            lines.push(wrapped);
-          }
-        }
-        if (truncated) {
-          lines.push(theme.fg("muted", `│ … ${previewLines.length - maxPreview} more lines`));
+        const rangeLabel = visible.length
+          ? `lines ${visible[0].line + 1}–${visible[visible.length - 1].line + 1} of ${previewLines.length}`
+          : "0 lines";
+        const syntaxLabel = isHighlighted ? "· shiki" : "· plain";
+        const canScroll = rows.length > viewportRows;
+        const scrollLabel = canScroll ? `· PgUp/PgDn scroll (${rowOffset + 1}/${rows.length})` : "";
+        lines.push(theme.fg("muted", `│ ${rangeLabel} ${syntaxLabel}${scrollLabel}`));
+        for (const row of visible) {
+          lines.push("│ " + row.text);
         }
         lines.push(theme.fg("accent", "└" + "─".repeat(Math.max(0, renderWidth - 2)) + "┘"));
         lines.push("");
@@ -595,13 +701,33 @@ async function requestCellApproval(
           lines.push(theme.fg("muted", "Why reject? (Enter to submit)"));
           lines.push(...editor.getLines());
         }
-        lines.push(theme.fg("dim", "↑/↓ select · Enter confirm · y approve · n reject · Esc reject"));
+        lines.push(theme.fg("dim", "↑/↓ select · PgUp/PgDn scroll · Home/End top/bottom · Enter confirm · y approve · n reject · Esc reject"));
         return lines;
       }
 
       function handleInput(data: string): void {
         if (inputMode) {
           editor.handleInput(data);
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.pageUp)) {
+          rowOffset = Math.max(0, rowOffset - (viewportRows - 4));
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.pageDown)) {
+          rowOffset += viewportRows - 4;
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.home)) {
+          rowOffset = 0;
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.end)) {
+          rowOffset = Number.MAX_SAFE_INTEGER; // render() clamps to the last full page
           refresh();
           return;
         }
