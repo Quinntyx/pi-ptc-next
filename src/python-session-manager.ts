@@ -1234,6 +1234,8 @@ export class PythonSessionManager {
     script?: string;
     notebookPath?: string;
     source?: string;
+    /** Explicit Python version (validated by the tool schema). Overrides a source-notebook pin; metadata is never mutated. */
+    version?: string;
   }): Promise<{
     id: string;
     sourcedFrom?: string;
@@ -1266,7 +1268,11 @@ export class PythonSessionManager {
     // so promoted skill workflows keep running on the interpreter they were
     // recorded with, even after the default bump.
     let pythonExecutable: string | undefined;
-    if (preparedSource?.pythonVersion && !process.env.PTC_PYTHON_EXECUTABLE) {
+    if (options.version && !process.env.PTC_PYTHON_EXECUTABLE) {
+      // Explicit request wins over the notebook pin, and never mutates the
+      // notebook's metadata — that records the original/intended version.
+      pythonExecutable = await ensurePythonForVersion(options.version);
+    } else if (preparedSource?.pythonVersion && !process.env.PTC_PYTHON_EXECUTABLE) {
       const sharedVersion = await this.resolveSharedVenvVersion();
       if (sharedVersion !== preparedSource.pythonVersion) {
         pythonExecutable = await ensurePythonForVersion(preparedSource.pythonVersion);

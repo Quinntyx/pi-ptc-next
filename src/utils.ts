@@ -437,3 +437,13 @@ export function withActivityLabel<T extends object>(tool: T): T {
   }
   return integration.wrapTool(tool) as T;
 }
+
+/**
+ * Strict Python version validation for provision_kernel's `version` arg.
+ * Accepts 3.14, 3.14.4, and pre-releases like 3.15.0b1 / 3.14.0rc2 (the forms
+ * uv's --python accepts for CPython). Everything else — flags, paths, spaces,
+ * specifiers — is rejected BEFORE the string reaches a shell.
+ */
+export function isValidPythonVersion(value: string): boolean {
+  return /^(?:\d+)\.(?:\d+)(?:\.(?:\d+))?(?:(?:a|b|c|rc)\d+)?$/.test(value.trim());
+}

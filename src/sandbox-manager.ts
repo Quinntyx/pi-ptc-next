@@ -51,7 +51,7 @@ export function resolvePythonExecutable(): string {
     "PTC Python environment not found at " + venvPython +
     ". The shared venv is created by provisioning (uv is required — " +
     "https://docs.astral.sh/uv/). Install uv, restart pi, and check " +
-    "~/.cache/pi-ptc/subagents-sync.log; or point PTC_PYTHON_EXECUTABLE at an interpreter."
+    "~/.cache/pi-pycells/subagents-sync.log; or point PTC_PYTHON_EXECUTABLE at an interpreter."
   );
 }
 

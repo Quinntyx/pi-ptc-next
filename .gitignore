@@ -8,3 +8,14 @@ package-lock.json
 
 .ptc-subagents-sync.json
 node_modules
+
+# local dev artifacts (kept on disk, not in the repo)
+BUGS.md
+CONSOLIDATION-REPORT.md
+FEATURE-PROPOSALS.md
+PLAN.md
+bug.txt
+review-plan.md
+review-workflow.ipynb
+notes
+research

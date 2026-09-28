@@ -469,16 +469,17 @@ def _ptc_render_notebook_document() -> str:
     import json as _nb_json
 
     # Pin the interpreter version into the notebook (standard
-    # language_info.version). Promoted notebooks keep this field, so a later
-    # default-version bump re-provisions the pinned interpreter instead of
-    # silently running old skill workflows on a different Python.
+    # language_info.version) — FIRST RUN ONLY. The pin records the version the
+    # notebook was born on (its "original/intended" version); later runs on a
+    # different explicit version never overwrite it, so promoted workflows
+    # keep their pin and provision_kernel(version=...) stays non-destructive.
     import platform as _nb_platform
     metadata_value = dict(_ptc_notebook_metadata) if _ptc_notebook_metadata else {
         "kernelspec": {"display_name": "Python 3 (ptc kernel)", "language": "python", "name": "python3"},
     }
     language_info = dict(metadata_value.get("language_info") or {})
     language_info.setdefault("name", "python")
-    language_info["version"] = _nb_platform.python_version()
+    language_info.setdefault("version", _nb_platform.python_version())
     metadata_value["language_info"] = language_info
     metadata = _nb_json.dumps(metadata_value, ensure_ascii=False, indent=1)
     cells = ",\n".join(_ptc_indent_block(fragment, 2) for fragment in _ptc_notebook_cell_fragments)

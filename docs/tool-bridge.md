@@ -131,11 +131,11 @@ Things that depend on the author's machine setup, and how to work around each:
 
 - **Python interpreter resolution.** The kernel picks the interpreter in this
   order: `PTC_PYTHON_EXECUTABLE`, then the PTC venv at
-  `~/.cache/pi-ptc/python-env/bin/python` (`Scripts\python.exe` on Windows) if
+  `~/.cache/pi-pycells/python-env/bin/python` (`Scripts\python.exe` on Windows) if
   it exists, then `python3`. The runtime requires **Python ≥ 3.10** and fails
   fast at startup otherwise. If your `python3` is older, set
   `PTC_PYTHON_EXECUTABLE=/path/to/python3.11`.
-- **The `~/.cache/pi-ptc` venv** is created by the pi-subagents integration,
+- **The `~/.cache/pi-pycells` venv** is created by the pi-subagents integration,
   not the tool bridge; on a fresh machine it simply won't exist and the
   fallback applies. Nothing in the tool bridge needs packages from that venv.
 - **Reserved helper names.** The names `ptc`, `_rpc_call`, `read`, `find`,

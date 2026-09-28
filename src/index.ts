@@ -33,6 +33,7 @@ import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, 
 import type { SubagentRuntimeSnapshot } from "./contracts/execution-types";
 import {
   collapseOutputPreview,
+  isValidPythonVersion,
   debugLog,
   isMutationPrompt,
   loadSettingsFromEnv,
@@ -385,7 +386,8 @@ function currentToolDescription(
 const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel and return its session id. The kernel requires a notebook file path (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
 
 - notebook (required): path to the destination .ipynb file (created if missing). Relative paths resolve against the cwd. For throwaway/scratch work, pass a /tmp path.
-- source (optional): a .ipynb or .py workflow to execute while provisioning. A notebook is copied to the destination first, including interleaved markdown, then its code cells run in order and record fresh outputs. A .py file becomes one virtual prefix cell. Bare names resolve from the PTC notebook library. The source is never modified.
+- version (optional): Python version for this kernel's venv — 3.14 (default), 3.14.4, or a pre-release like 3.15.0b1. Overrides a version pinned in the source notebook's metadata WITHOUT mutating that metadata (metadata records the original/intended version).
+  - source (optional): a .ipynb or .py workflow to execute while provisioning. A notebook is copied to the destination first, including interleaved markdown, then its code cells run in order and record fresh outputs. A .py file becomes one virtual prefix cell. Bare names resolve from the PTC notebook library. The source is never modified.
 - Prefix numbering includes every sourced notebook cell, including markdown: for 7 source cells, the first new exec_cell is cell 8. A sourcing error is recorded on the failed cell and leaves the kernel usable.
 - The kernel works like a Jupyter kernel: imports, variables, functions, and classes persist between cells and between conversation turns. Do NOT re-import or redefine; build on what is there.
 - inspect_kernel shows what the namespace already has; provision_dependency installs a missing package into the kernel's environment.
@@ -1190,9 +1192,25 @@ function provisionKernelTool(
             "Optional .ipynb or .py library workflow to copy/execute at provision time. Bare names resolve from the PTC library directory.",
         })
       ),
+      version: Type.Optional(
+        Type.String({
+          description:
+            "Python version for this kernel's venv (e.g. 3.14, 3.14.4, 3.15.0b1). Defaults to the shared venv (3.14); overrides a version pinned in the source notebook's metadata without mutating that metadata. Must be a plain Python version string.",
+        })
+      ),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { notebook, source } = params as { notebook?: string; source?: string };
+      const { notebook, source, version } = params as { notebook?: string; source?: string; version?: string };
+      if (version !== undefined && !isValidPythonVersion(version)) {
+        return {
+          content: [{
+            type: "text",
+            text: `provision_kernel: invalid python version ${JSON.stringify(version)}. ` +
+              "Use a plain version like 3.14, 3.14.4, or 3.15.0b1 (no flags, paths, or extra arguments).",
+          }],
+          details: { sessionId: null },
+        };
+      }
       if (!notebook || !notebook.trim()) {
         return {
           content: [{ type: "text", text: "provision_kernel requires a notebook path (.ipynb). For scratch work use a /tmp path." }],
@@ -1211,6 +1229,7 @@ function provisionKernelTool(
           parentToolCallId: toolCallId,
           notebookPath,
           source,
+          version,
         });
 
         const lines = [
@@ -1617,7 +1636,7 @@ function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManag
 // Subagent runtime (global API + footer)
 // ============================================================================
 
-const SUBAGENT_RUNTIME_KEY = Symbol.for("pi-ptc:subagent-runtime");
+const SUBAGENT_RUNTIME_KEY = Symbol.for("pi-pycells:subagent-runtime");
 
 /** Snapshot shape published on globalThis for other extensions (see createSubagentRuntime). */
 interface SubagentRuntimeApi {
@@ -1629,7 +1648,7 @@ interface SubagentRuntimeApi {
 }
 
 /**
- * GlobalThis-published API (key: Symbol.for("pi-ptc:subagent-runtime")) letting
+ * GlobalThis-published API (key: Symbol.for("pi-pycells:subagent-runtime")) letting
  * other extensions observe PTC subagent pools without a cross-package import:
  * current per-session snapshots plus running/settled/failed totals, and a
  * listener subscription for snapshot updates.
@@ -1883,12 +1902,12 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     // same promise before its first kernel spawn, so a first-install kernel
     // does not lock in system python3 while packages land in the venv.
     // Provisioning is best-effort, but its failure must not be fully silent:
-    // log one warning (details live in ~/.cache/pi-ptc/subagents-sync.log).
+    // log one warning (details live in ~/.cache/pi-pycells/subagents-sync.log).
     void startSubagentsEnv({ extensionRoot }).then((result) => {
       if (result.status === "failed") {
         console.warn(
           `[PTC] pi_subagents provisioning failed: ${result.reason}. ` +
-          "Core Python kernels are unaffected; see ~/.cache/pi-ptc/subagents-sync.log for details."
+          "Core Python kernels are unaffected; see ~/.cache/pi-pycells/subagents-sync.log for details."
         );
       }
       });

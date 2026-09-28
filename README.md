@@ -2,7 +2,7 @@
 
 `pi-pycells` is an extension for [Pi](https://github.com/earendil-works/pi) that implements Programmatic Tool Calling (PTC): instead of streaming every tool result back into the model's context, the model writes Python cells against a persistent, Jupyter-like kernel and calls Pi's tools (`read`, `grep`, `glob`, …) as ordinary `async` Python functions. Only each cell's final output reaches the model, so multi-step work costs a fraction of the tokens. The same kernels double as launch pads for parallel subagent orchestration (optional; see below).
 
-Fork of [`edxeth/pi-pycells`](https://github.com/edxeth/pi-pycells), which itself forked [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chris Egersdoerfer.
+Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which itself forked [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chris Egersdoerfer.
 
 ## Install
 
@@ -26,7 +26,7 @@ Fork of [`edxeth/pi-pycells`](https://github.com/edxeth/pi-pycells), which itsel
 
    Success looks like the cell returning `Out[2]: 2` (or similar) in a few seconds. Warnings about *other* packages can be ignored — only an error mentioning `provision_kernel`/`exec_cell` is PTC's.
 
-4. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is provisioned automatically in the background on first use — provisioning problems are logged to `~/.cache/pi-ptc/subagents-sync.log` and never block the core extension.
+4. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is provisioned automatically in the background on first use — provisioning problems are logged to `~/.cache/pi-pycells/subagents-sync.log` and never block the core extension.
 
 To remove: `pi remove git:github.com/Quinntyx/pi-pycells`.
 
@@ -98,7 +98,7 @@ More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom
 
 | Dependency | What it provides | Without it |
 |---|---|---|
-| `uv` | Preferred for creating the shared venv (`~/.cache/pi-ptc/python-env`) and for `provision_dependency` installs. | Venv creation falls back to `python3 -m venv`; `provision_dependency` fails (no pip fallback) — pre-install packages into the venv yourself. |
+| `uv` | Preferred for creating the shared venv (`~/.cache/pi-pycells/python-env`) and for `provision_dependency` installs. | Venv creation falls back to `python3 -m venv`; `provision_dependency` fails (no pip fallback) — pre-install packages into the venv yourself. |
 | `pi_subagents` + tmux + `pi-sock` | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). `pi_subagents` is auto-provisioned at session start from git (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). Subagents run under your own agent dir by default; `PI_CODING_SUBAGENT_DIR` gives them a separate one. | All core features work untouched; only `import pi_subagents` is unavailable (provisioning failure is a logged warning, never fatal). |
 | pi-tool-tree *(experimental)* | Nicer subagent activity display and tool-call activity labels. Currently unstable — known rendering bugs. | Plain rendering; the subagent panel, timers, and the vendored shimmer animation all work without it — you only lose live agent activity labels. |
 

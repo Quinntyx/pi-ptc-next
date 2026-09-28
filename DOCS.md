@@ -186,7 +186,7 @@ Everything is configured through environment variables, read **once** at extensi
 | `PTC_OUTPUT_PREVIEW_CHARS` (alias `PTC_MAX_OUTPUT_CHARS`) | `12000` | Model-visible preview before head/tail collapsing; full output stays in the notebook. |
 | `PTC_MAX_SPOOL_CHARS` | `10000000` | Emergency per-cell capture ceiling; not a preview limit. |
 | `PTC_MAX_PARALLEL_TOOL_CALLS` | `8` | Default concurrency for `ptc.gather_limit()` / `read_many` / `read_tree`. |
-| `PTC_PYTHON_EXECUTABLE` | shared venv (`~/.cache/pi-ptc/python-env-3.14`, legacy `python-env` on upgraded installs) | Interpreter for all kernels; used verbatim, overrides the venv. |
+| `PTC_PYTHON_EXECUTABLE` | shared venv (`~/.cache/pi-pycells/python-env-3.14`, legacy `python-env` on upgraded installs) | Interpreter for all kernels; used verbatim, overrides the venv. |
 
 ### Tool policy
 
@@ -237,7 +237,7 @@ More: [docs/configuration.md](docs/configuration.md) — the full per-variable r
 | **pi-tool-tree** | Optional | Nicer subagent activity display: the subagent panel and shimmer integrate with it via a `globalThis` API (`pi-tool-tree:api` / `pi-tool-tree:activity-api`), and it labels tool calls with model-supplied activity words. | Everything degrades to plain rendering — panels/footers still work, just with less polish. No extra setup needed. |
 | **shiki** | Bundled | Syntax highlighting for the `confirm: true` approval popup. It is a regular dependency, so highlighting works out of the box; if it ever fails to load the popup falls back to plain text (visible with `PTC_DEBUG=1`) without aborting. | Nothing to install. |
 
-Note that the shared venv at `~/.cache/pi-ptc/python-env` is created by the subagent provisioner but, once it exists, is preferred by **every** kernel over `python3` — even for users who never touch subagents. Set `PTC_PYTHON_EXECUTABLE` if you want to pin your own interpreter.
+Note that the shared venv at `~/.cache/pi-pycells/python-env` is created by the subagent provisioner but, once it exists, is preferred by **every** kernel over `python3` — even for users who never touch subagents. Set `PTC_PYTHON_EXECUTABLE` if you want to pin your own interpreter.
 
 ## Standalone setup
 
@@ -246,7 +246,7 @@ Several defaults encode the author's machine. None break core execution, but kno
 - **`pi_subagents` source.** `PTC_SUBAGENTS_REPO_URL` defaults to the public GitHub mirror (`https://github.com/Quinntyx/pi-subagents`), so provisioning works out of the box. Point it at your own fork, or set `PTC_SUBAGENTS_SOURCE` to a local checkout (must contain a `pyproject.toml` at its root or under a `main/` subdirectory), if you want a different source.
 - **Author-home dev-checkout default.** With `PTC_SUBAGENTS_SOURCE` unset, the provisioner probes `~/docs/src/pi-subagents` and installs it editable when present — on the author's machine it silently wins over the managed clone. Elsewhere it just doesn't exist; set the variable if you keep a checkout somewhere else.
 - **tmux is the only hard requirement for subagents.** `pi_subagents` warns at import (and its API raises) when not running under tmux. Spawned agents run under **your own agent dir by default** — same config, extensions (pi-sock), and auth as the orchestrator, so there is nothing to create. For a separate subagent environment, set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config (a pi-profiles-managed profile works: `PI_CODING_SUBAGENT_DIR=~/.config/pi/profiles/subagents`).
-- **`~/.cache/pi-ptc` cache root (non-configurable in code).** Holds the shared venv (`python-env/`), the managed `pi-subagents/` clone, the sync log (rotated at 1 MB), and the sync lock file. Once the venv exists, all kernels prefer it over `python3` — delete it, or set `PTC_PYTHON_EXECUTABLE`, to control your interpreter.
+- **`~/.cache/pi-pycells` cache root (non-configurable in code).** Holds the shared venv (`python-env/`), the managed `pi-subagents/` clone, the sync log (rotated at 1 MB), and the sync lock file. Once the venv exists, all kernels prefer it over `python3` — delete it, or set `PTC_PYTHON_EXECUTABLE`, to control your interpreter.
 - **Sync stamp inside the extension clone.** `.ptc-subagents-sync.json` lives in the extension's own directory; because `pi update` resets package clones, every update forces a fresh sync from whatever the repo variables resolve to at that moment. (The git-tracked stamp currently contains the author's absolute path — a harmless stale stamp that triggers one extra sync.)
 - **pi agent-dir conventions.** The notebook library defaults to `~/.pi/agent/ptc-library` (honoring `PI_CODING_AGENT_DIR`), and the default eval root `.pi/evals/ptc` assumes a pi-style project directory. Set `PTC_LIBRARY_DIR` / `PTC_EVALS_PATH` if your layout differs.
 - **English-only routing heuristics.** The auto-routing signals and mutation-word list are hardcoded English regexes; prompts in other languages simply don't route. Naming a PTC tool explicitly ("use exec_cell to …") routes unconditionally.

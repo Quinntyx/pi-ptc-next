@@ -7,11 +7,11 @@
  *
  * This module provisions that venv and the library:
  *
- *   1. venv: create ~/.cache/pi-ptc/python-env when missing (uv when
+ *   1. venv: create ~/.cache/pi-pycells/python-env-<ver> when missing (uv when
  *      available, else `python3 -m venv`) — resolvePythonExecutable()
  *      prefers this venv for all provision_kernel interpreters.
  *   2. source: PTC_SUBAGENTS_SOURCE (dev checkout, e.g. ~/docs/src/pi-subagents)
- *      when present, else a managed git clone at ~/.cache/pi-ptc/pi-subagents
+ *      when present, else a managed git clone at ~/.cache/pi-pycells/pi-subagents
  *      (cloned from PTC_SUBAGENTS_REPO_URL, fetched + reset on each sync).
  *   3. editable install of pi_subagents into the venv when first set up, when
  *      the editable path changes, or when pyproject.toml changed since the
@@ -162,7 +162,7 @@ export function sourceAvailable(devSource: string | undefined, cloneDir: string)
 
 /** Pure: default cache root shared with sandbox-manager's venv lookup. */
 export function defaultCacheRoot(): string {
-  return join(homedir(), ".cache", "pi-ptc");
+  return join(homedir(), ".cache", "pi-pycells");
 }
 
 /**
@@ -217,7 +217,7 @@ export async function ensurePythonForVersion(version: string): Promise<string> {
   const ok = await runLogged(join(cacheRoot, "subagents-sync.log"), "uv",
     ["venv", "--python", version, join(cacheRoot, `python-env-${version}`)]);
   if (!ok || !existsSync(python)) {
-    throw new Error(`could not create a Python ${version} venv via uv (see ~/.cache/pi-ptc/subagents-sync.log)`);
+    throw new Error(`could not create a Python ${version} venv via uv (see ~/.cache/pi-pycells/subagents-sync.log)`);
   }
   return python;
 }

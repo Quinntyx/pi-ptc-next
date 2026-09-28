@@ -65,19 +65,19 @@ No. Python cells run as a local subprocess and can spawn arbitrary child process
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-The startup `[PTC]` warning and `~/.cache/pi-ptc/subagents-sync.log` tell you exactly which step failed.
+The startup `[PTC]` warning and `~/.cache/pi-pycells/subagents-sync.log` tell you exactly which step failed.
 
 `PTC_PYTHON_EXECUTABLE` overrides the whole resolution — but note it's used verbatim with no existence check, so a bad value gives a crisp `spawn /nonexistent/python-xyz ENOENT` on kernel provisioning.
 
 ### Why does installing pi_subagents fail with a git auth error?
 
-On first session start the extension creates `~/.cache/pi-ptc/python-env-3.14` (`uv venv --python 3.14`; uv is required) and clones pi-subagents from the default `https://github.com/Quinntyx/pi-subagents` into `~/.cache/pi-ptc/pi-subagents`, then editable-installs it. If you point `PTC_SUBAGENTS_REPO_URL` at a repo that needs credentials, non-interactive git can't prompt and the clone logs something like:
+On first session start the extension creates `~/.cache/pi-pycells/python-env-3.14` (`uv venv --python 3.14`; uv is required) and clones pi-subagents from the default `https://github.com/Quinntyx/pi-subagents` into `~/.cache/pi-pycells/pi-subagents`, then editable-installs it. If you point `PTC_SUBAGENTS_REPO_URL` at a repo that needs credentials, non-interactive git can't prompt and the clone logs something like:
 
 ```
 fatal: could not read Username for '<host>': No such device or address
 ```
 
-in `~/.cache/pi-ptc/subagents-sync.log`. The stamp `<pkg>/src/.ptc-subagents-sync.json` gets `"ok": false` and sync retries next session. **A one-line `[PTC]` warning now appears at startup** when provisioning fails (details in `~/.cache/pi-ptc/subagents-sync.log`). Kernels and sessions work fine; without provisioning, the first symptom is a later cell dying with `ModuleNotFoundError: No module named 'pi_subagents'`. If you point `PTC_SUBAGENTS_REPO_URL` at a private repo, make sure your git credential helper can read it.
+in `~/.cache/pi-pycells/subagents-sync.log`. The stamp `<pkg>/src/.ptc-subagents-sync.json` gets `"ok": false` and sync retries next session. **A one-line `[PTC]` warning now appears at startup** when provisioning fails (details in `~/.cache/pi-pycells/subagents-sync.log`). Kernels and sessions work fine; without provisioning, the first symptom is a later cell dying with `ModuleNotFoundError: No module named 'pi_subagents'`. If you point `PTC_SUBAGENTS_REPO_URL` at a private repo, make sure your git credential helper can read it.
 
 A dev checkout at `~/docs/src/pi-subagents` (or `PTC_SUBAGENTS_SOURCE`) is preferred over the managed clone and skips git entirely.
 
@@ -89,7 +89,7 @@ See the previous two answers: provisioning failed (no python3/uv, clone failure,
 help: install it with provision_dependency('pi_subagents') then re-run
 ```
 
-— is a dead end: **pi-subagents is not on PyPI** (pypi.org 404s), and `provision_dependency` just runs `uv pip install <name>` (`src/index.ts:540`). Instead, fix the sync: check `~/.cache/pi-ptc/subagents-sync.log`, fix git access or set `PTC_SUBAGENTS_REPO_URL`/`PTC_SUBAGENTS_SOURCE`, and start a new session (or delete the sync stamp to force a retry).
+— is a dead end: **pi-subagents is not on PyPI** (pypi.org 404s), and `provision_dependency` just runs `uv pip install <name>` (`src/index.ts:540`). Instead, fix the sync: check `~/.cache/pi-pycells/subagents-sync.log`, fix git access or set `PTC_SUBAGENTS_REPO_URL`/`PTC_SUBAGENTS_SOURCE`, and start a new session (or delete the sync stamp to force a retry).
 
 ### What's the `.ptc-subagents-sync.json` stamp, and where does it live?
 
@@ -171,7 +171,7 @@ Remove all of these (tested paths):
 
 - The extension: `pi remove <pkg>` (e.g. `pi remove git:github.com/Quinntyx/pi-pycells`, ~0.3s), and the `"packages"` entry it wrote in `settings.json` for local-path installs.
 - `PI_CODING_AGENT_DIR` tree (e.g. `/tmp/.../pi-home`) if you used a throwaway one.
-- `$HOME/.cache/pi-ptc` — the venv, the managed pi-subagents clone, `subagents-sync.log`, and the lock file.
+- `$HOME/.cache/pi-pycells` — the venv, the managed pi-subagents clone, `subagents-sync.log`, and the lock file.
 - `$HOME/.pi/agent/profiles/subagents` if you gave subagents their own pi-profiles-managed profile via `PI_CODING_SUBAGENT_DIR`.
 - The repo copy, test notebooks, and `$HOME/.pi/pi-sock` sockets.
 

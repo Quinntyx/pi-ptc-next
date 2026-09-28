@@ -17,7 +17,7 @@
 `resolvePythonExecutable()` (`src/sandbox-manager.ts:35-42`) resolves in this order:
 
 1. `PTC_PYTHON_EXECUTABLE` if set (used verbatim, no existence check).
-2. The shared venv at `~/.cache/pi-ptc/python-env/bin/python` (POSIX) or `...\python-env\Scripts\python.exe` (Windows) — via `venvPythonPath()` in `src/subagents-env.ts:163-170` — but only if that file exists.
+2. The shared venv at `~/.cache/pi-pycells/python-env/bin/python` (POSIX) or `...\python-env\Scripts\python.exe` (Windows) — via `venvPythonPath()` in `src/subagents-env.ts:163-170` — but only if that file exists.
 3. `python3` from `PATH`.
 
 The shared venv is the same one the pi_subagents provisioner creates (`uv venv --python 3.14`; uv is required), so subagent support is available to every kernel without extra setup.
@@ -42,7 +42,7 @@ So a fresh install out of the box gives Python read-only access to your repo thr
 Optional interpreter pinning:
 
 ```bash
-# optional: pin the interpreter instead of the ~/.cache/pi-ptc venv fallback
+# optional: pin the interpreter instead of the ~/.cache/pi-pycells venv fallback
 export PTC_PYTHON_EXECUTABLE=/usr/bin/python3.12
 ```
 
@@ -66,7 +66,7 @@ A cell calling `bash()` gets the bridged tool with no opt-in required — and re
 
 | Env var | Default | Effect |
 | --- | --- | --- |
-| `PTC_PYTHON_EXECUTABLE` | *(unset)* | Interpreter used for all kernels; overrides the `~/.cache/pi-ptc/python-env` venv and `python3` fallback |
+| `PTC_PYTHON_EXECUTABLE` | *(unset)* | Interpreter used for all kernels; overrides the `~/.cache/pi-pycells/python-env` venv and `python3` fallback |
 | `PTC_EXECUTION_TIMEOUT_MS` | `270000` | Hard idle timeout for a Python execution (activity re-arms it) |
 | `PTC_DEBUG` | `false` | Debug logging; emits e.g. `Using subprocess runtime (no sandboxing substrate yet)` |
 
@@ -76,7 +76,7 @@ There are no sandbox-specific settings beyond these — no container image, netw
 
 Several defaults encode the author's machine layout. None break execution — kernels fall back to `python3` — but subagent support and reproducibility depend on the following:
 
-- **Hardcoded cache root `~/.cache/pi-ptc`** (`src/subagents-env.ts` `defaultCacheRoot()`). The venv `~/.cache/pi-ptc/python-env` is created by the subagents provisioner and preferred over `python3` by every kernel. If you don't want your kernels to silently switch interpreters when that venv appears, set `PTC_PYTHON_EXECUTABLE` explicitly.
+- **Hardcoded cache root `~/.cache/pi-pycells`** (`src/subagents-env.ts` `defaultCacheRoot()`). The venv `~/.cache/pi-pycells/python-env` is created by the subagents provisioner and preferred over `python3` by every kernel. If you don't want your kernels to silently switch interpreters when that venv appears, set `PTC_PYTHON_EXECUTABLE` explicitly.
 - **`pi_subagents` source**: the managed clone defaults to the public GitHub mirror `https://github.com/Quinntyx/pi-subagents` (`DEFAULT_REPO_URL`, `src/subagents-env.ts`) and clones anonymously. Point `PTC_SUBAGENTS_REPO_URL` at your own fork, or `PTC_SUBAGENTS_SOURCE` at a local checkout to install editable instead of cloning.
 - **Author-specific dev-checkout default**: when `PTC_SUBAGENTS_SOURCE` is unset, the provisioner probes `~/docs/src/pi-subagents` (`DEV_SOURCE_DEFAULT`) and installs it editable if it exists. On the author's machine this silently shadows the managed clone; elsewhere it just doesn't exist and the managed clone is used.
 - **Subagent agent-dir selection**: subagents run under the orchestrator's own agent dir by default (`PI_CODING_AGENT_DIR` else `~/.pi/agent`); `PI_CODING_SUBAGENT_DIR` points them at any other directory with a pi config. No pi-profiles dependency either way.
