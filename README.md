@@ -50,12 +50,12 @@ Describe the work; the model provisions a kernel and writes the cells:
 ```python
 # the model writes this as an exec_cell call — note what's NOT in your context:
 # none of the 200 file contents ever leave the kernel
-files = await glob('src/**/*.ts')
+files = await find('src/**/*.ts')
 counts = {f: (await read(f)).count('TODO') for f in files}
 sorted(counts.items(), key=lambda kv: -kv[1])[:5]
 ```
 
-The kernel is bound to a real `.ipynb` notebook (the durable record): variables, imports, and definitions persist across cells and conversation turns, output below a size cap is persisted in full but only summarized to the model, and host tools are gated by policy — with the defaults, cells get read-only access and no shell.
+The kernel is bound to a real `.ipynb` notebook — the durable record of the session. The model picks its location (usually your working directory); tell it where to put the notebook if you'd rather have it somewhere else, e.g. "provision the kernel with its notebook in /tmp" for throwaway work. Variables, imports, and definitions persist across cells and conversation turns, and output below a size cap is persisted in full but only summarized to the model.
 
 For simple requests the model still uses direct tools like `read` and `grep`; prompts shaped like the above (repo-wide scans, bulk conversions, aggregations, "compact JSON only") are auto-routed to a kernel, with optional bounded auto-recovery when a cell fails.
 
