@@ -385,7 +385,7 @@ function currentToolDescription(
 
 const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel and return its session id. The kernel requires a notebook file path (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
 
-- notebook (required): path to the destination .ipynb file (created if missing). Relative paths resolve against the cwd. For throwaway/scratch work, pass a /tmp path.
+- notebook (optional): path to the destination .ipynb file (created if missing). Relative paths resolve against the cwd. Omit it for throwaway/scratch work — the notebook is created under /tmp/pi-pycells/notebooks/ and the provision result reports its path. Pass an explicit path when the notebook should be kept with the project or promoted to the library.
 - version (optional): Python version for this kernel's venv — 3.14 (default), 3.14.4, or a pre-release like 3.15.0b1. Overrides a version pinned in the source notebook's metadata WITHOUT mutating that metadata (metadata records the original/intended version).
   - source (optional): a .ipynb or .py workflow to execute while provisioning. A notebook is copied to the destination first, including interleaved markdown, then its code cells run in order and record fresh outputs. A .py file becomes one virtual prefix cell. Bare names resolve from the PTC notebook library. The source is never modified.
 - Prefix numbering includes every sourced notebook cell, including markdown: for 7 source cells, the first new exec_cell is cell 8. A sourcing error is recorded on the failed cell and leaves the kernel usable.
@@ -1182,10 +1182,12 @@ function provisionKernelTool(
     label: "python",
     description: PROVISION_DESCRIPTION,
     parameters: Type.Object({
-      notebook: Type.String({
-        description:
-          "Path to the destination .ipynb notebook bound to this kernel (created if missing; .ipynb appended when omitted). Every executed cell is recorded in it live.",
-      }),
+      notebook: Type.Optional(
+        Type.String({
+          description:
+            "Path to the destination .ipynb notebook bound to this kernel (created if missing; .ipynb appended when omitted; relative paths resolve against the cwd). Omit it for throwaway work: the notebook lands in /tmp/pi-pycells/notebooks and the provision result reports the path. Every executed cell is recorded in it live.",
+        })
+      ),
       source: Type.Optional(
         Type.String({
           description:
@@ -1211,14 +1213,20 @@ function provisionKernelTool(
           details: { sessionId: null },
         };
       }
-      if (!notebook || !notebook.trim()) {
-        return {
-          content: [{ type: "text", text: "provision_kernel requires a notebook path (.ipynb). For scratch work use a /tmp path." }],
-          details: { sessionId: null },
-        };
+      // Default notebook location is /tmp: most kernels are throwaway, and
+      // cwd-defaults tracked piles of scratch notebooks into user repos.
+      // Pass an explicit path (e.g. in the project dir) when the notebook
+      // should be kept or promoted to the library.
+      let notebookPath: string;
+      if (notebook && notebook.trim()) {
+        const resolved = path.isAbsolute(notebook) ? notebook : path.resolve(ctx.cwd, notebook);
+        notebookPath = resolved.endsWith(".ipynb") ? resolved : `${resolved}.ipynb`;
+      } else {
+        const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "").replace("T", "-");
+        const rand = Math.random().toString(36).slice(2, 6);
+        notebookPath = path.join("/tmp", "pi-pycells", "notebooks", `${stamp}-${rand}.ipynb`);
+        fs.mkdirSync(path.dirname(notebookPath), { recursive: true });
       }
-      const resolved = path.isAbsolute(notebook) ? notebook : path.resolve(ctx.cwd, notebook);
-      const notebookPath = resolved.endsWith(".ipynb") ? resolved : `${resolved}.ipynb`;
 
       try {
         const { id, sourcedFrom, sourceError, scriptError } = await sessionManager.provision({

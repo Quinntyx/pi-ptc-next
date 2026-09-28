@@ -42,7 +42,7 @@ provision_kernel({ notebook: "/tmp/todo-scan.ipynb" })
 → "Provisioned kernel a3f8c1d2e4f5 — notebook /tmp/todo-scan.ipynb."
 ```
 
-Every kernel needs a real `.ipynb` destination; it is the durable artifact and gets a cell appended after every execution. For throwaway work pass a `/tmp` path; for real work put the notebook in your repo.
+Every kernel is bound to a real `.ipynb` destination; it is the durable artifact and gets a cell appended after every execution. Omit `notebook` for throwaway work — it lands under `/tmp/pi-pycells/notebooks/` and the provision result reports the path. For work worth keeping, pass an explicit path in your repo (or promote the notebook to the library afterwards).
 
 **3. The model works incrementally in cells.** Variables, imports, and defs persist across cells and conversation turns; the last bare expression echoes Jupyter `Out[n]`-style; nested tool calls (`await read(f)`, `await grep(...)`) hit the real pi tool implementations in the host process:
 

@@ -55,15 +55,15 @@ counts = {f: (await read(f)).count('TODO') for f in files}
 sorted(counts.items(), key=lambda kv: -kv[1])[:5]
 ```
 
-The kernel is bound to a real `.ipynb` notebook — the durable record of the session. The model picks its location (usually your working directory); tell it where to put the notebook if you'd rather have it somewhere else, e.g. "provision the kernel with its notebook in /tmp" for throwaway work. Variables, imports, and definitions persist across cells and conversation turns, and output below a size cap is persisted in full but only summarized to the model.
+The kernel is bound to a real `.ipynb` notebook — the durable record of the session. By default the notebook is created under `/tmp/pi-pycells/notebooks/` — throwaway kernels shouldn't litter your project. Tell the model to pass an explicit notebook path when you want one kept with the project (or promoted to the notebook library). Variables, imports, and definitions persist across cells and conversation turns. Long cell output is always saved in full in the notebook — the model just sees the start and end with the middle cut out, and can page through the full version with `read_cell_output`.
 
-For simple requests the model still uses direct tools like `read` and `grep`; prompts shaped like the above (repo-wide scans, bulk conversions, aggregations, "compact JSON only") are auto-routed to a kernel, with optional bounded auto-recovery when a cell fails.
+The model picks between its normal tools and a kernel on its own: a one-off lookup stays an ordinary `read`/`grep` call, while anything that means many tool calls in a row (repo-wide scans, bulk conversions, aggregations, "compact JSON only") makes a cell the obvious move. If a cell fails, bounded auto-recovery can retry it with a fix.
 
 More: [docs/kernels.md](docs/kernels.md) (kernel lifecycle), [docs/tool-bridge.md](docs/tool-bridge.md) (calling tools from Python), [docs/auto-routing-and-recovery.md](docs/auto-routing-and-recovery.md).
 
 ### Subagent orchestration from a cell
 
-When the optional `pi_subagents` stack is installed (see the table below), kernels can `import pi_subagents` and fan work out to real interactive Pi instances — one tmux window per agent, watchable and steerable by hand while the cell blocks:
+When the optional `pi_subagents` stack is installed (see the table below), kernels can `import pi_subagents` and fan work out to real interactive Pi instances — one tmux window per agent, watchable live while the cell blocks — and steerable mid-run, by you in the window or by the orchestrating model over the pool API:
 
 ```python
 import pi_subagents as subagents
@@ -78,7 +78,7 @@ while (result := await pool.pop(timeout=3600)) is not None:
 pool.close()   # tears down every spawned agent window
 ```
 
-Results come back in completion order, sessions can be reused for follow-ups, and a live progress panel renders in the chat while the cell runs. Without the stack this is simply unavailable — everything above keeps working.
+Results come back in completion order, sessions can be reused for follow-ups, and a live progress panel renders in the chat while the cell runs.
 
 More: [docs/subagents.md](docs/subagents.md).
 
