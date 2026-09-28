@@ -8,9 +8,8 @@ The subagent feature lets the model fan work out to multiple real pi instances �
 
 **Provisioning.** `pi_subagents` is *not* part of the npm install. At extension startup (unless `PI_SUBAGENT_DEPTH` is set), `ensureSubagentsEnv` runs fire-and-forget (`src/index.ts:1640-1644`, `src/subagents-env.ts`):
 
-1. Ensures a venv at `~/.cache/pi-pycells/python-env` exists (`uv venv` preferred, else `python3 -m venv`). Kernels prefer this venv's interpreter, even for users who never touch subagents.
-2. Resolves the `pi_subagents` source: a dev checkout (default `~/docs/src/pi-subagents`, override with `PTC_SUBAGENTS_SOURCE`) if present, otherwise a managed git clone at `~/.cache/pi-pycells/pi-subagents` cloned from `PTC_SUBAGENTS_REPO_URL`.
-3. Editable-installs it into the venv when the path or `pyproject.toml` hash changed since the last sync, then verifies `import pi_subagents` actually resolves.
+1. Ensures a venv at `~/.cache/pi-pycells/python-env-3.14` exists (`uv venv --python 3.14`; uv is required, no fallback). Kernels always run on this venv's interpreter, even for users who never touch subagents.
+   **Provisioning only runs when `PI_SUBAGENTS_MAX_CONCURRENT` is set** — subagents are opt-in; without it nothing is downloaded and cells importing `pi_subagents` get a hint explaining how to enable them.
 
 Syncs are throttled by a stamp file, `<extensionRoot>/.ptc-subagents-sync.json`, that lives *inside this package's clone* — so `pi update` (which resets package clones) forces a fresh sync on the next session start. Between updates the interval defaults to 24 hours (`PTC_SUBAGENTS_SYNC_INTERVAL_HOURS`). A failed stamp with the runtime still missing retries immediately. Syncs are serialized by a pid-tagged lock file (dead holders' locks are broken; legacy timestamp locks use a 5-minute age heuristic), and all output goes to `~/.cache/pi-pycells/subagents-sync.log` (rotated at 1 MB).
 
@@ -92,7 +91,7 @@ For long or destructive workflows, put the entire declared workflow in one cell 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PI_SUBAGENTS_MAX_CONCURRENT` | `8` | Global cap across all pools; stage `slots` are priorities, not hard limits |
+| `PI_SUBAGENTS_MAX_CONCURRENT` | *(unset — subagents disabled)* | Set to a positive number to enable subagents; also the global cap across all pools (stage `slots` are priorities, not hard limits). pi-pycells provisions the `pi_subagents` module when this is set. |
 | `PI_SUBAGENTS_CATALOG_TTL` | `120` s | Model-catalog cache lifetime before a live re-check |
 | `PI_CODING_SUBAGENT_DIR` | *(unset — subagents share the orchestrator's agent dir)* | Agent dir spawned subagent instances run under (env `PI_CODING_SUBAGENT_DIR`; the Task `profile` kwarg can override per task) |
 

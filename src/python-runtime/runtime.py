@@ -383,6 +383,10 @@ def _python_error_help(error: BaseException) -> str | None:
     if isinstance(error, (ModuleNotFoundError, ImportError)):
         missing = getattr(error, "name", None)
         top_level = str(missing).split(".")[0] if missing else None
+        if top_level == "pi_subagents" and not os.environ.get("PI_SUBAGENTS_MAX_CONCURRENT"):
+            return ("help: subagent orchestration is disabled by default; set "
+                    "PI_SUBAGENTS_MAX_CONCURRENT=8 (any positive number) in your environment "
+                    "and restart pi to enable it")
         # Only suggest provision_dependency for import names that are also PyPI
         # distribution names. Common offenders have different distribution names
         # (PIL -> pillow, cv2 -> opencv-python, sklearn -> scikit-learn, ...);

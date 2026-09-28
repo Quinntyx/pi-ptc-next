@@ -71,7 +71,7 @@ The startup `[PTC]` warning and `~/.cache/pi-pycells/subagents-sync.log` tell yo
 
 ### Why does installing pi_subagents fail with a git auth error?
 
-On first session start the extension creates `~/.cache/pi-pycells/python-env-3.14` (`uv venv --python 3.14`; uv is required) and clones pi-subagents from the default `https://github.com/Quinntyx/pi-subagents` into `~/.cache/pi-pycells/pi-subagents`, then editable-installs it. If you point `PTC_SUBAGENTS_REPO_URL` at a repo that needs credentials, non-interactive git can't prompt and the clone logs something like:
+Once subagents are enabled (set `PI_SUBAGENTS_MAX_CONCURRENT`) the extension creates `~/.cache/pi-pycells/python-env-3.14` (`uv venv --python 3.14`; uv is required) and clones pi-subagents from the default `https://github.com/Quinntyx/pi-subagents` into `~/.cache/pi-pycells/pi-subagents`, then editable-installs it. If you point `PTC_SUBAGENTS_REPO_URL` at a repo that needs credentials, non-interactive git can't prompt and the clone logs something like:
 
 ```
 fatal: could not read Username for '<host>': No such device or address

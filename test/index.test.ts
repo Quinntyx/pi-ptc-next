@@ -1103,3 +1103,25 @@ test("isValidPythonVersion accepts plain versions and rejects injection attempts
     assert.equal(isValidPythonVersion(bad), false, `expected reject: ${JSON.stringify(bad)}`);
   }
 });
+
+test("subagentsProvisioningEnabled: opt-in via PI_SUBAGENTS_MAX_CONCURRENT", async () => {
+  const { subagentsProvisioningEnabled } = require("../dist/utils.js");
+  const original = process.env.PI_SUBAGENTS_MAX_CONCURRENT;
+  try {
+    delete process.env.PI_SUBAGENTS_MAX_CONCURRENT;
+    assert.equal(subagentsProvisioningEnabled(), false, "unset = disabled");
+    process.env.PI_SUBAGENTS_MAX_CONCURRENT = "-1";
+    assert.equal(subagentsProvisioningEnabled(), false, "-1 = disabled");
+    process.env.PI_SUBAGENTS_MAX_CONCURRENT = "0";
+    assert.equal(subagentsProvisioningEnabled(), false, "0 = disabled");
+    process.env.PI_SUBAGENTS_MAX_CONCURRENT = "banana";
+    assert.equal(subagentsProvisioningEnabled(), false, "garbage = disabled");
+    process.env.PI_SUBAGENTS_MAX_CONCURRENT = "4";
+    assert.equal(subagentsProvisioningEnabled(), true, "positive int = enabled");
+    process.env.PI_SUBAGENTS_MAX_CONCURRENT = "8";
+    assert.equal(subagentsProvisioningEnabled(), true, "positive int = enabled");
+  } finally {
+    if (original === undefined) delete process.env.PI_SUBAGENTS_MAX_CONCURRENT;
+    else process.env.PI_SUBAGENTS_MAX_CONCURRENT = original;
+  }
+});

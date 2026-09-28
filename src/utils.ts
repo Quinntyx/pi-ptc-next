@@ -447,3 +447,16 @@ export function withActivityLabel<T extends object>(tool: T): T {
 export function isValidPythonVersion(value: string): boolean {
   return /^(?:\d+)\.(?:\d+)(?:\.(?:\d+))?(?:(?:a|b|c|rc)\d+)?$/.test(value.trim());
 }
+
+/**
+ * Subagent provisioning is opt-in: PI_SUBAGENTS_MAX_CONCURRENT set to a
+ * positive integer both enables it and caps the pools. Unset (the default)
+ * or any non-positive value means "no subagents" — nothing is downloaded,
+ * and `import pi_subagents` in a cell fails with a hint explaining why.
+ */
+export function subagentsProvisioningEnabled(): boolean {
+  const raw = process.env.PI_SUBAGENTS_MAX_CONCURRENT;
+  if (raw === undefined) return false;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value >= 1;
+}

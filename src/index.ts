@@ -34,6 +34,7 @@ import type { SubagentRuntimeSnapshot } from "./contracts/execution-types";
 import {
   collapseOutputPreview,
   isValidPythonVersion,
+  subagentsProvisioningEnabled,
   debugLog,
   isMutationPrompt,
   loadSettingsFromEnv,
@@ -1901,11 +1902,12 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   (globalThis as Record<string, unknown>).__ptcPythonSessionManager = sessionManager;
   (globalThis as Record<symbol, unknown>)[SUBAGENT_RUNTIME_KEY] = createSubagentRuntime(sessionManager);
 
-  // Provision the pi_subagents runtime in the background: create the PTC venv
-  // when missing and install/refresh pi_subagents from git. The sync stamp
-  // lives inside this package's clone, so `pi update` (which resets and cleans
-  // the clone) triggers a fresh sync on the next session start.
-  if (!process.env.PI_SUBAGENT_DEPTH) {
+  // Provision the pi_subagents runtime in the background — but only when the
+  // user opted in: subagents are OFF unless PI_SUBAGENTS_MAX_CONCURRENT is set
+  // to a positive number (which also becomes the global pool cap). An
+  // "optional" dependency that installs itself before you asked is just an
+  // unrequested install; nothing downloads until you enable it.
+  if (subagentsProvisioningEnabled()) {
     // Memoized and shared: the session manager's readiness gate awaits this
     // same promise before its first kernel spawn, so a first-install kernel
     // does not lock in system python3 while packages land in the venv.

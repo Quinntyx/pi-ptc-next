@@ -221,7 +221,7 @@ Result fields: `task`, `stage`, `handle`, `body` (str or dict response),
   continue in the same or a later cell.
 - Set explicit `Task.timeout` values for models that can fail at the provider;
   an errored turn may otherwise wait out the default settle timeout (30 min).
-- `PI_SUBAGENTS_MAX_CONCURRENT` (default 8) caps all pools globally; stage
+- `PI_SUBAGENTS_MAX_CONCURRENT` (unset by default — must be set to a positive number to enable subagents) caps all pools globally; stage
   slots are priorities, not hard limits - idle slots are borrowed.
 - Spawned agents cannot spawn agents; keep orchestration in the parent cell.
 - Each subagent is a real interactive pi in a tmux window titled
