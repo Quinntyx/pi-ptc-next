@@ -85,7 +85,7 @@ For long or destructive workflows, put the entire declared workflow in one cell 
 | `PTC_SUBAGENTS_PROFILE` | unset | Name/path forwarded to the interpreter as `PI_SUBAGENTS_PROFILE`; selects the pi profile subagent instances run under (`src/utils.ts:90`, `src/python-session-manager.ts:1077-1102`) |
 | `PTC_SUBAGENT_FOOTER` | `true` | Set `false` to hide the `subagents:` status footer (for custom footers consuming the `pi-ptc:subagent-runtime` API) |
 | `PTC_SUBAGENTS_SOURCE` | `~/docs/src/pi-subagents` | Dev checkout to install `pi_subagents` from, preferred over the managed clone |
-| `PTC_SUBAGENTS_REPO_URL` | `https://git.quinntyx.dev/quinntyx/pi-subagents` | Git source for the managed clone |
+| `PTC_SUBAGENTS_REPO_URL` | `https://github.com/Quinntyx/pi-subagents` | Git source for the managed clone |
 | `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` | `24` | Minimum interval between pi_subagents syncs |
 | `PI_SUBAGENT_DEPTH` | unset | Set by pi on spawned subagents; suppresses the autoimport and provisioning — subagents cannot spawn subagents |
 
@@ -95,7 +95,7 @@ For long or destructive workflows, put the entire declared workflow in one cell 
 | --- | --- | --- |
 | `PI_SUBAGENTS_MAX_CONCURRENT` | `8` | Global cap across all pools; stage `slots` are priorities, not hard limits |
 | `PI_SUBAGENTS_CATALOG_TTL` | `120` s | Model-catalog cache lifetime before a live re-check |
-| `PI_SUBAGENTS_PROFILE` | `~/.config/pi/profiles/subagents` | pi profile directory subagent instances launch with |
+| `PI_SUBAGENTS_PROFILE` | `~/.pi/agent/profiles/subagents` | pi profile directory subagent instances launch with |
 
 ### Settings
 
@@ -106,9 +106,9 @@ For long or destructive workflows, put the entire declared workflow in one cell 
 
 This feature was built on the author's machine and several defaults only work there. Workarounds:
 
-- **Private forge URL.** `PTC_SUBAGENTS_REPO_URL` defaults to `https://git.quinntyx.dev/quinntyx/pi-subagents`, which is inaccessible to outside users. Point it at a clone you can read (e.g. your own fork): `export PTC_SUBAGENTS_REPO_URL=https://github.com/<you>/pi-subagents`. The provisioner shells out to plain `git`, so the URL must be reachable by your credential helper.
+- **Source URL.** `PTC_SUBAGENTS_REPO_URL` defaults to the public GitHub mirror (`https://github.com/Quinntyx/pi-subagents`) and works anonymously. Point it at your own fork if you maintain one: `export PTC_SUBAGENTS_REPO_URL=https://github.com/<you>/pi-subagents`. The provisioner shells out to plain `git`, so the URL must be reachable by your credential helper.
 - **Author-specific dev-checkout path.** `PTC_SUBAGENTS_SOURCE` defaults to `~/docs/src/pi-subagents` (joined from your homedir, `src/subagents-env.ts:50`). If you don't have that directory nothing breaks — resolution falls through to the managed clone — but set `PTC_SUBAGENTS_SOURCE` if you keep a checkout elsewhere.
-- **tmux + the `subagents` pi profile are hard requirements.** The module checks at import that it is running under tmux with the `subagents` pi profile and raises plainly otherwise. You must have tmux installed and a pi profile directory named exactly `subagents` (default `~/.config/pi/profiles/subagents`) configured with whatever the spawned instances need — the author's profile wires in extensions such as `pi-sock` (the prompt-delivery transport) and `pi-tool-tree`. If you keep sessions elsewhere set `PI_CODING_AGENT_DIR` accordingly and place `profiles/subagents` under it.
+- **tmux + the `subagents` pi profile are hard requirements.** The module checks at import that it is running under tmux with the `subagents` pi profile and raises plainly otherwise. You must have tmux installed and a pi profile directory named exactly `subagents` (default `~/.pi/agent/profiles/subagents`) configured with whatever the spawned instances need — the author's profile wires in extensions such as `pi-sock` (the prompt-delivery transport) and `pi-tool-tree`. If you keep sessions elsewhere set `PI_CODING_AGENT_DIR` accordingly and place `profiles/subagents` under it.
 - **`pi_subagents` is not on PyPI / npm.** It is fetched from git at sync time. Without network access to a valid repo, provisioning fails (stamped, and logged to `~/.cache/pi-ptc/subagents-sync.log`); a previous working checkout or dev source keeps working. You can also supply any checkout via `PTC_SUBAGENTS_SOURCE` — it must contain a `pyproject.toml` at its root or under a `main/` subdirectory.
 - **Machine cache layout.** The venv (`python-env/`), managed clone (`pi-subagents/`), sync log, and lock file all live under `~/.cache/pi-ptc/` (non-configurable in code). The venv is used for *all* PTC kernels, even if you never use subagents; delete it if you want kernels on a different interpreter.
 - **`uv` and `git` assumed.** `uv` is preferred for venv creation and editable installs (falls back to `python3 -m venv` / `pip`); `git` is required for the managed-clone path.

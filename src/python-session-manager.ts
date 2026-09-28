@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { homedir } from "os";
 import type { ChildProcess } from "child_process";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   PtcAbortError,
   PtcProtocolError,
@@ -1091,7 +1091,7 @@ export class PythonSessionManager {
         : configured;
       return path.resolve(expanded);
     }
-    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homedir(), ".config", "pi");
+    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homedir(), ".pi", "agent");
     return path.resolve(agentDir, "ptc-library");
   }
 

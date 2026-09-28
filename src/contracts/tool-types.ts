@@ -3,7 +3,7 @@ import type {
   ExtensionContext,
   ToolDefinition,
   ToolInfo as ExtensionToolInfo,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 
 export type PtcCaller = "direct" | "code_execution";
@@ -62,7 +62,13 @@ export interface LoadedTool {
 
 export type ToolSource = "builtin" | "alias" | "extension";
 
-export interface ToolInfo extends ExtensionToolInfo {
+export interface ToolInfo extends Omit<ExtensionToolInfo, "sourceInfo"> {
+  /**
+   * pi >= 0.87 requires sourceInfo on ToolInfo exposed via getAllTools(); our
+   * registry synthesizes entries that never passed through pi's loader, so the
+   * field is optional here and stamped when bridging back to pi.
+   */
+  sourceInfo?: ExtensionToolInfo["sourceInfo"];
   execute: ToolDefinition["execute"];
   source: ToolSource;
   isReadOnly: boolean;

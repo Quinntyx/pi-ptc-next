@@ -60,7 +60,7 @@ top
 
 **5. Outputs are compact but never lost.** The model sees at most `PTC_OUTPUT_PREVIEW_CHARS` (default 12,000 chars) of any cell as a head/tail preview; the full output is persisted in the notebook's cell metadata and paged back via `read_cell_output(cellIdx, offset, limit)` (default 2,000 lines / 50 KB per call).
 
-**6. Reuse what worked.** Finish a good workflow with `promote_to_skill_notebook({ name: "event-analysis" })` to copy the complete notebook (markdown, code, outputs) into the library at `~/.config/pi/ptc-library`, then start future kernels with `provision_kernel({ notebook: "/tmp/work.ipynb", source: "event-analysis" })` — the sourced setup runs up front and the kernel inherits the namespace.
+**6. Reuse what worked.** Finish a good workflow with `promote_to_skill_notebook({ name: "event-analysis" })` to copy the complete notebook (markdown, code, outputs) into the library at `~/.pi/agent/ptc-library`, then start future kernels with `provision_kernel({ notebook: "/tmp/work.ipynb", source: "event-analysis" })` — the sourced setup runs up front and the kernel inherits the namespace.
 
 More: [docs/kernels.md](docs/kernels.md) for the full kernel lifecycle, and [docs/notebook-library.md](docs/notebook-library.md) for sourcing/promotion semantics.
 
@@ -150,7 +150,7 @@ More: [docs/custom-tools.md](docs/custom-tools.md)
 
 ## The notebook library
 
-`~/.config/pi/ptc-library` (override with `PTC_LIBRARY_DIR`) holds reusable workflow notebooks. `promote_to_skill_notebook({ name })` copies the complete live notebook — markdown, code, outputs — into the library under a sanitized lowercase-hyphenated name, refusing to overwrite unless `overwrite: true`. `provision_kernel({ ..., source: "name" })` starts a new kernel from a library workflow: a `.ipynb` source is copied verbatim and its code cells executed in order as prefix cells (markdown preserved, not executed); a `.py` source runs as one virtual prefix cell. Sourced setup has already run when your first cell executes — cell numbering includes all prefix cells (a 7-cell source makes your first new cell `Out[8]`). A failing source cell is recorded on that cell and leaves the kernel usable.
+`~/.pi/agent/ptc-library` (override with `PTC_LIBRARY_DIR`) holds reusable workflow notebooks. `promote_to_skill_notebook({ name })` copies the complete live notebook — markdown, code, outputs — into the library under a sanitized lowercase-hyphenated name, refusing to overwrite unless `overwrite: true`. `provision_kernel({ ..., source: "name" })` starts a new kernel from a library workflow: a `.ipynb` source is copied verbatim and its code cells executed in order as prefix cells (markdown preserved, not executed); a `.py` source runs as one virtual prefix cell. Sourced setup has already run when your first cell executes — cell numbering includes all prefix cells (a 7-cell source makes your first new cell `Out[8]`). A failing source cell is recorded on that cell and leaves the kernel usable.
 
 More: [docs/notebook-library.md](docs/notebook-library.md)
 
@@ -211,14 +211,14 @@ Everything is configured through environment variables, read **once** at extensi
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PTC_LIBRARY_DIR` | `$PI_CODING_AGENT_DIR/ptc-library` (`~/.config/pi/ptc-library`) | Notebook library for `source` lookup and promotion. |
+| `PTC_LIBRARY_DIR` | `$PI_CODING_AGENT_DIR/ptc-library` (`~/.pi/agent/ptc-library`) | Notebook library for `source` lookup and promotion. |
 | `PTC_EVALS_PATH` | `.pi/evals/ptc` | Root of benchmark/eval cases. |
 
 ### pi-subagents provisioning
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PTC_SUBAGENTS_REPO_URL` | `https://git.quinntyx.dev/quinntyx/pi-subagents` | Git source for the managed `pi_subagents` clone (private forge by default). |
+| `PTC_SUBAGENTS_REPO_URL` | `https://github.com/Quinntyx/pi-subagents` | Git source for the managed `pi_subagents` clone (public GitHub mirror by default; canonical repo lives on the author's forge). |
 | `PTC_SUBAGENTS_SOURCE` | `~/docs/src/pi-subagents` (if present) | Dev checkout installed editable instead of the managed clone. |
 | `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` | `24` | Minimum interval between syncs. |
 | `PTC_SUBAGENTS_PROFILE` | *(unset)* | Forwarded to kernels as `PI_SUBAGENTS_PROFILE`; selects the pi profile subagents run under. |
@@ -235,7 +235,7 @@ More: [docs/configuration.md](docs/configuration.md) — the full per-variable r
 | **Python ≥ 3.10** | Required | Interpreter for kernels. Older interpreters fail fast at startup (PEP 604 unions and 3.12 AST features are load-bearing). Set `PTC_PYTHON_EXECUTABLE` if your `python3` is older. | No kernels at all. |
 | **`uv`** | Optional (but used opportunistically) | Preferred for creating the shared venv (`~/.cache/pi-ptc/python-env`) and for `provision_dependency` package installs. | Venv creation falls back to `python3 -m venv`; `provision_dependency` fails with an ENOENT error — there is **no pip fallback**; pre-install packages into the venv yourself instead. |
 | **`git`** | Optional | Required only for the managed-clone path of `pi_subagents` provisioning. | Subagents provisioning fails (logged, non-fatal) if there's no dev checkout to use instead. |
-| **`pi_subagents` + tmux + `pi-sock` + the `subagents` pi profile** | Optional | The subagent orchestration stack: `pi_subagents` (installed into the shared venv from git at session start), tmux (each agent is a tmux window; the module refuses to import without tmux), `pi-sock` (prompt-delivery transport wired into the author's profile), and a pi profile named exactly `subagents` (default `~/.config/pi/profiles/subagents`). | All core features (kernels, tool bridge, routing, notebook library, benchmarks) work untouched. Only `import pi_subagents` in cells is unavailable — provisioning failure is logged as a warning, never fatal, and subagent pools/panels/footer simply don't appear. |
+| **`pi_subagents` + tmux + `pi-sock` + the `subagents` pi profile** | Optional | The subagent orchestration stack: `pi_subagents` (installed into the shared venv from git at session start), tmux (each agent is a tmux window; the module refuses to import without tmux), `pi-sock` (prompt-delivery transport wired into the author's profile), and a pi profile named exactly `subagents` (default `~/.pi/agent/profiles/subagents`). | All core features (kernels, tool bridge, routing, notebook library, benchmarks) work untouched. Only `import pi_subagents` in cells is unavailable — provisioning failure is logged as a warning, never fatal, and subagent pools/panels/footer simply don't appear. |
 | **pi-tool-tree** | Optional | Nicer subagent activity display: the subagent panel and shimmer integrate with it via a `globalThis` API (`pi-tool-tree:api` / `pi-tool-tree:activity-api`), and it labels tool calls with model-supplied activity words. | Everything degrades to plain rendering — panels/footers still work, just with less polish. No extra setup needed. |
 | **shiki** | Bundled | Syntax highlighting for the `confirm: true` approval popup. It is a regular dependency, so highlighting works out of the box; if it ever fails to load the popup falls back to plain text (visible with `PTC_DEBUG=1`) without aborting. | Nothing to install. |
 
@@ -245,12 +245,12 @@ Note that the shared venv at `~/.cache/pi-ptc/python-env` is created by the suba
 
 Several defaults encode the author's machine. None break core execution, but know about them:
 
-- **Private forge URL for `pi_subagents`.** `PTC_SUBAGENTS_REPO_URL` defaults to `https://git.quinntyx.dev/quinntyx/pi-subagents`, unreachable outside the author's network. Outside, the background provisioner fails with a logged warning (details in `~/.cache/pi-ptc/subagents-sync.log`) and `import pi_subagents` is unavailable — nothing else breaks. Workarounds: point `PTC_SUBAGENTS_REPO_URL` at a fork you can clone (the provisioner shells out to plain `git`, so your credential helper must work), or set `PTC_SUBAGENTS_SOURCE` to your own checkout (must contain a `pyproject.toml` at its root or under a `main/` subdirectory).
+- **`pi_subagents` source.** `PTC_SUBAGENTS_REPO_URL` defaults to the public GitHub mirror (`https://github.com/Quinntyx/pi-subagents`), so provisioning works out of the box. Point it at your own fork, or set `PTC_SUBAGENTS_SOURCE` to a local checkout (must contain a `pyproject.toml` at its root or under a `main/` subdirectory), if you want a different source.
 - **Author-home dev-checkout default.** With `PTC_SUBAGENTS_SOURCE` unset, the provisioner probes `~/docs/src/pi-subagents` and installs it editable when present — on the author's machine it silently wins over the managed clone. Elsewhere it just doesn't exist; set the variable if you keep a checkout somewhere else.
-- **tmux + the `subagents` pi profile are hard requirements for subagents.** The `pi_subagents` module checks at import that it runs under tmux with the `subagents` pi profile and raises plainly otherwise. Create `~/.config/pi/profiles/subagents` (or set `PI_CODING_AGENT_DIR` / `PTC_SUBAGENTS_PROFILE` for a different location) with whatever spawned instances need. If you don't use pi profiles, leave `PTC_SUBAGENTS_PROFILE` unset.
+- **tmux + the `subagents` pi profile are hard requirements for subagents.** The `pi_subagents` module checks at import that it runs under tmux with the `subagents` pi profile and raises plainly otherwise. Create `~/.pi/agent/profiles/subagents` (or set `PI_CODING_AGENT_DIR` / `PTC_SUBAGENTS_PROFILE` for a different location) with whatever spawned instances need. If you don't use pi profiles, leave `PTC_SUBAGENTS_PROFILE` unset.
 - **`~/.cache/pi-ptc` cache root (non-configurable in code).** Holds the shared venv (`python-env/`), the managed `pi-subagents/` clone, the sync log (rotated at 1 MB), and the sync lock file. Once the venv exists, all kernels prefer it over `python3` — delete it, or set `PTC_PYTHON_EXECUTABLE`, to control your interpreter.
 - **Sync stamp inside the extension clone.** `.ptc-subagents-sync.json` lives in the extension's own directory; because `pi update` resets package clones, every update forces a fresh sync from whatever the repo variables resolve to at that moment. (The git-tracked stamp currently contains the author's absolute path — a harmless stale stamp that triggers one extra sync.)
-- **pi agent-dir conventions.** The notebook library defaults to `~/.config/pi/ptc-library` (honoring `PI_CODING_AGENT_DIR`), and the default eval root `.pi/evals/ptc` assumes a pi-style project directory. Set `PTC_LIBRARY_DIR` / `PTC_EVALS_PATH` if your layout differs.
+- **pi agent-dir conventions.** The notebook library defaults to `~/.pi/agent/ptc-library` (honoring `PI_CODING_AGENT_DIR`), and the default eval root `.pi/evals/ptc` assumes a pi-style project directory. Set `PTC_LIBRARY_DIR` / `PTC_EVALS_PATH` if your layout differs.
 - **English-only routing heuristics.** The auto-routing signals and mutation-word list are hardcoded English regexes; prompts in other languages simply don't route. Naming a PTC tool explicitly ("use exec_cell to …") routes unconditionally.
 - **Custom `tools/` directory is not configurable.** Custom tools load from `<extensionRoot>/tools` inside the installed extension, so npm-installed files there can be wiped by upgrades — keep sources elsewhere and symlink them in, or maintain a patched local checkout.
 - **Benchmark harness is repo-only.** Eval cases, baselines, and the `run-benchmarks.js` flow exist only in the git repo (not the npm `files` allowlist), and there is no `benchmark` npm script — run `npm run build && node dist/run-benchmarks.js …` yourself.

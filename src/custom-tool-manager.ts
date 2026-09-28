@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import type { LoadedTool, PtcToolDefinition } from "./contracts/tool-types";
 import { getExplicitCallers, PTC_TOOL_NAMES } from "./contracts/tool-types";

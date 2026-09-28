@@ -9,8 +9,8 @@ import type {
   ExtensionContext,
   Theme,
   ToolRenderResultOptions,
-} from "@mariozechner/pi-coding-agent";
-import { Container, Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { Container, Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PtcPythonError } from "./execution/execution-errors";
 import { CustomToolManager } from "./custom-tool-manager";
 import { buildCodeExecutionRecoveryPrompt, classifyCodeExecutionFailure } from "./recovery-classifier";
@@ -71,7 +71,7 @@ ptcGlobal.__ptcTokensSaved = ptcTokensSaved;
 // Minimal structural view of the render context the pi TUI passes as the fourth
 // argument to renderResult. `state` is shared across all renders of the same tool
 // execution, which lets the executing-code view carry its scroll position between
-// partial updates (the installed @mariozechner types predate this argument).
+// partial updates (older installed types predate this argument).
 interface PartialRenderContext {
   state?: { viewStartLine?: number };
 }
@@ -114,11 +114,19 @@ function buildExecutingCodeLines(
     const lineNumber = index + 1;
     const isCurrentLine = lineNumber === currentLine;
     const line = codeLines[index];
-    let prefix = `${String(lineNumber).padStart(6, " ")} │ `;
+    // The 6-char number field + separator keeps the rail at a constant column
+    // for every row. The current line swaps the rail glyph for the marker IN
+    // that column: a leading `▶ ` before the number depends on the terminal
+    // rendering ▶ as exactly one cell (U+25B6 gets wide/emoji rendering in
+    // some terminals, which shoved that one row's rail sideways). ▸ (U+25B8)
+    // has no wide presentation, and sitting in the rail column keeps the
+    // number field identical across rows regardless.
+    const numberField = String(lineNumber).padStart(6, " ");
+    let prefix = `${numberField} │ `;
     let content = line;
 
     if (isCurrentLine) {
-      prefix = theme.fg("success", `▶ ${String(lineNumber).padStart(4, " ")} │ `);
+      prefix = theme.fg("success", `${numberField} ▸ `);
       content = theme.fg("text", line);
     } else if (lineNumber < currentLine) {
       prefix = theme.fg("muted", prefix);
@@ -195,10 +203,14 @@ function renderWorkflowRollup(details: ExecutionDetails | undefined, theme: Them
  * blocks (workflow rollup and subagent panel between return and kernel);
  * legacy/sectionless output renders verbatim with a 25-line display cap.
  */
+/** Collapsed view shows this many body lines; ctrl-o expands to the full cell output. */
+const COMPLETED_PREVIEW_LINES = 4;
+
 function renderCompletedOutput(
   resultText: string,
   details: ExecutionDetails | undefined,
-  theme: Theme
+  theme: Theme,
+  expanded?: boolean
 ): Component {
   if (!details) {
     return new Text(resultText || "(No output)", 0, 0);
@@ -234,11 +246,10 @@ function renderCompletedOutput(
       subagentLines.length + toolLines.length > 0 ? `\n${[...subagentLines, ...toolLines].join("\n")}\n` : "";
     const rawBody = resultText || "(No output)";
     const bodyLines = rawBody.split("\n");
-    const maxDisplayLines = 25;
     let displayedBody = rawBody;
-    if (bodyLines.length > maxDisplayLines) {
-      displayedBody = bodyLines.slice(0, maxDisplayLines).join("\n") +
-        `\n${theme.fg("muted", `... (${bodyLines.length - maxDisplayLines} more lines omitted in view)`)}`;
+    if (!expanded && bodyLines.length > COMPLETED_PREVIEW_LINES) {
+      displayedBody = bodyLines.slice(0, COMPLETED_PREVIEW_LINES).join("\n") +
+        `\n${theme.fg("muted", `... (${bodyLines.length - COMPLETED_PREVIEW_LINES} more lines — ctrl-o to expand)`)}`;
     }
     return new Text(`${header}${subagentBlock}\n${displayedBody}`, 0, 0);
   }
@@ -248,7 +259,23 @@ function renderCompletedOutput(
   const container = new Container();
   container.addChild(new Text(header, 0, 0));
   const addRule = () => container.addChild(new RuleComponent(theme));
-  const addSection = (body: string) => container.addChild(new Text(body || "(empty)", 0, 0));
+  // Collapsed: cap every section body to a few lines (ctrl-o expands).
+  const addSection = (body: string) => {
+    if (expanded) {
+      container.addChild(new Text(body || "(empty)", 0, 0));
+      return;
+    }
+    const lines = (body || "(empty)").split("\n");
+    if (lines.length <= COMPLETED_PREVIEW_LINES) {
+      container.addChild(new Text(body || "(empty)", 0, 0));
+      return;
+    }
+    container.addChild(new Text(
+      lines.slice(0, COMPLETED_PREVIEW_LINES).join("\n") +
+        `\n${theme.fg("muted", `... (${lines.length - COMPLETED_PREVIEW_LINES} more lines — ctrl-o to expand)`)}`,
+      0, 0
+    ));
+  };
 
   const kernel = sections.find((s) => s.name === "kernel");
   for (const section of sections) {
@@ -728,27 +755,75 @@ function tokenFontAnsi(fontStyle: number | undefined): string {
   return out;
 }
 
-let highlighterPromise: Promise<any> | null = null;
+let highlighters = new Map<string, Promise<any> | null>();
 
 /**
- * Lazily create the shared Shiki highlighter for the theme in PTC_CODE_THEME
- * (default github-dark). Returns null when Shiki cannot load; a failure resets
- * the memo so a later call can retry.
+ * Pick the Shiki theme that matches the terminal's background. Token colors
+ * from a dark palette on a light terminal (or vice versa) are unreadable, so
+ * mirror pi-tool-tree: choose github-light/github-dark from the active pi
+ * theme's background luminance. PTC_CODE_THEME overrides the choice.
  */
-function getHighlighter(): Promise<any> | null {
-  if (!highlighterPromise) {
-    const themeName = process.env.PTC_CODE_THEME || "github-dark";
-    highlighterPromise = import("shiki")
+function resolveShikiThemeName(theme?: Theme): string {
+  if (process.env.PTC_CODE_THEME) return process.env.PTC_CODE_THEME;
+  const bg = parseAnsiColorRgb(safeGetAnsi(theme, "getBgAnsi", "selectedBg")
+    || safeGetAnsi(theme, "getBgAnsi", "userMessageBg"));
+  const fg = parseAnsiColorRgb(safeGetAnsi(theme, "getFgAnsi", "text")
+    || safeGetAnsi(theme, "getFgAnsi", "fg"));
+  const sample = bg ?? fg;
+  if (!sample) return "github-dark";
+  const luminance = 0.2126 * sample.r + 0.7152 * sample.g + 0.0722 * sample.b;
+  // A bright sampled color means a light terminal: use the light palette.
+  return luminance > 128 ? "github-light" : "github-dark";
+}
+
+function safeGetAnsi(theme: Theme | undefined, method: "getFgAnsi" | "getBgAnsi", key: string): string | null {
+  try {
+    const ansi = (theme as unknown as Record<string, ((k: string) => string) | undefined> | undefined)?.[method]?.(key);
+    return typeof ansi === "string" && ansi.length > 0 ? ansi : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Parse a truecolor (38;2;/48;2;) or 256-color (38;5;/48;5;) ANSI sequence into RGB. */
+function parseAnsiColorRgb(ansi: string | null): { r: number; g: number; b: number } | null {
+  if (!ansi) return null;
+  const tc = ansi.match(/\x1b\[(?:38|48);2;(\d+);(\d+);(\d+)m/);
+  if (tc) return { r: +tc[1], g: +tc[2], b: +tc[3] };
+  const idx = ansi.match(/\x1b\[(?:38|48);5;(\d+)m/);
+  if (idx) {
+    // 256-color cube approximation (xterm): enough for light/dark decisions.
+    const n = +idx[1];
+    if (n < 16) return null;
+    if (n < 232) {
+      const cube = [0, 95, 135, 175, 215, 255];
+      const i = n - 16;
+      return { r: cube[Math.floor(i / 36) % 6], g: cube[Math.floor(i / 6) % 6], b: cube[i % 6] };
+    }
+    const level = 8 + (n - 232) * 10;
+    return { r: level, g: level, b: level };
+  }
+  return null;
+}
+
+/**
+ * Lazily create a Shiki highlighter per theme name. Returns null when Shiki
+ * cannot load; a failure resets the memo so a later call can retry.
+ */
+function getHighlighter(themeName: string): Promise<any> | null {
+  if (!highlighters.has(themeName)) {
+    const promise = import("shiki")
       .then((shiki: any) => shiki.createHighlighter({ themes: [themeName], langs: ["python"] }))
       .catch((error: unknown) => {
         // A transient module/theme failure should not disable highlighting for
         // the rest of the process lifetime; allow the next request to retry.
-        highlighterPromise = null;
+        highlighters.delete(themeName);
         debugLog(`shiki unavailable, approval preview falls back to plain text: ${error instanceof Error ? error.message : String(error)}`);
         return null;
       });
+    highlighters.set(themeName, promise);
   }
-  return highlighterPromise;
+  return highlighters.get(themeName) ?? null;
 }
 
 const highlightCache = new Map<string, string[]>();
@@ -757,22 +832,37 @@ const highlightCache = new Map<string, string[]>();
  * Highlight Python cell code to ANSI-colored lines for the approval popup,
  * with a small clear-on-overflow cache; null when highlighting is unavailable.
  */
-async function highlightCellCode(code: string): Promise<string[] | null> {
+async function highlightCellCode(code: string, theme?: Theme): Promise<string[] | null> {
   const cached = highlightCache.get(code);
   if (cached) return cached;
   try {
-    const highlighter = await getHighlighter();
+    const themeName = resolveShikiThemeName(theme);
+    const highlighter = await getHighlighter(themeName);
     if (!highlighter) return null;
-    const themeName = process.env.PTC_CODE_THEME || "github-dark";
     const { tokens }: { tokens: ShikiToken[][] } = highlighter.codeToTokens(code, {
       lang: "python",
       theme: themeName,
     });
+    // Light palette on a light terminal (or dark on dark) washes out: clamp
+    // token colors whose luminance sits on the wrong side of the background to
+    // a safe muted foreground — same normalization pi-tool-tree applies.
+    const onLight = themeName.includes("light");
+    const minLuminance = onLight ? 140 : 72;
+    const safeMuted = hexToAnsiFg(onLight ? "#57606a" : "#8b949e") ?? "";
     const lines = tokens.map((line) => {
       let out = "";
       for (const token of line) {
-        const color = token.color ? hexToAnsiFg(token.color) : null;
         const font = tokenFontAnsi(token.fontStyle);
+        let color: string | null = null;
+        if (token.color) {
+          const rgb = hexRgb(token.color);
+          if (rgb) {
+            const lum = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
+            color = lum < minLuminance ? safeMuted : hexToAnsiFg(token.color);
+          } else {
+            color = hexToAnsiFg(token.color);
+          }
+        }
         if (color || font) out += (color ?? "") + font + token.content + "\x1b[0m";
         else out += token.content;
       }
@@ -785,6 +875,14 @@ async function highlightCellCode(code: string): Promise<string[] | null> {
     debugLog(`shiki highlighting failed, approval preview falls back to plain text: ${error instanceof Error ? error.message : String(error)}`);
     return null;
   }
+}
+
+/** Parse a #rrggbb (or #rgb) hex color into RGB components. */
+function hexRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/.exec(hex.trim());
+  if (!m) return null;
+  const full = m[1].length === 3 ? m[1].split("").map((c) => c + c).join("") : m[1];
+  return { r: parseInt(full.slice(0, 2), 16), g: parseInt(full.slice(2, 4), 16), b: parseInt(full.slice(4, 6), 16) };
 }
 
 // ============================================================================
@@ -892,7 +990,7 @@ async function requestCellApproval(
 
   // Highlight once, up-front (before the sync TUI renderer runs). Falls back
   // to plain text if Shiki is unavailable.
-  const highlightedLines = await highlightCellCode(code);
+  const highlightedLines = await highlightCellCode(code, ctx.ui?.theme);
   const previewLines = highlightedLines ?? code.split("\n");
   const isHighlighted = highlightedLines !== null;
 
@@ -1361,7 +1459,7 @@ function execCellTool(
     },
     renderResult(
       result: AgentToolResult<unknown>,
-      { isPartial }: ToolRenderResultOptions,
+      { isPartial, expanded }: ToolRenderResultOptions,
       theme: Theme,
       context?: PartialRenderContext
     ) {
@@ -1400,7 +1498,7 @@ function execCellTool(
         .map((content) => content.text)
         .join("");
 
-      return renderCompletedOutput(text, details, theme);
+      return renderCompletedOutput(text, details, theme, expanded);
     },
   });
 }

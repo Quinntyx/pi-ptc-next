@@ -1,4 +1,4 @@
-import type { Theme, ThemeColor } from "@mariozechner/pi-coding-agent";
+import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { shimmerText } from "./shimmer";
 import type {
   SubagentAgentRow,
@@ -207,18 +207,18 @@ function renderSubagentFan(
     groupAgents.forEach((agent, index) => {
       const last = index === groupAgents.length - 1;
       const branch = last ? "╰" : "├";
-      const gutter = agent.awaited ? theme.fg("accent", "  ▶ ") : "    ";
+      const gutter = agent.awaited ? theme.fg("accent", "  ▸ ") : "    ";
 
       if (agent.status === "queued") {
         lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", `… ${agent.name}`)}`);
-        lines.push(`    ${theme.fg("muted", last ? "  " : "│ ")}${theme.fg("muted", "╰ waiting for a pool slot")}`);
+        lines.push(`${last ? gutter : "    "}${theme.fg("muted", last ? "╰" : "│ ╰")} ${theme.fg("muted", "waiting for a pool slot")}`);
         lines.push("");
         return;
       }
 
       if (agent.status === "starting") {
         lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", `○ ${agent.name}`)}`);
-        lines.push(`    ${theme.fg("muted", last ? "  " : "│ ")}${theme.fg("muted", "╰ starting…")}`);
+        lines.push(`${last ? gutter : "    "}${theme.fg("muted", last ? "╰" : "│ ╰")} ${theme.fg("muted", "starting…")}`);
         lines.push("");
         return;
       }
@@ -269,7 +269,7 @@ function renderSubagentFan(
         }
       }
       if (detailBits.length > 0) {
-        lines.push(`    ${theme.fg("muted", last ? "  " : "│ ")}${theme.fg("muted", "╰")} ${detailBits.join("")}`);
+        lines.push(`${last ? gutter : "    "}${theme.fg("muted", last ? "╰" : "│ ╰")} ${detailBits.join("")}`);
       }
       if (!last) lines.push(`    ${theme.fg("muted", "│")}`);
     });

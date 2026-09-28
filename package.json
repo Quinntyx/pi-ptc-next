@@ -52,12 +52,12 @@
   "author": "",
   "license": "MIT",
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "dependencies": {
-    "@mariozechner/pi-tui": "^0.55.1",
     "@sinclair/typebox": "^0.34.41",
-    "shiki": "^4.4.3"
+    "shiki": "^4.4.3",
+    "@earendil-works/pi-tui": "^0.55.1"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

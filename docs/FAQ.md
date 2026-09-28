@@ -18,7 +18,7 @@ No environment variables are required — but note there is **no sandboxing**: k
 
 ### Do I need pi-profiles?
 
-No. There is no pi-profiles *package* dependency anywhere in pi-ptc-next. Kernels don't need profiles at all. Subagent spawning (via `pi_subagents`) needs a pi *profile directory* named `subagents` (`$PI_SUBAGENTS_PROFILE` or `~/.config/pi/profiles/subagents`), which is resolved by pi-subagents itself, not by pi-profiles. The host only forwards `PI_SUBAGENTS_PROFILE` into the kernel env when `PTC_SUBAGENTS_PROFILE` is set (`src/python-session-manager.ts:1077-1104`); otherwise the child inherits the ambient env and pi-subagents uses its default path.
+No. There is no pi-profiles *package* dependency anywhere in pi-ptc-next. Kernels don't need profiles at all. Subagent spawning (via `pi_subagents`) needs a pi *profile directory* named `subagents` (`$PI_SUBAGENTS_PROFILE` or `~/.pi/agent/profiles/subagents`), which is resolved by pi-subagents itself, not by pi-profiles. The host only forwards `PI_SUBAGENTS_PROFILE` into the kernel env when `PTC_SUBAGENTS_PROFILE` is set (`src/python-session-manager.ts:1077-1104`); otherwise the child inherits the ambient env and pi-subagents uses its default path.
 
 ### Does it work without tmux?
 
@@ -69,13 +69,13 @@ Once `~/.cache/pi-ptc/python-env` exists, system python3 is no longer needed on 
 
 ### Why does installing pi_subagents fail with a git auth error?
 
-On first session start the extension creates `~/.cache/pi-ptc/python-env` (with `uv venv`, or `python3 -m venv` if uv is absent — the fallback is verified working, just slower) and clones pi-subagents from the default `https://git.quinntyx.dev/quinntyx/pi-subagents` into `~/.cache/pi-ptc/pi-subagents`, then editable-installs it. That host is anonymously clonable today, but if it ever isn't (or you point `PTC_SUBAGENTS_REPO_URL` at a private repo), non-interactive git can't prompt for credentials and the clone logs:
+On first session start the extension creates `~/.cache/pi-ptc/python-env` (with `uv venv`, or `python3 -m venv` if uv is absent — the fallback is verified working, just slower) and clones pi-subagents from the default `https://github.com/Quinntyx/pi-subagents` into `~/.cache/pi-ptc/pi-subagents`, then editable-installs it. If you point `PTC_SUBAGENTS_REPO_URL` at a repo that needs credentials, non-interactive git can't prompt and the clone logs something like:
 
 ```
-fatal: could not read Username for 'https://git.quinntyx.dev': No such device or address
+fatal: could not read Username for '<host>': No such device or address
 ```
 
-in `~/.cache/pi-ptc/subagents-sync.log`. The stamp `<pkg>/src/.ptc-subagents-sync.json` gets `"ok": false` and sync retries next session. **You will see nothing in chat** — the initial-clone failure is fire-and-forget and silent (`src/index.ts:1641`; only the clone-*update* path logs a warning, `src/subagents-env.ts:416`). Kernels and sessions work fine; the first symptom is a later cell dying with `ModuleNotFoundError: No module named 'pi_subagents'`. Check `~/.cache/pi-ptc/subagents-sync.log` when that happens. If you point `PTC_SUBAGENTS_REPO_URL` at a private repo, make sure your git credential helper can read it.
+in `~/.cache/pi-ptc/subagents-sync.log`. The stamp `<pkg>/src/.ptc-subagents-sync.json` gets `"ok": false` and sync retries next session. **A one-line `[PTC]` warning now appears at startup** when provisioning fails (details in `~/.cache/pi-ptc/subagents-sync.log`). Kernels and sessions work fine; without provisioning, the first symptom is a later cell dying with `ModuleNotFoundError: No module named 'pi_subagents'`. If you point `PTC_SUBAGENTS_REPO_URL` at a private repo, make sure your git credential helper can read it.
 
 A dev checkout at `~/docs/src/pi-subagents` (or `PTC_SUBAGENTS_SOURCE`) is preferred over the managed clone and skips git entirely.
 
@@ -170,7 +170,7 @@ Remove all of these (tested paths):
 - The extension: `pi remove <pkg>` (e.g. `pi remove git:github.com/Quinntyx/pi-ptc-next`, ~0.3s), and the `"packages"` entry it wrote in `settings.json` for local-path installs.
 - `PI_CODING_AGENT_DIR` tree (e.g. `/tmp/.../pi-home`) if you used a throwaway one.
 - `$HOME/.cache/pi-ptc` — the venv, the managed pi-subagents clone, `subagents-sync.log`, and the lock file.
-- `$HOME/.config/pi/profiles/subagents` if you created a subagents profile.
+- `$HOME/.pi/agent/profiles/subagents` if you created a subagents profile.
 - The repo copy, test notebooks, and `$HOME/.pi/pi-sock` sockets.
 
 Verified no orphans remained after cleanup (`ps aux` for `python-env/bin/python` came back empty).

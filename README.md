@@ -30,7 +30,7 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
 To remove: `pi remove git:github.com/Quinntyx/pi-ptc-next`.
 
-> **⚠️ Trust warning: no sandbox.** Python cells run as plain processes under your user account, with full access to your files and network — nothing is sandboxed or gated (the model's cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Use it only in repos you trust; never point it at untrusted code.
+> **⚠️ Yolo mode — no sandbox.** Pi itself runs tools with your full permissions, and so do these Python kernels: plain processes with full file/network access, nothing sandboxed or gated (cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Don't point it at untrusted code.
 
 ## Requirements
 
@@ -92,6 +92,8 @@ More: [docs/subagents.md](docs/subagents.md).
 - **Notebook library** — promote a working notebook with `promote_to_skill_notebook({ name })`, then start future kernels from it via `provision_kernel({ notebook: ..., source: "name" })` for reusable, pre-seeded workflows.
 
 More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom-tools.md](docs/custom-tools.md), [docs/notebook-library.md](docs/notebook-library.md).
+
+> Paths: this documentation writes `~/.pi/agent` (pi's default agent dir) everywhere. pi honors `PI_CODING_AGENT_DIR`; if you (or pi-profiles) set it, every path below that lives in the agent dir moves with it.
 
 ## Optional dependencies
 

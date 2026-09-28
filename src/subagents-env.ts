@@ -46,7 +46,7 @@ import { createHash } from "crypto";
 import { join } from "path";
 import { debugLog, logWarning } from "./utils";
 
-const DEFAULT_REPO_URL = "https://git.quinntyx.dev/quinntyx/pi-subagents";
+const DEFAULT_REPO_URL = "https://github.com/Quinntyx/pi-subagents";
 const DEV_SOURCE_DEFAULT = join(homedir(), "docs", "src", "pi-subagents");
 const LOCK_MAX_AGE_MS = 5 * 60 * 1000;
 /** Rotate subagents-sync.log once it exceeds this size (keeps one .1 backup). */

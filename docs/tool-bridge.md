@@ -154,6 +154,6 @@ Things that depend on the author's machine setup, and how to work around each:
 - **Private infrastructure is not involved.** The tool bridge itself is fully
   local (pipes between the host process and the Python subprocess). The
   pi-subagents feature has author-specific defaults (private git URL,
-  `~/docs/src/pi-subagents` checkout, `~/.config/pi/profiles/subagents`
+  `~/docs/src/pi-subagents` checkout, `~/.pi/agent/profiles/subagents`
   profile), but those affect subagent provisioning, not tool calls from
   Python.

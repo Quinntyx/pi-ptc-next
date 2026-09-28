@@ -49,7 +49,7 @@ export PTC_EXECUTION_TIMEOUT_MS=600000
 # Give the model a larger head/tail preview of cell output
 export PTC_OUTPUT_PREVIEW_CHARS=20000
 
-# Keep reusable notebooks somewhere other than ~/.config/pi/ptc-library
+# Keep reusable notebooks somewhere other than ~/.pi/agent/ptc-library
 export PTC_LIBRARY_DIR=~/notebooks/ptc-library
 
 # Debug logging while troubleshooting tool policy
@@ -112,7 +112,7 @@ enforcement.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `PTC_LIBRARY_DIR` | path (tilde-expanded) | `$PI_CODING_AGENT_DIR/ptc-library` | Reusable notebook library used by the notebook flows `/ptc` notebook flows (`resolveLibraryDir`, `src/python-session-manager.ts:992-1002`). `PI_CODING_AGENT_DIR` defaults to `~/.config/pi`. |
+| `PTC_LIBRARY_DIR` | path (tilde-expanded) | `$PI_CODING_AGENT_DIR/ptc-library` | Reusable notebook library used by the notebook flows `/ptc` notebook flows (`resolveLibraryDir`, `src/python-session-manager.ts:992-1002`). `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`. |
 | `PTC_EVALS_PATH` | path | `.pi/evals/ptc` | Root of the JSON eval/benchmark cases (`src/benchmark-runner.ts:175`); read directly, not part of `PtcSettings`. |
 | `PTC_PYTHON_EXECUTABLE` | path | *(unset)* | Interpreter used for every kernel, verbatim and with no existence check. Overrides the venv resolution below (`src/sandbox-manager.ts:35-38`). |
 
@@ -124,7 +124,7 @@ optional `pi_subagents` package (`src/subagents-env.ts`). Provisioning runs only
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `PTC_SUBAGENTS_REPO_URL` | URL | `https://git.quinntyx.dev/quinntyx/pi-subagents` | Where the provisioner clones pi-subagents from when no dev checkout is found. |
+| `PTC_SUBAGENTS_REPO_URL` | URL | `https://github.com/Quinntyx/pi-subagents` | Where the provisioner clones pi-subagents from when no dev checkout is found. |
 | `PTC_SUBAGENTS_SOURCE` | path | `~/docs/src/pi-subagents` (if it exists) | Dev checkout installed editable instead of the managed clone; only used when the directory actually contains a `pyproject.toml`. |
 | `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` | number | `24` | Minimum interval between syncs; a younger sync stamp in the extension clone skips re-sync. |
 | `PTC_SUBAGENTS_PROFILE` | path | *(unset)* | Forwarded to kernels as `PI_SUBAGENTS_PROFILE` around each spawn (`src/python-session-manager.ts:1077-1096`), telling `pi_subagents` which pi profile to launch subagent instances with. |
@@ -142,7 +142,7 @@ none (`PTC_CTX_LIMIT_FALLBACK`, `src/execution/subagent-panel.ts:8`).
 Items that assume the author's machine layout, and the workaround for each:
 
 - **Private forge as the pi-subagents source.** `PTC_SUBAGENTS_REPO_URL` defaults to
-  `https://git.quinntyx.dev/quinntyx/pi-subagents`, which is inaccessible outside the
+  `https://github.com/Quinntyx/pi-subagents`, which is inaccessible outside the
   author's network. On your machine the background provisioner fails with a logged warning
   and `import pi_subagents` is unavailable — nothing else breaks. To use subagents, set
   `PTC_SUBAGENTS_REPO_URL` to a URL you can clone (the provisioner shells out to plain
@@ -155,8 +155,8 @@ Items that assume the author's machine layout, and the workaround for each:
   a path that doesn't exist) to control which source is installed.
 - **`subagents` pi profile assumption.** When `PTC_SUBAGENTS_PROFILE` is set, subagents are
   launched with that pi profile directory; the pi-subagents package itself defaults to
-  `~/.config/pi/profiles/subagents`, which assumes you created a pi profile named exactly
-  `subagents` under `~/.config/pi/profiles/`. If you don't use pi profiles, leave
+  `~/.pi/agent/profiles/subagents`, which assumes you created a pi profile named exactly
+  `subagents` under the agent dir (`~/.pi/agent/profiles/`). If you don't use pi profiles, leave
   `PTC_SUBAGENTS_PROFILE` unset — kernels spawn with your environment unchanged.
 - **Venv and cache root under `~/.cache/pi-ptc`.** The provisioner creates
   `~/.cache/pi-ptc/python-env` (via `uv` if available, else `python3 -m venv`) and a managed
@@ -165,7 +165,7 @@ Items that assume the author's machine layout, and the workaround for each:
   never use subagents. Set `PTC_PYTHON_EXECUTABLE` to pin your own interpreter; the target
   must be Python ≥ 3.10 (kernels fail fast otherwise).
 - **pi agent-dir convention.** `PTC_LIBRARY_DIR`'s default assumes pi's
-  `$PI_CODING_AGENT_DIR`/`~/.config/pi` layout, and `PTC_EVALS_PATH`'s default `.pi/evals/ptc`
+  `$PI_CODING_AGENT_DIR`/`~/.pi/agent` layout, and `PTC_EVALS_PATH`'s default `.pi/evals/ptc`
   assumes a pi project with that directory. Set either variable explicitly if your layout
   differs.
 - **Sync stamp inside the extension clone.** The pi-subagents sync stamp lives at

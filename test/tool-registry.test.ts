@@ -16,7 +16,7 @@ function createStubTool(name, description) {
 function loadToolRegistryWithStubbedHost() {
   const originalLoad = Module._load;
   Module._load = function (request, parent, isMain) {
-    if (request === "@mariozechner/pi-coding-agent") {
+    if (request === "@earendil-works/pi-coding-agent") {
       return {
         createReadTool: () => createStubTool("read", "read"),
         createBashTool: () => createStubTool("bash", "bash"),

@@ -1,5 +1,5 @@
 import type { ChildProcess } from "child_process";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PtcExecutionTelemetry, PtcRecoveryDetails, PtcRecoveryState } from "../recovery-state";
 import type { ToolUpdateCallback } from "./tool-types";
 

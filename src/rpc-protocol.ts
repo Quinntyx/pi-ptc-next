@@ -1,6 +1,6 @@
 import { ChildProcess } from "child_process";
 import readline from "readline";
-import type { AgentToolUpdateCallback } from "@mariozechner/pi-coding-agent";
+import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import {
   PtcAbortError,
   PtcProtocolError,

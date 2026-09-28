@@ -8,7 +8,7 @@ The PTC notebook library is a directory of reusable, self-documenting Python wor
 
 1. The `libraryDir` field of `PtcSettings` — but note that this field is never populated from a settings file; the extension's settings are loaded purely from environment variables (`loadSettingsFromEnv()`, `src/utils.ts:63`), and it does not set `libraryDir`. It only matters for programmatic/SDK callers. For interactive use, the effective user-facing override is the next item.
 2. The `PTC_LIBRARY_DIR` environment variable (a leading `~` is expanded to your home directory).
-3. Otherwise: `<PI_CODING_AGENT_DIR>/ptc-library`, where `PI_CODING_AGENT_DIR` defaults to `~/.config/pi` — i.e. `~/.config/pi/ptc-library` on a default install.
+3. Otherwise: `<PI_CODING_AGENT_DIR>/ptc-library`, where `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent` — i.e. `~/.pi/agent/ptc-library` on a default install.
 
 The directory does not need to exist in advance; promotion creates it with `mkdir -p` semantics (`src/python-session-manager.ts:1437`).
 
@@ -43,13 +43,13 @@ The copy is complete: markdown, code cells, and outputs all survive, which is wh
 Discover what is available, then start a kernel from a workflow:
 
 ```bash
-ls ~/.config/pi/ptc-library/
+ls ~/.pi/agent/ptc-library/
 # code-review.ipynb  tmux-orchestration.ipynb  fetch-and-chart.py
 ```
 
 ```text
 provision_kernel({ notebook: "/tmp/work.ipynb", source: "code-review" })
-# Sourced from /home/you/.config/pi/ptc-library/code-review.ipynb.
+# Sourced from /home/you/.pi/agent/ptc-library/code-review.ipynb.
 # The copied markdown guidance and already-executed setup are in the notebook;
 # continue with exec_cell in the inherited namespace.
 ```
@@ -59,7 +59,7 @@ After a successful run worth keeping, polish the notebook's markdown and promote
 ```text
 promote_to_skill_notebook({ name: "My Review Workflow!" })
 # Promoted /tmp/work.ipynb to library notebook my-review-workflow at
-# /home/you/.config/pi/ptc-library/my-review-workflow.ipynb.
+# /home/you/.pi/agent/ptc-library/my-review-workflow.ipynb.
 ```
 
 Re-promoting over an existing name requires explicit consent:
@@ -76,7 +76,7 @@ Policy (from `skills/ptc-library/SKILL.md`): promote reusable, pre-approved appr
 | Setting | Meaning | Default |
 |---|---|---|
 | `PTC_LIBRARY_DIR` (env) | Library directory; `~` is expanded. Takes precedence over the agent-dir default. | unset |
-| `PI_CODING_AGENT_DIR` (env) | pi's agent directory; the library lives at `<agentDir>/ptc-library` when `PTC_LIBRARY_DIR` is unset. | `~/.config/pi` |
+| `PI_CODING_AGENT_DIR` (env) | pi's agent directory; the library lives at `<agentDir>/ptc-library` when `PTC_LIBRARY_DIR` is unset. | `~/.pi/agent` |
 | `libraryDir` (`PtcSettings` field, `src/contracts/settings.ts:21`) | Programmatic-only override; *not* read from any settings file, so interactive users should use `PTC_LIBRARY_DIR`. | unset |
 | `promote_to_skill_notebook.overwrite` | Allow replacing an existing library notebook of the same sanitized name. | `false` |
 
@@ -86,8 +86,8 @@ There is no dedicated settings file for this feature: the extension loads its se
 
 Everything in the library feature itself resolves from environment variables and pi's agent-dir convention — the source contains no author-specific absolute paths, private URLs, or profile names for this feature. Things to know on a machine without the author's setup:
 
-- **Library defaults to `~/.config/pi/ptc-library`.** This assumes pi's standard agent-dir layout (`$PI_CODING_AGENT_DIR` else `~/.config/pi`, `src/python-session-manager.ts:1002-1004`). If your pi data lives elsewhere, set `PI_CODING_AGENT_DIR`, or point `PTC_LIBRARY_DIR` directly at whatever directory you want (any path; `~` expansion supported). Bare-name `source` lookups only see files sitting directly in that resolved directory.
-- **No env var set and non-standard pi install?** The library is simply `~/.config/pi/ptc-library`; create it and drop `.ipynb` (or `.py`) files in, or set `PTC_LIBRARY_DIR` per-shell. The bundled `ptc-library` skill teaches the model to `ls` these same locations, so keeping the directory in one of the default spots makes discovery automatic.
+- **Library defaults to `~/.pi/agent/ptc-library`.** This assumes pi's standard agent-dir layout (`$PI_CODING_AGENT_DIR` else `~/.pi/agent`). If your pi data lives elsewhere, set `PI_CODING_AGENT_DIR`, or point `PTC_LIBRARY_DIR` directly at whatever directory you want (any path; `~` expansion supported). Bare-name `source` lookups only see files sitting directly in that resolved directory.
+- **No env var set and non-standard pi install?** The library is simply `~/.pi/agent/ptc-library`; create it and drop `.ipynb` (or `.py`) files in, or set `PTC_LIBRARY_DIR` per-shell. The bundled `ptc-library` skill teaches the model to `ls` these same locations, so keeping the directory in one of the default spots makes discovery automatic.
 - **Empty library = bare names don't resolve.** A bare `source` that matches nothing in the library silently falls back to being treated as a cwd-relative path (`src/python-session-manager.ts:1022-1024`), which will then fail as a missing file. If you get "could not read source", check whether the name actually exists in your resolved library directory.
 - **Promotion needs a notebook-backed kernel.** `promote_to_skill_notebook` without `notebookPath` uses the most recently used live notebook-backed session. Since `provision_kernel` *requires* a `.ipynb` destination, this is normally satisfied — but if the notebook-backed session was killed, pass `notebookPath` explicitly. The source must be a `.ipynb`; `.py` sessions cannot be promoted as notebooks.
 - **Multi-kernel caveat.** `read_cell_output` reads from the most recently used notebook-backed kernel's `.ipynb` (`src/index.ts:392-399`); with several kernels alive, a `cellIdx` may belong to a different kernel's notebook than the one you just executed in. Prefer one notebook-backed kernel per workflow.
