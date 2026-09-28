@@ -40,7 +40,7 @@ To remove: `pi remove git:github.com/Quinntyx/pi-pycells`.
 
 ### Python kernels with tool access
 
-You never manage kernels by hand — describe the work and the model provisions a kernel and runs cells:
+Describe the work; the model provisions a kernel and writes the cells:
 
 ```text
 > Count the TODO comments in every *.ts file under src/ and give me the
