@@ -26,7 +26,7 @@ import {
   type PtcRecoveryState,
 } from "./recovery-state";
 import { createSandbox } from "./sandbox-manager";
-import { ensureSubagentsEnv } from "./subagents-env";
+import { startSubagentsEnv } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
@@ -48,6 +48,7 @@ import {
   type CodeViewState,
 } from "./execution/code-view";
 import { relevantAgents, renderSubagentNotification, renderSubagentPanel } from "./execution/subagent-panel";
+import { renderNestedToolTree } from "./execution/tool-subtree";
 import { PythonSessionManager } from "./python-session-manager";
 import type {
   PythonSessionManagerHooks,
@@ -75,6 +76,12 @@ interface PartialRenderContext {
   state?: { viewStartLine?: number };
 }
 
+/**
+ * Build the model-visible executing-code view: a header with progress and the
+ * active nested tool, then a line-numbered viewport of the cell. For long
+ * cells (> CODE_VIEW_FULL_THRESHOLD lines) the viewport follows currentLine
+ * via the shared CodeViewState so scroll position persists across updates.
+ */
 function buildExecutingCodeLines(
   codeLines: string[],
   currentLine: number,
@@ -130,6 +137,7 @@ function buildExecutingCodeLines(
   return lines;
 }
 
+/** Render the executing-code view as a static TUI component. */
 function renderExecutingCode(
   codeLines: string[],
   currentLine: number,
@@ -182,6 +190,11 @@ function renderWorkflowRollup(details: ExecutionDetails | undefined, theme: Them
   return new Text(lines.join("\n"), 0, 0);
 }
 
+/**
+ * Render a finished exec result. Sectioned results render as rule-separated
+ * blocks (workflow rollup and subagent panel between return and kernel);
+ * legacy/sectionless output renders verbatim with a 25-line display cap.
+ */
 function renderCompletedOutput(
   resultText: string,
   details: ExecutionDetails | undefined,
@@ -216,7 +229,9 @@ function renderCompletedOutput(
   if (!sections) {
     // Legacy blob (stale runtime) or error text: render verbatim.
     const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
-    const subagentBlock = subagentLines.length > 0 ? `\n${subagentLines.join("\n")}\n` : "";
+    const toolLines = renderNestedToolTree(details.nestedCallRecords, theme);
+    const subagentBlock =
+      subagentLines.length + toolLines.length > 0 ? `\n${[...subagentLines, ...toolLines].join("\n")}\n` : "";
     const rawBody = resultText || "(No output)";
     const bodyLines = rawBody.split("\n");
     const maxDisplayLines = 25;
@@ -251,6 +266,11 @@ function renderCompletedOutput(
     addRule();
     container.addChild(new Text(subagentLines.join("\n"), 0, 0));
   }
+  const toolTreeLines = renderNestedToolTree(details.nestedCallRecords, theme);
+  if (toolTreeLines.length > 0) {
+    addRule();
+    container.addChild(new Text(toolTreeLines.join("\n"), 0, 0));
+  }
   if (kernel) {
     addRule();
     addSection(kernel.body);
@@ -262,12 +282,14 @@ function renderCompletedOutput(
   return container;
 }
 
+/** Extension root directory (parent of dist/ when loaded from the build output). */
 function getExtensionRoot(): string {
   return __dirname.endsWith("/dist") || __dirname.endsWith("\\dist")
     ? __dirname.replace(/[/\\]dist$/, "")
     : __dirname;
 }
 
+/** Lazily create the per-request recovery state held in session state. */
 function getRequestRecoveryState(sessionState: PtcSessionState): PtcRecoveryState {
   if (!sessionState.recoveryState) {
     sessionState.recoveryState = createPtcRecoveryState();
@@ -276,6 +298,7 @@ function getRequestRecoveryState(sessionState: PtcSessionState): PtcRecoveryStat
   return sessionState.recoveryState;
 }
 
+/** Wrap a recovery prompt as a displayable custom message injected into the next context. */
 function buildRecoveryContextMessage(content: string) {
   return {
     role: "custom" as const,
@@ -290,6 +313,11 @@ function buildRecoveryContextMessage(content: string) {
 // Tool descriptions
 // ============================================================================
 
+/**
+ * Build the model-facing helper contract embedded in exec_cell/inspect_kernel
+ * descriptions: the callable host tools and the Python helpers generated for
+ * them, plus the always-available ptc.* utilities.
+ */
 function buildToolDescription(callableTools: ToolInfo[]): string {
   const callableHelperLines = describePythonHelpers(callableTools);
   const callable = callableTools.map((tool) => tool.ptc?.pythonName || tool.name).join(", ") || "(none)";
@@ -310,6 +338,10 @@ ${helperList}
 Python runs as a local subprocess. Nested host-tool policy still applies.`;
 }
 
+/**
+ * Build the tool description for the current cwd, falling back to an empty
+ * callable list (with a warning) if registry lookup fails.
+ */
 function currentToolDescription(
   toolRegistry: ToolRegistry,
   settings: PtcSettings,
@@ -337,9 +369,9 @@ const EXEC_CELL_DESCRIPTION = `Execute a cell in a persistent Jupyter-like kerne
 
 - State persists: imports, variables, functions, and classes from earlier cells are still there — never re-import, never redefine; write each cell as the continuation of the live namespace.
 - The last bare expression of a cell is echoed automatically (Out[n] semantics) — no print/return needed to see a value.
-- Results are sectioned by the host so provenance is structural: 'output:' (everything the cell printed), 'return (Out[n]):' (the echoed value), 'kernel:' (namespace summary), 'subagents:' (pool progress, when pools exist). Section markers sit at column 0; everything indented under a marker was produced by the cell — a cell that prints "kernel:" stays inside its section and cannot impersonate one.
+- Results are sectioned by the host so provenance is structural: 'output:' (everything the cell printed), 'return (Out[n]):' (the echoed value), 'kernel:' (namespace summary), 'subagents:' (pool progress, when pools exist), 'tools:' (per-tool call counts when the cell bridged host tools). Section markers sit at column 0; everything indented under a marker was produced by the cell — a cell that prints "kernel:" stays inside its section and cannot impersonate one.
 - Top-level await works; do not call asyncio.run(...). Errors never kill the kernel — fix and retry in the same namespace.
-- Large results are shown as a head/tail preview. Use read_cell_output(cellIdx, offset?, limit?) to page through the full notebook-persisted output without re-running the cell.
+- Large results are shown as a head/tail preview. Use read_cell_output(cellIdx, kernel?, offset?, limit?) to page through the full notebook-persisted output without re-running the cell; kernel defaults to the most recently used kernel.
 - file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; tracebacks map to the real file). Prefer cells: the notebook on disk is already the durable record.
 - IPython magics (%timeit, !pip, ...) do not exist here — cells starting with % or ! are rejected before execution with the native equivalent.
 - confirm (optional): set true to ask the user for approval before running. The popup shows the full cell body in a Shiki-syntax-highlighted, scrollable viewport (PgUp/PgDn to scroll). Run most cells immediately; set confirm=true for destructive work. Never set it when the user said "run autonomously" or "don't prompt me". Approval/autonomy policy for orchestrated workflows: see the pi-subagents skill.
@@ -361,6 +393,7 @@ const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into the
 
 
 
+/** list_kernels tool: enumerate live kernels with ids, notebook paths, cell counts, busy state. */
 function listKernelsTool(sessionManager: PythonSessionManager): PtcToolDefinition {
   return withActivityLabel({
     name: "list_kernels",
@@ -389,23 +422,28 @@ function listKernelsTool(sessionManager: PythonSessionManager): PtcToolDefinitio
   });
 }
 
+/** read_cell_output tool: page through a cell's durable notebook output (1-based cellIdx, optional kernel). */
 function readCellOutputTool(sessionManager: PythonSessionManager): PtcToolDefinition {
   return withActivityLabel({
     name: "read_cell_output",
     label: "read output",
     description:
-      "Read the full durable output of a cell from the most recently used kernel's notebook. " +
+      "Read the full durable output of a cell from a kernel's notebook. Defaults to the most " +
+      "recently used kernel; pass kernel to target a specific one. " +
       "Cell numbers are 1-based and match Out[n], exec_cell previews, and inspect_kernel's cell count. " +
       "Use offset/limit to continue through large output, like the native read tool.",
     parameters: Type.Object({
       cellIdx: Type.Integer({ minimum: 1, description: "1-based notebook cell/execution number." }),
+      kernel: Type.Optional(
+        Type.String({ description: "Kernel/session id; defaults to the most recently used kernel." })
+      ),
       offset: Type.Optional(Type.Integer({ minimum: 1, description: "1-based output line to start reading." })),
       limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of output lines to return." })),
     }),
     execute: async (_toolCallId, params) => {
-      const { cellIdx, offset, limit } = params as { cellIdx: number; offset?: number; limit?: number };
+      const { cellIdx, kernel, offset, limit } = params as { cellIdx: number; kernel?: string; offset?: number; limit?: number };
       try {
-        const result = await sessionManager.readCellOutput(cellIdx, { offset, limit });
+        const result = await sessionManager.readCellOutput(cellIdx, { kernel, offset, limit });
         return {
           content: [{ type: "text", text: result.text }],
           details: result,
@@ -413,13 +451,14 @@ function readCellOutputTool(sessionManager: PythonSessionManager): PtcToolDefini
       } catch (error) {
         return {
           content: [{ type: "text", text: `read_cell_output failed: ${error instanceof Error ? error.message : String(error)}` }],
-          details: { cellIdx },
+          details: { cellIdx, kernel },
         };
       }
     },
   });
 }
 
+/** promote_to_skill_notebook tool: copy a session notebook into the PTC library. */
 function promoteToSkillNotebookTool(sessionManager: PythonSessionManager): PtcToolDefinition {
   return withActivityLabel({
     name: "promote_to_skill_notebook",
@@ -467,6 +506,7 @@ function promoteToSkillNotebookTool(sessionManager: PythonSessionManager): PtcTo
   });
 }
 
+/** inspect_kernel tool: structured digest of a kernel's user namespace (imports/defs/classes/vars/cells). */
 function inspectKernelTool(sessionManager: PythonSessionManager, toolDescription: string): PtcToolDefinition {
   return withActivityLabel({
     name: "inspect_kernel",
@@ -516,6 +556,7 @@ function inspectKernelTool(sessionManager: PythonSessionManager, toolDescription
   });
 }
 
+/** provision_dependency tool: uv pip install a distribution into the shared kernel environment. */
 function provisionDependencyTool(
   sessionManager: PythonSessionManager,
   sandboxManager: SandboxManager
@@ -587,10 +628,18 @@ interface PtcSessionState {
   lastCtx: ExtensionContext | null;
 }
 
+/** Order-sensitive list equality (used to avoid redundant setActiveTools calls). */
 function areToolListsEqual(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+/**
+ * If the prompt matches the routing heuristic, hide non-routable tools for
+ * this request, expose exec_cell/provision_kernel/read_cell_output, and append
+ * a routing nudge to the system prompt. Returns the systemPrompt change, or
+ * undefined when no routing happened. restoreActiveToolsAfterRouting undoes
+ * the tool swap at agent_end.
+ */
 function applyAutoRouting(
   pi: ExtensionAPI,
   toolRegistry: ToolRegistry,
@@ -636,6 +685,7 @@ function applyAutoRouting(
   };
 }
 
+/** Restore the pre-routing active tool set (no-op when routing never swapped it). */
 function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessionState): void {
   if (!sessionState.activeToolsBeforeRouting) {
     return;
@@ -660,6 +710,7 @@ interface ShikiToken {
   fontStyle?: number;
 }
 
+/** Convert a Shiki token's hex color to a truecolor ANSI foreground escape (null when not a #rrggbb string). */
 function hexToAnsiFg(hex: string): string | null {
   const match = /^#([0-9a-fA-F]{6})$/.exec(hex.trim());
   if (!match) return null;
@@ -667,6 +718,7 @@ function hexToAnsiFg(hex: string): string | null {
   return `\x1b[38;2;${(value >> 16) & 0xff};${(value >> 8) & 0xff};${value & 0xff}m`;
 }
 
+/** Map Shiki FontStyle bits (italic/bold/underline) to ANSI SGR escapes. */
 function tokenFontAnsi(fontStyle: number | undefined): string {
   // Shiki FontStyle bits: Italic = 1, Bold = 2, Underline = 4.
   let out = "";
@@ -678,6 +730,11 @@ function tokenFontAnsi(fontStyle: number | undefined): string {
 
 let highlighterPromise: Promise<any> | null = null;
 
+/**
+ * Lazily create the shared Shiki highlighter for the theme in PTC_CODE_THEME
+ * (default github-dark). Returns null when Shiki cannot load; a failure resets
+ * the memo so a later call can retry.
+ */
 function getHighlighter(): Promise<any> | null {
   if (!highlighterPromise) {
     const themeName = process.env.PTC_CODE_THEME || "github-dark";
@@ -696,7 +753,10 @@ function getHighlighter(): Promise<any> | null {
 
 const highlightCache = new Map<string, string[]>();
 
-/** Highlight Python cell code to ANSI-colored lines; null if highlighting is unavailable. */
+/**
+ * Highlight Python cell code to ANSI-colored lines for the approval popup,
+ * with a small clear-on-overflow cache; null when highlighting is unavailable.
+ */
 async function highlightCellCode(code: string): Promise<string[] | null> {
   const cached = highlightCache.get(code);
   if (cached) return cached;
@@ -728,13 +788,14 @@ async function highlightCellCode(code: string): Promise<string[] | null> {
 }
 
 // ============================================================================
-// Tools
-// ============================================================================
-
-// ============================================================================
 // Cell approval gate (exec_cell confirm=true)
-// ============================================================================"""
+// ============================================================================
 
+/**
+ * Run a command with a wall-clock timeout and abort-signal support
+ * (SIGTERM on abort/timeout). Rejects with messages distinguishing ENOENT,
+ * timeout/kill, and nonzero exit, including captured output.
+ */
 function execFilePtc(
   command: string,
   args: string[],
@@ -802,11 +863,13 @@ function execFilePtc(
   });
 }
 
+/** Model's approve/reject decision for a confirm=true cell. */
 interface CellApprovalDecision {
   action: "approve" | "reject";
   note?: string;
 }
 
+/** The three choices offered in the cell approval popup. */
 const CELL_APPROVAL_OPTIONS = [
   { value: "approve", label: "Approve — run this cell" },
   { value: "reject", label: "Reject — do not run it" },
@@ -1009,6 +1072,7 @@ async function requestCellApproval(
 
 
 
+/** provision_kernel tool: spawn a persistent notebook-backed kernel (optionally sourcing a workflow). */
 function provisionKernelTool(
   sessionManager: PythonSessionManager,
   sessionState: PtcSessionState
@@ -1108,6 +1172,7 @@ function provisionKernelTool(
   });
 }
 
+/** exec_cell tool: run one cell in a persistent kernel, with confirmation gate, preview collapsing, recovery, and subagent streaming. */
 function execCellTool(
   pi: ExtensionAPI,
   sessionManager: PythonSessionManager,
@@ -1322,6 +1387,11 @@ function execCellTool(
           lines.push("");
           lines.push(...subagentLines);
         }
+        const toolTreeLines = renderNestedToolTree(details.nestedCallRecords, theme);
+        if (toolTreeLines.length > 0) {
+          lines.push("");
+          lines.push(...toolTreeLines);
+        }
         return new Text(lines.join("\n"), 0, 0);
       }
 
@@ -1336,9 +1406,47 @@ function execCellTool(
 }
 
 // ============================================================================
+// /workflow command
+// ============================================================================
+
+const WORKFLOW_PROMPT = `The user wants to run a task as an orchestrated subagent workflow (they invoked /workflow).
+
+Load the bundled pi-subagents skill (skills/pi-subagents/SKILL.md) and read it fully before doing anything else. Then reason about the user's request above and design the best workflow for it:
+
+1. Decompose the request into agent-sized units and decide the stages (audit/build/review/synth as appropriate), how many subagents per stage, and what each agent's precise, self-contained task brief is.
+2. Decide termination: linear fan-out vs. a review/fix cycle (gate any cycle on a metadata rounds cap).
+3. Pick the model for each stage and set thinking levels appropriate to the work.
+4. Provision a throwaway kernel with provision_kernel (use a /tmp notebook path unless the user asked for a durable notebook), define the tasks, build the AgentPool, submit, and consume results in completion order in ONE exec_cell cell.
+5. Feed results forward yourself: parse structured results in Python and restate them as prose in the next agent's prompt — never paste raw JSON between agents.
+
+If the request is too small to warrant a workflow (a single agent would do), say so and just do the work directly instead.
+
+User request: `;
+
+/** Register the /workflow command: injects the subagent-workflow design prompt as a follow-up message. */
+function registerWorkflowCommand(pi: ExtensionAPI): void {
+  pi.registerCommand("workflow", {
+    description: "Kick off a subagent workflow: has the model load the pi-subagents skill and design a workflow from your request",
+    handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
+      const request = (args ?? "").trim();
+      if (!request) {
+        ctx.ui.notify("usage: /workflow <request to turn into a subagent workflow>", "error");
+        return;
+      }
+      await pi.sendUserMessage(WORKFLOW_PROMPT + request, { deliverAs: "followUp" });
+    },
+  });
+}
+
+// ============================================================================
 // /ptc command
 // ============================================================================
 
+/**
+ * Resolve the session a /ptc action targets: an explicit id, else the most
+ * recently targeted foreground session, else the most recent active, else the
+ * first live session. Returns { error } when nothing qualifies.
+ */
 function resolveTargetSession(
   sessionManager: PythonSessionManager,
   sessionState: PtcSessionState,
@@ -1357,6 +1465,7 @@ function resolveTargetSession(
   return target ?? { error: "No python sessions. Provision one with provision_kernel first." };
 }
 
+/** Register the /ptc command (interrupt|stop|kill [session_id]; bg/fg are WIP-deferred). */
 function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManager, sessionState: PtcSessionState): void {
   pi.registerCommand("ptc", {
     description: "Control PTC Python kernels: /ptc <interrupt|kill> [session_id]",
@@ -1412,6 +1521,7 @@ function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManag
 
 const SUBAGENT_RUNTIME_KEY = Symbol.for("pi-ptc:subagent-runtime");
 
+/** Snapshot shape published on globalThis for other extensions (see createSubagentRuntime). */
 interface SubagentRuntimeApi {
   getSnapshot(): {
     sessions: Array<{ sessionId: string; snapshot: SubagentRuntimeSnapshot }>;
@@ -1420,6 +1530,12 @@ interface SubagentRuntimeApi {
   subscribe(listener: (payload: { sessionId: string; snapshot: SubagentRuntimeSnapshot }) => void): () => void;
 }
 
+/**
+ * GlobalThis-published API (key: Symbol.for("pi-ptc:subagent-runtime")) letting
+ * other extensions observe PTC subagent pools without a cross-package import:
+ * current per-session snapshots plus running/settled/failed totals, and a
+ * listener subscription for snapshot updates.
+ */
 function createSubagentRuntime(sessionManager: PythonSessionManager): SubagentRuntimeApi {
   const listeners = new Set<(payload: { sessionId: string; snapshot: SubagentRuntimeSnapshot }) => void>();
 
@@ -1456,6 +1572,10 @@ function createSubagentRuntime(sessionManager: PythonSessionManager): SubagentRu
   };
 }
 
+/**
+ * Update the status-bar subagent indicator (unless disabled or headless):
+ * counts of running/done agents relevant to the given exec, cleared when none.
+ */
 function updateSubagentFooter(
   sessionState: PtcSessionState,
   settings: PtcSettings,
@@ -1487,6 +1607,7 @@ function updateSubagentFooter(
 // Event handlers
 // ============================================================================
 
+/** session_start: scan custom tools, then (re)register all PTC tools. */
 async function handleSessionStart(
   customToolManager: CustomToolManager,
   sessionState: PtcSessionState,
@@ -1514,6 +1635,11 @@ async function handleSessionStart(
   pi.registerTool(provisionDependencyTool(sessionManager, sandboxManager));
 }
 
+/**
+ * before_agent_start: reset per-request recovery state, decide whether
+ * automatic recovery is allowed (mutation prompts disallow it), apply prompt
+ * routing, and add a depth note to the system prompt for subagent instances.
+ */
 function handleBeforeAgentStart(
   pi: ExtensionAPI,
   toolRegistry: ToolRegistry,
@@ -1543,6 +1669,10 @@ function handleBeforeAgentStart(
   return result;
 }
 
+/**
+ * context: inject a pending recovery prompt (if any) as an extra message and
+ * clear it — one recovery nudge per request.
+ */
 function handleContext(sessionState: PtcSessionState, event: { messages: Array<Record<string, unknown>> }) {
   if (!sessionState.pendingRecoveryPrompt) {
     return undefined;
@@ -1553,6 +1683,10 @@ function handleContext(sessionState: PtcSessionState, event: { messages: Array<R
   return { messages };
 }
 
+/**
+ * tool_result: on a failed exec_cell, stamp recovery telemetry/details onto the
+ * result so the transcript records what the recovery system observed.
+ */
 function handleToolResult(
   sessionState: PtcSessionState,
   event: { toolName: string; isError: boolean; details?: unknown }
@@ -1573,6 +1707,7 @@ function handleToolResult(
   };
 }
 
+/** agent_end: restore routed-away tools and clear per-request recovery state. */
 function handleAgentEnd(pi: ExtensionAPI, sessionState: PtcSessionState): void {
   restoreActiveToolsAfterRouting(pi, sessionState);
   sessionState.pendingRecoveryPrompt = null;
@@ -1580,6 +1715,7 @@ function handleAgentEnd(pi: ExtensionAPI, sessionState: PtcSessionState): void {
   sessionState.recoveryState = null;
 }
 
+/** session_shutdown: close custom tools, dispose all kernels, clean the sandbox. */
 async function handleSessionShutdown(
   customToolManager: CustomToolManager,
   sandboxManager: SandboxManager,
@@ -1594,6 +1730,13 @@ async function handleSessionShutdown(
 // Extension entry
 // ============================================================================
 
+/**
+ * PTC extension entry point: load settings from env, create the sandbox,
+ * construct the kernel manager (disposing any manager left by a previous
+ * extension instance), publish the subagent runtime, kick off background
+ * pi_subagents env provisioning, and register commands, tools, and event
+ * handlers.
+ */
 export default async function ptcExtension(pi: ExtensionAPI, context?: ExtensionContext) {
   const settings = loadSettingsFromEnv();
   const extensionRoot = getExtensionRoot();
@@ -1638,12 +1781,14 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   // lives inside this package's clone, so `pi update` (which resets and cleans
   // the clone) triggers a fresh sync on the next session start.
   if (!process.env.PI_SUBAGENT_DEPTH) {
-    void ensureSubagentsEnv({ extensionRoot }).catch((error) => {
-      debugLog("pi_subagents provisioning failed", String(error));
-    });
+    // Memoized and shared: the session manager's readiness gate awaits this
+    // same promise before its first kernel spawn, so a first-install kernel
+    // does not lock in system python3 while packages land in the venv.
+    void startSubagentsEnv({ extensionRoot });
   }
 
   registerPtcCommand(pi, sessionManager, sessionState);
+  registerWorkflowCommand(pi);
 
   const onToolSetChanged = () => {
     // During initial startup handleSessionStart registers all tools once after

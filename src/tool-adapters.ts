@@ -9,6 +9,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Concatenate the `text` items of a tool result's content array (non-text items contribute nothing). */
 function extractTextContent(result: ToolExecutionResult): string {
   const content = Array.isArray(result.content) ? result.content : [];
   return content
@@ -21,6 +22,10 @@ function extractTextContent(result: ToolExecutionResult): string {
     .join("");
 }
 
+/**
+ * Rough size of a value in characters (strings count directly, everything else
+ * is its JSON serialization; non-serializable values fall back to String()).
+ */
 function estimateChars(value: unknown): number {
   if (typeof value === "string") {
     return value.length;
@@ -40,6 +45,7 @@ function estimateChars(value: unknown): number {
 const TRUNCATION_NOTICE_LINE_RE =
   /^\[(?:Showing lines \d|Use offset=|\d+ more lines in file|\d+ (?:results|entries|matches) limit reached|\d[\d.]*[KMG]?B limit reached|Some lines truncated to \d+ chars|Output truncated\b)/;
 
+/** Split into trimmed non-empty lines, dropping the given sentinel strings and pi truncation notices. */
 function splitNonEmptyLines(text: string, emptyMarkers: string[] = []): string[] {
   const trimmed = text.trim();
   if (!trimmed || emptyMarkers.includes(trimmed)) {
@@ -109,6 +115,11 @@ function parseGrepLineRelativeTo(line: string, filePath: string): ParsedGrepMatc
   return null;
 }
 
+/**
+ * Best-effort parse of one grep output line without a known file anchor.
+ * Match lines anchor on the last `:<digits>:` and context lines on the last
+ * `-<digits>-`; returns null when the line fits neither shape.
+ */
 function parseGrepLineGeneric(line: string): ParsedGrepMatch | null {
   // Match lines: anchor on the LAST `:<digits>:` so paths containing
   // hyphen-digit segments (`v2-2024-report.md:12: x`) are not split early.
@@ -137,6 +148,11 @@ function parseGrepLineGeneric(line: string): ParsedGrepMatch | null {
   return null;
 }
 
+/**
+ * Parse pi's grep text output back into structured matches: continuation lines
+ * are resolved against the most recently confirmed path, and "No matches found"
+ * yields an empty list.
+ */
 function parseGrepMatches(text: string): Array<Record<string, unknown>> {
   const trimmed = text.trim();
   if (!trimmed || trimmed === "No matches found") {
@@ -166,6 +182,14 @@ function parseGrepMatches(text: string): Array<Record<string, unknown>> {
   return matches;
 }
 
+/**
+ * Convert a host tool result into the plain JSON value a cell receives via the
+ * RPC bridge. Results carrying `details.ptcValue` pass through untouched; known
+ * builtin tools get typed shapes (find/ls → string lists, grep → {matches,
+ * matchLimitReached}, bash → {stdout, stderr, exitCode}, edit/write → summaries
+ * with optional diff); anything else degrades to its raw text. `estimatedChars`
+ * is the approximate serialized size of `value`.
+ */
 export function normalizeToolResult(toolName: string, result: ToolExecutionResult): NormalizedToolResult {
   if (isRecord(result.details) && "ptcValue" in result.details) {
     const ptcValue = result.details.ptcValue;

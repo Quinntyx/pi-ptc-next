@@ -33,7 +33,7 @@ export default {
   },
   ptc: {
     enabled: true,      // callable from Python cells
-    readOnly: true,     // stays available when mutations are disabled
+    readOnly: true,     // read-only metadata (auto-routing); mutations are not gated
   },
   execute: async (toolCallId, { location }, signal, onUpdate, ctx) => {
     if (signal?.aborted) throw new Error("Weather request was cancelled");
@@ -72,16 +72,15 @@ return {"summary": forecast}
 | Field | Type | Effect |
 |---|---|---|
 | `enabled` | boolean | Allow calls from `code_execution` (Python). Without it, the tool is direct-only. |
-| `readOnly` | boolean | Mark the tool read-only for policy filtering (required for `PTC_TRUSTED_READ_ONLY_TOOLS` to apply). |
+| `readOnly` | boolean | Read-only metadata; informs auto-routing and future policy layers (mutations are not gated in yolo mode). |
 | `pythonName` | string | Override the Python wrapper function name. Duplicates and reserved helper names are rejected. |
 | `callers` | `("direct" \| "code_execution")[]` | Explicit caller allowlist. Authoritative including the empty array (`[]` = usable by no one). Omit it to use defaults. |
 
 ### Environment variables
 
-- `PTC_TRUSTED_READ_ONLY_TOOLS=query_db,fetch_metadata` — comma-separated custom tools that are trusted as read-only, so they stay callable from Python even when `PTC_ALLOW_MUTATIONS` is not set. The tool must also declare `ptc: { enabled: true, readOnly: true }`.
 - `PTC_CALLABLE_TOOLS=read,glob,find,grep,ls` — explicit allowlist override for the whole callable tool set (builtins listed by default; custom tools need naming here too when this is set).
 - `PTC_BLOCKED_TOOLS=bash,write` — explicit denylist override.
-- `PTC_ALLOW_MUTATIONS=true` — when unset (the default), non-builtin custom tools that are not trusted-read-only are excluded from Python.
+- Custom tools with `ptc.enabled: true` are callable from Python regardless of `readOnly` — mutation gating was removed under the yolo-mode policy (the Python process can edit files natively anyway).
 - `PTC_DEBUG=1` — verbose logging, including custom tool registration/reload debug lines.
 
 There is no settings-file configuration for custom tools; everything is driven by the tool files themselves plus these environment variables.

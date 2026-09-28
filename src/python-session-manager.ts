@@ -13,6 +13,8 @@ import {
 } from "./execution/execution-errors";
 import { normalizeToolResult } from "./tool-adapters";
 import { sectionize } from "./utils";
+import { existsSync } from "fs";
+import { venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
 import { buildSessionPrelude } from "./execution/session-prelude";
 import { loadPythonRuntimeSources } from "./execution/runtime-assets";
 import type {
@@ -47,12 +49,14 @@ export type {
 
 export class PythonSessionError extends Error {}
 
+/** A sourcing (provision-time prefix-cell) failure, recorded against the copied cell. */
 export interface SourceExecutionError {
   cellIdx: number;
   message: string;
   traceback?: string;
 }
 
+/** Result of copying a session notebook into the reusable PTC library. */
 export interface SkillNotebookPromotionResult {
   name: string;
   path: string;
@@ -60,6 +64,7 @@ export interface SkillNotebookPromotionResult {
   overwritten: boolean;
 }
 
+/** Thrown when an operation names a session id that is not live; the message lists live ids. */
 export class UnknownSessionError extends PythonSessionError {
   constructor(public requestedId: string, availableIds: string[]) {
     super(
@@ -95,6 +100,12 @@ const INTERRUPT_GRACE_MS = 5_000;
 
 type InterruptKind = "abort" | "timeout";
 
+/**
+ * One long-lived interpreter subprocess speaking the persistent NDJSON
+ * protocol (exec / tool_call / exec_done frames). Tracks per-exec state,
+ * serializes one exec at a time, routes nested tool calls, and applies
+ * Ctrl-C-style interrupts with a forced-kill fallback.
+ */
 class PersistentSessionProtocol {
   private stdout = "";
   private stderr = "";
@@ -120,6 +131,9 @@ class PersistentSessionProtocol {
   private execTimeoutMs?: number;
   private nestedToolCalls = 0;
   private nestedToolNames: string[] = [];
+  // Per-call records for the model/user-facing tool subtree (name, one-line
+  // target summary, outcome). Reset at the start of each exec.
+  private nestedCallRecords: Array<{ name: string; target?: string; ok: boolean; ms: number }> = [];
   private nestedResultChars = 0;
   private nestedResultCount = 0;
   private nestedErrors = 0;
@@ -239,6 +253,7 @@ class PersistentSessionProtocol {
       execId: this.execId,
       nestedToolCalls: this.nestedToolCalls,
       nestedToolNames: [...this.nestedToolNames],
+      nestedCallRecords: [...this.nestedCallRecords],
       nestedResultChars: this.nestedResultChars,
       nestedResultCount: this.nestedResultCount,
       nestedErrors: this.nestedErrors,
@@ -300,6 +315,7 @@ class PersistentSessionProtocol {
         this.nestedToolCalls += 1;
         this.nestedToolNames.push(tool);
         this.activeTool = tool;
+        const callStartedAt = Date.now();
         this.emitUpdate();
         try {
           const result = await this.runTool(tool, msg.params, callId);
@@ -309,9 +325,21 @@ class PersistentSessionProtocol {
           );
           this.nestedResultChars += normalized.estimatedChars;
           this.nestedResultCount += 1;
+          this.nestedCallRecords.push({
+            name: tool,
+            target: summarizeToolTarget(msg.params),
+            ok: true,
+            ms: Date.now() - callStartedAt,
+          });
           this.send({ type: "tool_result", id: callId, value: normalized.value });
         } catch (error) {
           this.nestedErrors += 1;
+          this.nestedCallRecords.push({
+            name: tool,
+            target: summarizeToolTarget(msg.params),
+            ok: false,
+            ms: Date.now() - callStartedAt,
+          });
           this.send({
             type: "tool_result",
             id: callId,
@@ -348,12 +376,14 @@ class PersistentSessionProtocol {
         const echo = typeof msg.echo === "string" ? msg.echo : undefined;
         const kernelText = typeof msg.kernel_text === "string" ? msg.kernel_text : undefined;
         const subagentsText = typeof msg.subagents_text === "string" ? msg.subagents_text : undefined;
-        const sectioned = echo !== undefined || kernelText !== undefined || subagentsText !== undefined;
+        const toolsText = typeof msg.tools_text === "string" ? msg.tools_text : undefined;
+        const sectioned = echo !== undefined || kernelText !== undefined || subagentsText !== undefined || toolsText !== undefined;
         this.finish({
           output: this.buildFinalOutput(finalOutput, {
             echo,
             kernelText,
             subagentsText,
+            toolsText,
             cellIdx,
           }),
           images: (msg.images as never[] | undefined) ?? undefined,
@@ -556,9 +586,9 @@ class PersistentSessionProtocol {
    */
   private buildFinalOutput(
     finalText: string,
-    sections?: { echo?: string; kernelText?: string; subagentsText?: string; cellIdx?: number }
+    sections?: { echo?: string; kernelText?: string; subagentsText?: string; toolsText?: string; cellIdx?: number }
   ): string {
-    if (!sections || (sections.echo === undefined && sections.kernelText === undefined && sections.subagentsText === undefined)) {
+    if (!sections || (sections.echo === undefined && sections.kernelText === undefined && sections.subagentsText === undefined && sections.toolsText === undefined)) {
       return this.stdout ? `${this.stdout}${finalText}`.trim() : finalText;
     }
     const parts: string[] = [];
@@ -576,6 +606,7 @@ class PersistentSessionProtocol {
     }
     if (sections.kernelText?.trim()) parts.push(sectionize("kernel", sections.kernelText));
     if (sections.subagentsText?.trim()) parts.push(sectionize("subagents", sections.subagentsText));
+      if (sections.toolsText?.trim()) parts.push(sectionize("tools", sections.toolsText));
     if (parts.length === 0) return finalText;
     return parts.join("\n");
   }
@@ -623,6 +654,7 @@ class PersistentSessionProtocol {
     this.totalLines = undefined;
     this.activeTool = undefined;
     this.lastSubagentSnapshot = undefined;
+    this.nestedCallRecords = [];
 
     const sourcePath = this.cellFile;
     const sourceCellIndex = this.sourceCellIndex;
@@ -652,6 +684,7 @@ class PersistentSessionProtocol {
     return promise;
   }
 
+  /** The id of the exec currently in flight, or null when idle. */
   currentExecId(): string | null {
     return this.execResolve ? this.execId : null;
   }
@@ -738,6 +771,11 @@ class PersistentSessionProtocol {
     this.initialCellCount = initialCellCount;
   }
 
+  /**
+   * End the protocol: close stdin (so the interpreter's reader sees EOF) and
+   * stop consuming stdout. Does not kill the process — termination is the
+   * manager's terminateSession job.
+   */
   async dispose(): Promise<void> {
     this.clearExecTimeout();
     try {
@@ -856,6 +894,32 @@ function extractNotebookCellOutput(cell: Record<string, unknown>): string {
   return parts.join(parts.length > 1 ? "\n\n" : "");
 }
 
+/**
+ * One-line identifying summary of a bridged tool call's primary parameter
+ * (path, pattern, command, ...) for the tool subtree renderer.
+ */
+function summarizeToolTarget(params: unknown): string | undefined {
+  try {
+    if (!params || typeof params !== "object") return undefined;
+    const record = params as Record<string, unknown>;
+    const preferred = ["path", "file_path", "pattern", "command", "notebook", "name", "query"];
+    for (const key of preferred) {
+      const value = record[key];
+      if (typeof value === "string" && value.trim()) return truncateTarget(value.trim());
+    }
+    for (const value of Object.values(record)) {
+      if (typeof value === "string" && value.trim()) return truncateTarget(value.trim());
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function truncateTarget(value: string): string {
+  return value.length > 48 ? `${value.slice(0, 47)}...` : value;
+}
+
 interface SessionRecord {
   id: string;
   notebookPath?: string;
@@ -877,9 +941,17 @@ interface SessionRecord {
   sourcedFrom?: string;
 }
 
+/**
+ * Owns the set of live persistent Python kernels: provisioning (optionally
+ * sourcing a notebook/script), serialized foreground exec, notebook-backed
+ * cell output reads, script export/promotion, subagent snapshot fan-out, and
+ * lifecycle (interrupt/kill/dispose).
+ */
 export class PythonSessionManager {
   private sessions = new Map<string, SessionRecord>();
   private recency: string[] = [];
+  /** Set after the first provision() has waited (once) for venv provisioning. */
+  private envGateSettled = false;
 
   constructor(
     private sandboxManager: SandboxManager,
@@ -889,6 +961,11 @@ export class PythonSessionManager {
     private hooks: PythonSessionManagerHooks = {}
   ) {}
 
+  /**
+   * Live sessions sorted most-recently-used first. `chunks` counts user-visible
+   * cells: copied prefix cells plus user-executed chunks (provisioning retry
+   * chunks excluded).
+   */
   list(): SessionSummary[] {
     return [...this.sessions.values()]
       .sort((a, b) => this.recencyIndex(b.id) - this.recencyIndex(a.id))
@@ -907,14 +984,17 @@ export class PythonSessionManager {
     return index === -1 ? -1 : index;
   }
 
+  /** Whether a session id is live. */
   get(id: string): boolean {
     return this.sessions.has(id);
   }
 
+  /** Latest subagent snapshot recorded for one session, or null. */
   getSubagentSnapshot(sessionId: string): SubagentRuntimeSnapshot | null {
     return this.sessions.get(sessionId)?.latestSnapshot ?? null;
   }
 
+  /** Most recent non-null subagent snapshot across all sessions (MRU order). */
   latestSubagentSnapshot(): SubagentRuntimeSnapshot | null {
     for (let index = this.recency.length - 1; index >= 0; index--) {
       const snapshot = this.sessions.get(this.recency[index])?.latestSnapshot;
@@ -934,17 +1014,27 @@ export class PythonSessionManager {
     return record.protocol.inspectKernel(options.timeoutMs);
   }
 
-  /** Read a 1-based cell output from the most recently used kernel's notebook. */
+  /** Read a 1-based cell output from a kernel's notebook (default: most recently used). */
   async readCellOutput(
     cellIdx: number,
-    options: { offset?: number; limit?: number } = {}
+    options: { kernel?: string; offset?: number; limit?: number } = {}
   ): Promise<{ text: string; notebookPath: string; cellIdx: number }> {
     if (!Number.isInteger(cellIdx) || cellIdx < 1) {
       throw new PythonSessionError("cellIdx must be a positive 1-based integer");
     }
-    const record = [...this.sessions.values()]
-      .filter((session) => !session.killed && session.notebookPath)
-      .sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0];
+    let record: SessionRecord | undefined;
+    if (options.kernel) {
+      record = this.sessions.get(options.kernel);
+      if (!record) {
+        const live = this.list().map((s) => s.id).join(", ") || "(none)";
+        throw new PythonSessionError(`unknown kernel ${options.kernel} (live kernels: ${live})`);
+      }
+    } else {
+      // Default: the most recently used notebook-backed kernel.
+      record = [...this.sessions.values()]
+        .filter((session) => !session.killed && session.notebookPath)
+        .sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0];
+    }
     if (!record?.notebookPath) {
       throw new PythonSessionError("no notebook-backed kernel is available");
     }
@@ -989,6 +1079,10 @@ export class PythonSessionManager {
     return result;
   }
 
+  /**
+   * Resolve the PTC notebook library directory: settings.libraryDir, then
+   * PTC_LIBRARY_DIR (both `~/`-expanded), then `<pi agent dir>/ptc-library`.
+   */
   resolveLibraryDir(): string {
     const configured = this.settings.libraryDir?.trim() || process.env.PTC_LIBRARY_DIR?.trim();
     if (configured) {
@@ -1104,6 +1198,14 @@ export class PythonSessionManager {
     }
   }
 
+  /**
+   * Spawn and ready a persistent kernel. `notebookPath` (required for a
+   * durable record) is bound to the kernel; `source` (.ipynb or .py) is copied
+   * to the destination and its code cells executed as prefix cells before
+   * returning; `script` runs as one legacy seeding cell. Sourcing/script
+   * failures do not throw — they are returned as sourceError/scriptError and
+   * the kernel stays usable.
+   */
   async provision(options: {
     cwd: string;
     ctx: ExtensionContext;
@@ -1121,6 +1223,19 @@ export class PythonSessionManager {
   }> {
     // Back-burner: limit disabled 2026-09-26 — revisit for provisioning churn per docs/BACK-BURNER.md §2
     // Keep maxPythonSessions parsing for compatibility, but do not reject new kernels here.
+
+    // Venv readiness gate: on a fresh install the background pi_subagents
+    // provisioning may still be creating the shared venv. Wait (bounded) for
+    // it to settle before the first spawn, so resolvePythonExecutable() picks
+    // the venv instead of locking the session onto system python3 while
+    // provisioned packages live elsewhere. Skipped when the interpreter is
+    // pinned or the venv already exists.
+    if (!this.envGateSettled) {
+      this.envGateSettled = true;
+      if (!process.env.PTC_PYTHON_EXECUTABLE && !existsSync(venvPythonPath())) {
+        await waitForSubagentsEnv();
+      }
+    }
 
     const sessionId = randomUUID().replace(/-/g, "").slice(0, 12);
     const { cwd } = options;
@@ -1255,7 +1370,6 @@ export class PythonSessionManager {
     return { id: sessionId, sourcedFrom: preparedSource?.path, sourceError, scriptError };
   }
 
-  /** Foreground exec: serialized per session, streams updates, blocks. */
   /**
    * Foreground exec: serialized per session. pi may dispatch several exec_cell
    * calls in one assistant message (parallel tool calls), and a session has one
@@ -1317,6 +1431,11 @@ export class PythonSessionManager {
     return true;
   }
 
+  /**
+   * Run one chunk inside a session: validate user code (sourced library cells
+   * are exempt), bump recency, wire the abort signal to a Ctrl-C-style
+   * interrupt, and await the protocol's result.
+   */
   private async execChunk(
     record: SessionRecord,
     code: string,
@@ -1498,6 +1617,7 @@ export class PythonSessionManager {
     return this.list().find((session) => session.running) ?? null;
   }
 
+  /** Kill one session: end the protocol, then SIGTERM → SIGKILL the process. */
   async dispose(sessionId: string): Promise<void> {
     const record = this.sessions.get(sessionId);
     if (!record) {
@@ -1538,10 +1658,12 @@ export class PythonSessionManager {
     forceKill.unref?.();
   }
 
+  /** Dispose every live session (used at session shutdown / extension reload). */
   async disposeAll(): Promise<void> {
     await Promise.all([...this.sessions.keys()].map((id) => this.dispose(id)));
   }
 
+  /** Look up a live session or throw UnknownSessionError listing live ids. */
   private require(sessionId: string): SessionRecord {
     const record = this.sessions.get(sessionId);
     if (!record) {

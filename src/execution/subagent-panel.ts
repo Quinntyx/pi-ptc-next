@@ -1,4 +1,5 @@
 import type { Theme, ThemeColor } from "@mariozechner/pi-coding-agent";
+import { shimmerText } from "./shimmer";
 import type {
   SubagentAgentRow,
   SubagentPoolStageState,
@@ -19,14 +20,14 @@ function subdued(theme: Theme | undefined, text: string): string {
 }
 
 /**
- * Shimmer sweep for a running action word, shared with the activity tree's label
- * sweep. It renders muted when that extension is absent.
+ * Shimmer sweep for a running action word. Uses the vendored painter
+ * (`./shimmer.ts`, ported from pi-tool-tree) so the animation is identical
+ * with or without that extension; falls back to muted paint without a theme.
  */
 function shimmerWord(word: string, theme: Theme): string {
   if (!word) return "";
-  const activity = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
-  if (typeof activity?.shimmerText === "function") return activity.shimmerText(word, theme);
-  return theme.fg("muted", word);
+  if (!theme) return word;
+  return shimmerText(word, theme);
 }
 
 function isDone(agent: SubagentAgentRow): boolean {
@@ -302,6 +303,12 @@ function renderSubagentFan(
   return lines;
 }
 
+/**
+ * Render the live subagent panel for the transcript: per-group headers with
+ * elapsed time, one row per agent (status glyph, elapsed, tool calls, ctx
+ * usage, current activity label), idle pool stages from earlier cells, and a
+ * totals line. `execId` scopes rows to the exec currently being streamed.
+ */
 export function renderSubagentPanel(
   snapshot: SubagentRuntimeSnapshot | undefined,
   theme: Theme,

@@ -21,6 +21,7 @@ import type {
 
 type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Promise<unknown>;
 
+/** Structural type guards for incoming RPC frames (see validateRpcMessage). */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -252,6 +253,11 @@ const RPC_MESSAGE_VALIDATORS: { [K in RpcMessageType]: RpcMessageValidator<K> } 
   script_exported: validateScriptExportedMessage,
 };
 
+/**
+ * Validate and normalize one parsed RPC frame from Python. Throws
+ * PtcProtocolError for unknown frame types or fields of the wrong shape, so a
+ * buggy runtime fails loudly instead of silently producing undefined fields.
+ */
 export function validateRpcMessage(value: unknown): RpcMessage {
   if (!isRecord(value) || !isString(value.type)) {
     throw new PtcProtocolError("RPC frame must be an object with a string type field.");
@@ -264,6 +270,7 @@ export function validateRpcMessage(value: unknown): RpcMessage {
   return RPC_MESSAGE_VALIDATORS[value.type as RpcMessageType](value);
 }
 
+/** Convert any thrown value into the wire-format RpcErrorPayload. */
 function serializeError(error: unknown): RpcErrorPayload {
   if (error instanceof Error) {
     return {
@@ -291,6 +298,13 @@ export interface RpcProtocolOptions {
   terminateProcess?: (signal: NodeJS.Signals) => boolean;
 }
 
+/**
+ * Line-delimited JSON RPC bridge for one Python execution subprocess:
+ * forwards nested `tool_call` frames to `runTool` (normalizing results back),
+ * accumulates stdout/stderr, streams progress/update frames to `onUpdate`,
+ * and settles exactly once — resolving on `complete`, rejecting on `error`,
+ * abort, timeout, or transport failure (with process termination on reject).
+ */
 export class RpcProtocol {
   private lineReader: readline.Interface;
   private completionPromise: Promise<CodeExecutionResult>;
@@ -665,6 +679,13 @@ export class RpcProtocol {
     this.proc.stdin.write(`${serialized}\n`);
   }
 
+  /**
+   * Resolve with the CodeExecutionResult (or reject with the failure).
+   * `timeoutMs`, when given, starts a ONE-SHOT wall-clock timer on the first
+   * call that rejects with PtcTimeoutError — it is total runtime, not idle
+   * time, and is not re-armed by activity (unlike the persistent-session
+   * manager's idle timeout).
+   */
   async waitForCompletion(timeoutMs?: number): Promise<CodeExecutionResult> {
     if (timeoutMs !== undefined && !this.executionTimeout && !this.completed) {
       this.executionTimeout = setTimeout(() => {

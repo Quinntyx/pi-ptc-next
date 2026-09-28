@@ -1,5 +1,5 @@
 {
-  "name": "@cegersdo/pi-ptc",
+  "name": "@quinntyx/pi-ptc-next",
   "version": "0.1.1",
   "description": "Programmatic Tool Calling (PTC) extension for pi-coding-agent - enables Python code execution with async tool calls",
   "main": "dist/index.js",
@@ -24,7 +24,7 @@
   },
   "files": [
     "dist",
-    "src/python-runtime",
+    "src",
     "tools",
     "skills"
   ],

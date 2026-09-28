@@ -4,6 +4,15 @@ import sys
 import threading
 from typing import Any, Dict, Optional
 
+"""JSONL RPC client for the PTC Python runtime.
+
+Tool calls are written to stdout as {"type": "tool_call", ...} frames and
+answered by the host on stdin. The same stdin carries host-initiated
+exec/export_script/inspect frames for persistent-session mode, dispatched to a
+registered exec handler. Malformed frames are skipped and logged; the client
+disconnects only on EOF or 100 consecutive malformed frames.
+"""
+
 _ptc_rpc_asyncio = asyncio
 
 # Startup guard: the runtime relies on PEP 604 unions in *evaluated* annotations
@@ -26,6 +35,9 @@ _MAX_CONSECUTIVE_MALFORMED_FRAMES = 100
 
 
 class ToolCallError(Exception):
+    """Raised when a tool call returns an error payload: the message includes the
+    host-provided stack trace when present, and .payload keeps the original dict."""
+
     def __init__(self, payload: Dict[str, Any]):
         self.payload = payload
         message = str(payload.get("message") or "Tool call failed")
@@ -35,6 +47,8 @@ class ToolCallError(Exception):
 
 
 class RpcProtocolError(Exception):
+    """Raised for transport-level failures: EOF on stdin, a garbage frame stream,
+    or client shutdown with calls still pending."""
     pass
 
 
@@ -72,6 +86,8 @@ async def _connect_stdin_reader(reader: asyncio.StreamReader, stdin: Any = None)
 
 
 class RpcClient:
+    """Request/response client over stdin/stdout JSONL frames, plus dispatch of
+    host-initiated exec-family frames in persistent-session mode."""
 
     def __init__(self, default_call_timeout: float = 300.0):
         self.call_id = 0
@@ -88,18 +104,25 @@ class RpcClient:
         self.disconnected = _ptc_rpc_asyncio.Event()
 
     def set_exec_handler(self, handler) -> None:
+        """Register the callback that receives host "exec"/"export_script"/"inspect"
+        frames (persistent-session mode)."""
         self.exec_handler = handler
 
     async def start_reader(self) -> None:
+        """Start the background stdin reader task."""
         self.reader_task = asyncio.create_task(self._stdin_reader())
 
     def _fail_pending_calls(self, error: Exception) -> None:
+        """Fail and clear every in-flight call with `error`."""
         for future in self.pending_calls.values():
             if not future.done():
                 future.set_exception(error)
         self.pending_calls.clear()
 
     async def _stdin_reader(self) -> None:
+        """Read stdin until EOF: route responses to pending calls, hand exec-family
+        frames to the handler, and skip malformed lines. Disconnects (failing all
+        pending calls) on EOF or 100 consecutive malformed/undecodable frames."""
         malformed_streak = 0
         try:
             reader = asyncio.StreamReader()
@@ -159,6 +182,9 @@ class RpcClient:
             self.disconnected.set()
 
     def _handle_response(self, response: Dict[str, Any]) -> None:
+        """Dispatch one decoded frame: exec-family frames go to the handler;
+        anything else resolves the pending call with the matching id (an `error`
+        dict becomes ToolCallError)."""
         if response.get("type") in ("exec", "export_script", "inspect"):
             handler = self.exec_handler
             if handler is not None:
@@ -178,6 +204,9 @@ class RpcClient:
             del self.pending_calls[call_id]
 
     async def call(self, tool: str, params: Dict[str, Any], timeout: float | None = None) -> Any:
+        """Invoke a host tool and await its result value. Raises ToolCallError (or
+        a plain Exception) for error replies, and Exception on timeout (per-call
+        `timeout` in seconds, default 300)."""
         self.call_id += 1
         call_id = f"call_{self.call_id}"
         request = {
@@ -206,6 +235,7 @@ class RpcClient:
             self.pending_calls.pop(call_id, None)
 
     async def cleanup(self) -> None:
+        """Fail pending calls and cancel the reader task. Idempotent."""
         self._fail_pending_calls(RpcProtocolError("RPC client shut down"))
         if self.reader_task:
             self.reader_task.cancel()
@@ -218,6 +248,14 @@ class RpcClient:
 
 _rpc = RpcClient()
 
+# Per-cell tool-call ledger. session.py clears this at the start of each exec
+# and summarizes it into the cell's model-facing `tools:` section, so the model
+# can see which Pi tools a cell used and how often.
+cell_tool_calls: list[str] = []
+
 
 async def _rpc_call(tool: str, params: Dict[str, Any], timeout: float | None = None) -> Any:
+    """Call a host tool, first recording it in the per-cell tool-call ledger
+    (cell_tool_calls) that feeds the model-facing `tools:` section."""
+    cell_tool_calls.append(tool)
     return await _rpc.call(tool, params, timeout=timeout)

@@ -43,8 +43,7 @@ starting a new pi session (or reloading the extension), not just setting it mid-
 Set variables in the shell that launches pi (or in your pi profile's environment):
 
 ```bash
-# Allow Python to use mutating tools and bash; raise the per-cell timeout
-export PTC_ALLOW_MUTATIONS=true
+# Expose the bridged bash tool to Python; raise the per-cell timeout
 export PTC_ALLOW_BASH=true
 export PTC_EXECUTION_TIMEOUT_MS=600000
 
@@ -67,9 +66,9 @@ import os, json
 return json.dumps({k: v for k, v in os.environ.items() if k.startswith("PTC_")}, indent=2)
 ```
 
-Note that without `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH` only read-only tools are callable from cells.
-There is no required opt-in for Python execution itself: kernels run unsandboxed as host subprocesses
-(yolo mode — sandboxing is planned, not implemented).
+Without `PTC_ALLOW_BASH` the bridged `bash` tool is filtered out of cells; mutating tools are not
+gated (see `docs/sandboxing.md` for why). There is no required opt-in for Python execution itself:
+kernels run unsandboxed as host subprocesses (yolo mode — sandboxing is planned, not implemented).
 
 ## Environment variables
 
@@ -87,19 +86,17 @@ that file.
 
 ### Tool policy
 
-Tool filtering happens in `ToolRegistry.getCallableTools` (`src/tool-registry.ts:222-254`):
+Tool filtering happens in `ToolRegistry.getCallableTools` (`src/tool-registry.ts`):
 `PTC_BLOCKED_TOOLS` is checked first (denylist always wins), then `PTC_CALLABLE_TOOLS`
-(when set, only listed tools pass), then `bash` requires `PTC_ALLOW_BASH`, and when
-`PTC_ALLOW_MUTATIONS` is off only read-only built-ins plus trusted read-only custom tools
-are callable.
+(when set, only listed tools pass), then `bash` requires `PTC_ALLOW_BASH`. Mutating tools
+are deliberately not gated — the Python process is unsandboxed (yolo mode), so filtering
+the model's mutating tools is futile enforcement.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `PTC_ALLOW_MUTATIONS` | bool | `false` | Allow mutating tools (`edit`, `write`, …) from Python. |
 | `PTC_ALLOW_BASH` | bool | `false` | Allow the `bash` tool from Python. |
 | `PTC_CALLABLE_TOOLS` | comma list | *(unset — all eligible tools)* | Explicit allowlist override. |
 | `PTC_BLOCKED_TOOLS` | comma list | *(unset)* | Explicit denylist; wins over the allowlist. |
-| `PTC_TRUSTED_READ_ONLY_TOOLS` | comma list | *(unset)* | Custom tools treated as read-only (and thus callable with mutations disabled) even though they are not marked read-only. |
 
 ### Routing, recovery, sessions
 

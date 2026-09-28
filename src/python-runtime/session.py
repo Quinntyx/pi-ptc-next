@@ -194,6 +194,8 @@ def _ptc_build_cell(code: str, cell_name: str):
 
 
 def _ptc_find_magics(code: str) -> list[tuple[int, str]]:
+    """Return (1-based line number, stripped line) pairs for lines starting with
+    `%` or `!` (candidate IPython magics). Only consulted for cells that fail to parse."""
     offending = []
     for lineno, line in enumerate(code.split("\n"), 1):
         if _PTC_MAGIC_RE.match(line):
@@ -217,6 +219,9 @@ def _ptc_code_parses(code: str) -> bool:
 
 
 def _ptc_magic_error(offending: list[tuple[int, str]]) -> str:
+    """Build the MagicError text for the offending magic lines (first three shown)
+    plus a table of native equivalents; the text states the cell was not executed
+    and not written to the notebook."""
     shown = "; ".join(f"line {n}: `{text[:60]}`" for n, text in offending[:3])
     equivalents = " · ".join(f"{magic} → {hint}" for magic, hint in _PTC_MAGIC_EQUIVALENTS)
     return (
@@ -227,6 +232,8 @@ def _ptc_magic_error(offending: list[tuple[int, str]]) -> str:
 
 
 def _ptc_preview_value(value) -> str:
+    """Short type/shape summary for inspect_kernel's var list, e.g.
+    "DataFrame 10×3" or "list(42)"; falls back to the bare type name."""
     kind = type(value).__name__
     try:
         shape = getattr(value, "shape", None)
@@ -318,6 +325,8 @@ def _ptc_kernel_digest(before: dict | None = None) -> dict:
 
 
 def _ptc_format_digest(digest: dict) -> str:
+    """Render a digest as a one-line summary ("cell 3 · 2 defs · +x ~y …").
+    Changed-name entries are truncated to +3/+2 with an overflow count."""
     parts = [f"cell {digest['cells']}"]
     if digest["defs"]:
         parts.append(f"{len(digest['defs'])} defs")
@@ -337,6 +346,24 @@ def _ptc_format_digest(digest: dict) -> str:
     # No "[kernel]" prefix: the host owns section markers now; this text is the
     # indented body of the host's `kernel:` section.
     return " · ".join(parts)
+
+
+def _ptc_tools_summary() -> str | None:
+    """One-line summary of the Pi tools this cell called, for the model-facing
+    `tools:` section (e.g. `read ×12 · grep ×3 · 15 calls`). Defensive: the
+    ledger lives in the RPC module and must never break cell reporting."""
+    try:
+        ledger = globals().get("cell_tool_calls")
+        if not ledger:
+            return None
+        counts: dict[str, int] = {}
+        for name in ledger:
+            counts[name] = counts.get(name, 0) + 1
+        bits = [f"{name} ×{n}" if n > 1 else name for name, n in counts.items()]
+        bits.append(f"{len(ledger)} call" + ("s" if len(ledger) != 1 else ""))
+        return " · ".join(bits)
+    except Exception:
+        return None
 
 
 def _ptc_subagents_summary() -> str | None:
@@ -531,6 +558,8 @@ def _ptc_notebook_write(exec_count: int, code: str, *, stdout_text: str, echo_te
 
 
 def _ptc_emit_kernel_inspect(frame: dict) -> None:
+    """Answer an "inspect" frame with kernel_inspected carrying the user-created
+    namespace snapshot (runtime plumbing excluded via the baseline fingerprint)."""
     _emit_protocol({
         "type": "kernel_inspected",
         "id": frame.get("id") or "unknown",
@@ -539,11 +568,23 @@ def _ptc_emit_kernel_inspect(frame: dict) -> None:
 
 
 async def _ptc_exec_chunk(frame: dict) -> None:
+    """Execute one "exec" frame end to end and emit the terminal frame.
+
+    Handles file mode (source_path), the parse-failed magic guard, notebook
+    recording (errored and interrupted cells included), the local-namespace
+    merge, auto-echo of the trailing expression, and figure capture. On success
+    emits exec_done whose `output`/`echo` are spool-capped cell text; the
+    kernel/subagent/tool sections travel as separate fields (`kernel_text`,
+    `subagents_text`, `tools_text`) that the host composes into the model text.
+    Cell errors emit exec_error and keep the kernel alive; only host teardown
+    re-raises."""
     global _cell_counter, _last_reported_line, _last_progress_at, _current_line, _PTC_USER_CODE_LINE_COUNT
 
     global _ptc_notebook_path, _ptc_baseline
     exec_id = frame.get("id") or "unknown"
     code = frame.get("code") or ""
+    # Fresh per-cell tool-call ledger (see rpc.cell_tool_calls).
+    globals().get("cell_tool_calls", []).clear()
     source_path = frame.get("source_path") or None
     notebook_path = frame.get("notebook") or None
     source_cell_index = frame.get("source_cell_index")
@@ -689,8 +730,42 @@ async def _ptc_exec_chunk(frame: dict) -> None:
                     "source": source,
                 })
                 return
-            if isinstance(error, (SystemExit, GeneratorExit)):
+            if isinstance(error, GeneratorExit):
                 raise
+            if isinstance(error, SystemExit):
+                # sys.exit() (or a raised SystemExit) is a cell error, not a
+                # kernel fatal: report it like any other exception so the
+                # persistent kernel stays alive for the next cell.
+                message = str(error) or "SystemExit"
+                traceback_text = _traceback_with_help(error)
+                _stdout_proxy.flush()
+                full_output = (
+                    (_stdout_proxy.cell_text + traceback_text).strip()
+                    if _stdout_proxy.cell_text else traceback_text
+                )
+                _ptc_notebook_write(
+                    exec_count,
+                    code,
+                    stdout_text=_stdout_proxy.cell_text,
+                    echo_text=None,
+                    full_output=full_output,
+                    images=None,
+                    error={
+                        "ename": "SystemExit",
+                        "evalue": message,
+                        "traceback": traceback_text,
+                    },
+                    source_path=source_path,
+                    source_cell_index=source_cell_index,
+                )
+                _stdout_proxy.cell_text = ""
+                _emit_protocol({
+                    "type": "exec_error",
+                    "id": exec_id,
+                    "message": f"SystemExit: {message}" if message else "SystemExit",
+                    "traceback": traceback_text,
+                })
+                return
             message = str(error)
             traceback_text = _traceback_with_help(error)
             # Errored cells executed, so they are recorded (Jupyter-faithful)
@@ -757,6 +832,7 @@ async def _ptc_exec_chunk(frame: dict) -> None:
             digest = _ptc_kernel_digest(before_fingerprint)
             kernel_text = _ptc_format_digest(digest)
             subagents_text = _ptc_subagents_summary()
+            tools_text = _ptc_tools_summary()
             record_parts = []
             if result_text:
                 record_parts.append(result_text)
@@ -793,6 +869,7 @@ async def _ptc_exec_chunk(frame: dict) -> None:
                 "echo": response_echo,
                 "kernel_text": kernel_text,
                 "subagents_text": subagents_text,
+                "tools_text": tools_text,
                 "images": images,
                 "total_output_chars": total_output_chars,
                 "cell": exec_count,

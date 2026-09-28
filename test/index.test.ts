@@ -255,7 +255,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
       ["exec_cell", "inspect_kernel", "list_kernels", "promote_to_skill_notebook", "provision_dependency", "provision_kernel", "read_cell_output"].sort(),
     );
     const readCellOutput = registered.find((tool) => tool.name === "read_cell_output");
-    assert.deepEqual(Object.keys(readCellOutput.parameters.properties), ["cellIdx", "offset", "limit"]);
+    assert.deepEqual(Object.keys(readCellOutput.parameters.properties), ["cellIdx", "kernel", "offset", "limit"]);
     const readResult = await readCellOutput.execute(
       "read-output",
       { cellIdx: 3, offset: 2, limit: 4 },

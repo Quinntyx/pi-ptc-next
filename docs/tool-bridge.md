@@ -108,9 +108,7 @@ All of these are environment variables read at tool-call selection time:
 |---|---|---|
 | `PTC_CALLABLE_TOOLS` | unset | Comma-separated allowlist of callable tools (e.g. `read,glob,find,grep,ls`). When set, *only* these tools are callable. |
 | `PTC_BLOCKED_TOOLS` | unset | Comma-separated denylist; wins over everything else. |
-| `PTC_ALLOW_MUTATIONS` | `false` | When false, only read-only tools (and trusted read-only custom tools) are callable — this is why `edit`/`write` are absent by default. |
 | `PTC_ALLOW_BASH` | `false` | Must be true for `bash()` to be exposed. |
-| `PTC_TRUSTED_READ_ONLY_TOOLS` | unset | Comma-separated custom-tool names treated as read-only even with mutations disabled. Requires the tool to declare `ptc.enabled: true` and `ptc.readOnly: true`. |
 | `PTC_MAX_PARALLEL_TOOL_CALLS` | `8` | Default concurrency for `ptc.gather_limit()` / `ptc.read_many()` / `ptc.read_tree()`. |
 | `PTC_EXECUTION_TIMEOUT_MS` | `270000` | Hard cell timeout; bounds the total time nested calls may take. |
 | `PTC_DEBUG` | `false` | Debug logging. |
@@ -120,8 +118,8 @@ Notes on defaults:
 - `true`/`1`/`yes`/`on` (case-insensitive) enable boolean flags; anything else
   keeps the default.
 - Custom and extension tools are **not** callable from Python by default. They
-  must declare `ptc.enabled: true` (and, with mutations disabled, also
-  `ptc.readOnly: true` plus an entry in `PTC_TRUSTED_READ_ONLY_TOOLS`). A tool
+  must declare `ptc.enabled: true`. Mutating tools are not gated (yolo mode —
+  the Python process can edit files natively, so filtering is futile). A tool
   can restrict itself to `ptc.callers: ["direct"]` to stay invisible to Python.
 - `glob()` is a first-class alias of pi's `find()` with identical parameters
   and defaults (`limit` defaults to 1000; `ls`'s `limit` defaults to 500).

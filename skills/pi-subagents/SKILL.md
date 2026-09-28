@@ -199,6 +199,7 @@ Result fields: `task`, `stage`, `handle`, `body` (str or dict response),
 
 # Model and effort selection
 
+- Every `pi_subagents` object is introspectable: call `help(obj)` (e.g. `help(pool)`, `help(task)`, `help(result)`) inside a cell to see all attributes and methods when this skill is silent on a detail. `dir(obj)` lists them tersely.
 - Resolve every named model: `subagents.best_model_match("flash")` returns one
   pick (exact slug > profile default provider > first-party > proxied);
   `model_slugs`/`resolve_models`/`list_models` give full rows. Pass a full

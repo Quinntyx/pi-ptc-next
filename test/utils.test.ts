@@ -36,7 +36,7 @@ test("collapseOutputPreview keeps a 70/30 head/tail split at line boundaries wit
   assert.equal((result.match(/lines hidden/g) || []).length, 1);
   assert.match(
     result,
-    /\.\.\. 22 lines hidden \(529 of 719 chars\) — full output: read_cell_output\(cell_idx=7\) \.\.\./
+    /\.\.\. 22 lines hidden \(529 of 719 chars\) — full output: read_cell_output\(cellIdx=7\) \.\.\./
   );
   const [head, tail] = result.split(/\n\.\.\. .*? \.\.\.\n/);
   assert.ok(head.length > tail.length * 1.5, "head should receive approximately 70% of visible content");

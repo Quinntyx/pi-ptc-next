@@ -65,11 +65,17 @@ export interface SubagentsEnvOptions {
 }
 
 export interface SubagentsEnvResult {
+  /** `ok` (installed and import verified), `skipped` (lock/throttle), or `failed`. */
   status: "ok" | "skipped" | "failed";
+  /** Machine-readable-ish failure or skip reason; set unless status is "ok". */
   reason?: string;
+  /** Interpreter inside the PTC venv (present when the venv exists). */
   venvPython?: string;
+  /** Directory the editable install points at. */
   editablePath?: string;
+  /** True when pi_subagents came from the managed clone, not a dev checkout. */
   managed?: boolean;
+  /** Short git HEAD of the installed pi-subagents checkout. */
   commit?: string;
 }
 
@@ -316,8 +322,53 @@ function releaseLock(paths: Paths): void {
   }
 }
 
+// --- readiness gate ---------------------------------------------------------------
+
+/**
+ * In-flight provisioning promise, memoized so the session manager and the
+ * entry point share one run. Settled results stay memoized: a failed sync
+ * must not trigger retry storms from every kernel start.
+ */
+let envPromise: Promise<SubagentsEnvResult> | undefined;
+
+/**
+ * Kick off provisioning once per process and share the promise. Returns the
+ * same result for every caller; rejections are normalized to a failed result.
+ */
+export function startSubagentsEnv(options: SubagentsEnvOptions = {}): Promise<SubagentsEnvResult> {
+  envPromise ??= ensureSubagentsEnv(options).catch((error): SubagentsEnvResult => ({
+    status: "failed",
+    reason: error instanceof Error ? error.message : String(error),
+  }));
+  return envPromise;
+}
+
+/**
+ * Resolve once provisioning has settled (or `timeoutMs` elapsed, whichever is
+ * first). Callers spawn kernels after this so interpreter resolution sees the
+ * venv when provisioning managed to create it — without this gate, a
+ * first-install kernel can start on system `python3` while provisioned
+ * packages land in the venv it never picked.
+ */
+export async function waitForSubagentsEnv(timeoutMs = 120_000): Promise<void> {
+  if (!envPromise) return;
+  await Promise.race([
+    envPromise.then(() => undefined, () => undefined),
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+    }),
+  ]);
+}
+
 // --- sync -------------------------------------------------------------------------
 
+/**
+ * Run a full provisioning pass (venv, source, editable install, import check)
+ * under the pid-tagged lock file: skips when another live process holds the
+ * lock, breaks locks left by dead pids, and honors the stamp-file throttle
+ * (see shouldAttemptSync). Returns the outcome; never throws.
+ */
 export async function ensureSubagentsEnv(
   options: SubagentsEnvOptions = {},
 ): Promise<SubagentsEnvResult> {

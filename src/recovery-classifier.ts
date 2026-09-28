@@ -1,5 +1,6 @@
 import type { RecoveryFailureClass } from "./recovery-state";
 
+/** The failure shapes this classifier can detect (aliases RecoveryFailureClass). */
 export type RecoveryKind = RecoveryFailureClass;
 
 const KNOWN_ASYNC_HELPERS = [
@@ -72,6 +73,10 @@ function stripComment(line: string): string {
   return result.trim();
 }
 
+/**
+ * Split traceback/code into non-empty, comment-stripped lines to scan for
+ * unawaited helper calls.
+ */
 function getEvidenceLines(traceback?: string, code?: string): string[] {
   return [traceback, code]
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -80,6 +85,10 @@ function getEvidenceLines(traceback?: string, code?: string): string[] {
     .filter((line) => line.length > 0);
 }
 
+/**
+ * True when some line calls a known async helper bare (not awaited, not inside
+ * an iteration/aggregation wrapper) — the signature of a missing await.
+ */
 function hasDirectUnawaitedHelperCall(lines: string[]): boolean {
   return lines.some((line) => {
     if (!helperCallPattern.test(line) || awaitedHelperCallPattern.test(line)) {
@@ -90,10 +99,21 @@ function hasDirectUnawaitedHelperCall(lines: string[]): boolean {
   });
 }
 
+/**
+ * True when an unawaited helper result is iterated/unpacked/summed — the
+ * "coroutine object is not iterable" family of failures.
+ */
 function hasIteratedUnawaitedHelperUse(lines: string[]): boolean {
   return lines.some((line) => !awaitedHelperCallPattern.test(line) && iteratedHelperPatterns.some((pattern) => pattern.test(line)));
 }
 
+/**
+ * Classify a failed cell execution as a recoverable async-misuse failure.
+ * Requires BOTH a matching runtime diagnostic (coroutine/never-awaited) in
+ * `message`/`traceback` AND corroborating evidence in the traceback or cell
+ * code; a bare "await" echoed in a traceback is not enough. Returns null when
+ * the failure is not recoverable by this mechanism.
+ */
 export function classifyCodeExecutionFailure(
   message: string,
   traceback?: string,
@@ -115,6 +135,10 @@ export function classifyCodeExecutionFailure(
   return null;
 }
 
+/**
+ * Build the follow-up recovery prompt instructing the model to await async
+ * helpers, specialized per failure class.
+ */
 export function buildCodeExecutionRecoveryPrompt(kind: RecoveryKind): string {
   switch (kind) {
     case "missing-await":

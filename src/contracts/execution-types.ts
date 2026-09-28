@@ -50,7 +50,7 @@ export type RpcMessage =
   | { type: "error"; message: string; traceback?: string }
   | { type: "update"; message: string }
   // Persistent-kernel frames (exec_cell against a provisioned interpreter).
-  | { type: "exec_done"; id: string; output: string; echo?: string; kernel_text?: string; subagents_text?: string; images?: PtcImageArtifact[]; total_output_chars?: number; cell?: number }
+  | { type: "exec_done"; id: string; output: string; echo?: string; kernel_text?: string; subagents_text?: string; tools_text?: string; images?: PtcImageArtifact[]; total_output_chars?: number; cell?: number }
   | { type: "exec_error"; id: string; message: string; traceback?: string; interrupted?: boolean; line?: number; source?: string }
   | { type: "session_ready" }
   | { type: "subagent_state"; snapshot: SubagentRuntimeSnapshot }
@@ -162,6 +162,15 @@ export interface PythonSessionManagerHooks {
   onInterrupted?: (sessionId: string, text: string) => void;
 }
 
+/** One bridged Pi tool call made from inside a cell (tool subtree rendering). */
+export interface NestedToolCallRecord {
+  name: string;
+  /** Short identifying summary of the primary parameter (path, pattern, command). */
+  target?: string;
+  ok: boolean;
+  ms: number;
+}
+
 interface ExecutionMetrics {
   nestedToolCalls: number;
   nestedToolNames: string[];
@@ -197,6 +206,8 @@ export interface ExecutionDetails extends ExecutionMetrics {
   cellIdx?: number;
   /** Result text uses the sectioned (output/return/kernel/subagents) format. */
   sectioned?: boolean;
+  /** Bridged Pi tool calls made from inside this cell (tool subtree rendering). */
+  nestedCallRecords?: NestedToolCallRecord[];
 }
 
 export interface CodeExecutionResult {

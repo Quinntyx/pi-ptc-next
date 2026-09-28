@@ -45,6 +45,7 @@ function hasSchemaShape(value: unknown): value is TSchema {
   return typeof value === "object" && value !== null;
 }
 
+/** Structural check: a valid custom tool file default-exports {name, execute, parameters}. */
 function isCustomToolDefinition(value: unknown): value is PtcToolDefinition {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
@@ -58,6 +59,11 @@ function isCustomToolDefinition(value: unknown): value is PtcToolDefinition {
   );
 }
 
+/**
+ * Load one custom tool file (default export wins over a bare module export).
+ * The import is cache-busted so repeated calls re-execute the file (hot
+ * reload); throws when the module does not export a valid tool definition.
+ */
 export async function loadCustomToolFile(filePath: string): Promise<LoadedTool> {
   const filename = path.basename(filePath);
   // Cache-bust the import: ESM modules are cached by URL and `require.cache`
@@ -109,6 +115,10 @@ async function loadToolsFromDir(
   return loadedTools;
 }
 
+/**
+ * Test-only variant of the directory scan: throws an AggregateError listing
+ * every load failure instead of delegating to a callback.
+ */
 export async function loadCustomToolsFromDir(toolsDir: string): Promise<LoadedTool[]> {
   const errors: Error[] = [];
   const loadedTools = await loadToolsFromDir(toolsDir, (_filename, error) => {
@@ -122,6 +132,13 @@ export async function loadCustomToolsFromDir(toolsDir: string): Promise<LoadedTo
   return loadedTools;
 }
 
+/**
+ * Watches `<extensionRoot>/tools/*.js` and keeps its custom tools registered
+ * with the host: loading at startup, add/change/delete/rename via an fs.watch
+ * listener (300 ms debounce, reconciles serialized per file), and re-watch
+ * after watcher errors. Reserved names (builtins, PTC tools) and duplicate
+ * tool names are rejected.
+ */
 export class CustomToolManager {
   private readonly toolsDir: string;
   private readonly fileToTool = new Map<string, string>();
@@ -141,6 +158,10 @@ export class CustomToolManager {
     this.toolsDir = path.join(extensionRoot, "tools");
   }
 
+  /**
+   * Load all tools from the tools dir (invalid files are warned and skipped),
+   * then start watching. Returns a filename → tool-name map.
+   */
   async start(): Promise<Map<string, string>> {
     this.closed = false;
     this.ensureToolsDir();
@@ -162,6 +183,7 @@ export class CustomToolManager {
     return new Map(this.fileToTool);
   }
 
+  /** Begin watching the tools dir (idempotent); errors trigger a re-watch after 1 s. */
   startWatching(): void {
     if (this.watcher || this.closed) {
       return;
@@ -218,6 +240,7 @@ export class CustomToolManager {
     }, 1000);
   }
 
+  /** Stop watching and cancel all pending timers and in-flight reconciles; irreversible. */
   close(): void {
     this.closed = true;
     this.watcher?.close();

@@ -58,7 +58,7 @@ test("ToolRegistry treats an explicit empty ptc.callers allowlist as deny-all", 
     },
   });
 
-  const settings = baseSettings({ trustedReadOnlyTools: ["query_db"] });
+  const settings = baseSettings();
   const callable = registry.getCallableTools(process.cwd(), settings);
   assert.ok(!callable.some((tool) => tool.name === "query_db"));
 
@@ -146,7 +146,6 @@ test("ToolRegistry denylist uses every currently registered PTC tool name", () =
   }
 
   const settings = baseSettings({
-    allowMutations: true,
     allowBash: true,
     callableTools: [...PTC_TOOL_NAMES],
   });
@@ -159,12 +158,10 @@ function baseSettings(overrides = {}) {
     executionTimeoutMs: 1000,
     outputPreviewChars: 1000,
     maxSpoolChars: 10_000_000,
-    allowMutations: false,
     allowBash: false,
     maxParallelToolCalls: 4,
     debugLogging: false,
     autoRoute: true,
-    trustedReadOnlyTools: undefined,
     callableTools: undefined,
     blockedTools: undefined,
     ...overrides,
@@ -181,7 +178,7 @@ function stringParamSchema() {
   };
 }
 
-test("ToolRegistry blocks untrusted custom read-only tools when mutations are disabled", () => {
+test("custom tools are callable with no allowlist now that mutation gating is gone", () => {
   const registry = createRegistry();
   registry.upsertTool({
     name: "query_db",
@@ -196,27 +193,24 @@ test("ToolRegistry blocks untrusted custom read-only tools when mutations are di
   const callable = registry.getCallableTools(process.cwd(), baseSettings());
   const names = callable.map((tool) => tool.name);
 
-  assert.deepEqual(names.sort(), ["find", "glob", "grep", "ls", "read"]);
+  // Builtins (read/edit/find/glob/grep/ls/write) plus the custom tool; mutations are no longer gated.
+  assert.deepEqual(names.sort(), ["edit", "find", "glob", "grep", "ls", "query_db", "read", "write"]);
 });
 
-test("ToolRegistry allows trusted custom read-only tools when explicitly allowlisted", () => {
+test("non-read-only custom tools are callable too (mutations are not gated, yolo mode)", () => {
   const registry = createRegistry();
   registry.upsertTool({
-    name: "query_db",
-    description: "Query DB",
+    name: "deploy",
+    description: "Deploy",
     parameters: stringParamSchema(),
-    ptc: { enabled: true, readOnly: true, pythonName: "query_db_readonly" },
+    ptc: { enabled: true },
     async execute() {
       return { content: [{ type: "text", text: "ok" }], details: undefined };
     },
   });
 
-  const callable = registry.getCallableTools(
-    process.cwd(),
-    baseSettings({ trustedReadOnlyTools: ["query_db"] })
-  );
-
-  assert.ok(callable.some((tool) => tool.name === "query_db"));
+  const callable = registry.getCallableTools(process.cwd(), baseSettings());
+  assert.ok(callable.some((tool) => tool.name === "deploy"));
 });
 
 test("ToolRegistry rejects duplicate python helper names", () => {
@@ -236,7 +230,7 @@ test("ToolRegistry rejects duplicate python helper names", () => {
   }
 
   assert.throws(
-    () => registry.getCallableTools(process.cwd(), baseSettings({ trustedReadOnlyTools: ["tool_a", "tool_b"] })),
+    () => registry.getCallableTools(process.cwd(), baseSettings()),
     /Duplicate Python helper name/
   );
 });
@@ -255,13 +249,13 @@ test("ToolRegistry respects code_execution-only callers for custom tools", () =>
 
   const callable = registry.getCallableTools(
     process.cwd(),
-    baseSettings({ trustedReadOnlyTools: ["query_db"] })
+    baseSettings()
   );
   assert.ok(callable.some((tool) => tool.name === "query_db"));
 
   const routable = registry.getAutoRoutableToolNames(
     process.cwd(),
-    baseSettings({ trustedReadOnlyTools: ["query_db"] })
+    baseSettings()
   );
   assert.ok(!routable.includes("query_db"));
 });
@@ -280,7 +274,7 @@ test("ToolRegistry auto-routing only hides tools callable both directly and from
 
   const routable = registry.getAutoRoutableToolNames(
     process.cwd(),
-    baseSettings({ trustedReadOnlyTools: ["query_db"] })
+    baseSettings()
   );
   assert.ok(routable.includes("read"));
   assert.ok(routable.includes("query_db"));

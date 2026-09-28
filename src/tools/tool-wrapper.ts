@@ -6,6 +6,7 @@ import {
   getPythonReturnType,
 } from "./python-tool-contract";
 
+/** Render `params = _ptc_drop_none({...})` — None values are dropped so optional params stay unset. */
 function buildParamsDictionary(paramNames: string[]): string {
   if (paramNames.length === 0) {
     return "    params = {}";
@@ -16,6 +17,7 @@ function buildParamsDictionary(paramNames: string[]): string {
     .join(",\n")}\n    })`;
 }
 
+/** Generated helper body: multiline signature, params dict, and the `_rpc_call` bridge hop. */
 function buildGenericToolWrapper(tool: ToolInfo): string {
   const pythonName = getPythonHelperName(tool);
   const returnType = getPythonReturnType(tool);
@@ -28,6 +30,7 @@ ${paramsDict}
     return await _rpc_call(${JSON.stringify(tool.name)}, params)`;
 }
 
+/** Hand-rolled wrapper for read(path, *, offset, limit) — the one builtin with keyword-only paging params. */
 function buildReadWrapper(): string {
   return `async def read(
     path: str,
@@ -43,6 +46,11 @@ function buildReadWrapper(): string {
     return await _rpc_call("read", params)`;
 }
 
+/**
+ * Generate the Python source injected into every kernel: typing imports, the
+ * result TypedDicts (GrepResult, BashResult, …), `_ptc_drop_none`, and one
+ * `async def` wrapper per callable tool that forwards to `_rpc_call`.
+ */
 export function generateToolWrappers(tools: ToolInfo[]): string {
   const imports = `from typing import Optional, List, Dict, Any, TypedDict, Union`;
   const helpers = `

@@ -10,6 +10,7 @@ function isProcessRunning(proc: ChildProcess): boolean {
   return proc.exitCode === null && proc.signalCode === null;
 }
 
+/** Resolve when the process exits (or already has); false if still running after `timeoutMs`. */
 function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (!isProcessRunning(proc)) {
     return Promise.resolve(true);
@@ -31,6 +32,10 @@ function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
   });
 }
 
+/**
+ * Interpreter path for PTC kernels: `PTC_PYTHON_EXECUTABLE` wins, else the
+ * provisioned PTC venv when it exists, else `python3` from PATH.
+ */
 export function resolvePythonExecutable(): string {
   if (process.env.PTC_PYTHON_EXECUTABLE) {
     return process.env.PTC_PYTHON_EXECUTABLE;
@@ -42,6 +47,11 @@ export function resolvePythonExecutable(): string {
   return "python3";
 }
 
+/**
+ * No-op "sandbox": kernels run as unsandboxed host subprocesses (yolo mode).
+ * Tracks spawned children so cleanup() can terminate whole process groups
+ * (SIGTERM, then SIGKILL after a 1 s grace period each).
+ */
 class SubprocessSandbox implements SandboxManager {
   private readonly children = new Set<ChildProcess>();
 
@@ -107,6 +117,11 @@ class SubprocessSandbox implements SandboxManager {
   }
 }
 
+/**
+ * Create the sandbox manager. Takes no settings: only unsandboxed subprocess
+ * mode exists (VM-based checkpointing is planned; see docs/sandboxing.md), so
+ * there is nothing to configure.
+ */
 export function createSandbox(): Promise<SandboxManager> {
   // No sandboxing substrate yet: kernels run as plain host subprocesses ("yolo"
   // mode). VM-based checkpointing is planned; see docs/sandboxing.md.

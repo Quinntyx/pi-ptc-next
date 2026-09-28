@@ -2,7 +2,31 @@
 
 `pi-ptc-next` (package `@cegersdo/pi-ptc`) is an extension for [Pi](https://github.com/mariozechner/pi-coding-agent) that implements Programmatic Tool Calling (PTC): instead of streaming every tool result back into the model's context, the model writes Python cells against a persistent, Jupyter-like kernel and calls Pi's tools (`read`, `grep`, `glob`, …) as ordinary `async` Python functions. Only each cell's final output reaches the model, so multi-step work costs a fraction of the tokens. The same kernels double as launch pads for parallel subagent orchestration (optional; see below).
 
-Fork of [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chris Egersdoerfer.
+Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which itself forked [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chris Egersdoerfer.
+
+## Install
+
+1. **Install the extension into Pi:**
+
+   ```bash
+   pi install git:github.com/Quinntyx/pi-ptc-next
+   ```
+
+   Pi clones the repo into `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs `npm install` for it (a few benign-looking npm warnings about unapproved install scripts are normal). For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
+
+2. **That's the whole install.** No `npm run build` is needed — Pi compiles the extension's TypeScript at load time — and no environment variables are required. On the next `pi` start, the extension registers `provision_kernel`, `exec_cell`, and friends.
+
+3. **Verify it works.** Start `pi` and describe a PTC-shaped task, or check headless:
+
+   ```bash
+   pi -p "Use provision_kernel and exec_cell to print 1+1 in a Python cell."
+   ```
+
+4. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is auto-provisioned into `~/.cache/pi-ptc/python-env` at session start.
+
+To remove: `pi remove git:github.com/Quinntyx/pi-ptc-next`.
+
+> **⚠️ No sandboxing yet — yolo mode only.** Kernels run as plain host Python subprocesses with your real filesystem, permissions, and environment. Sandboxing is planned (VM-based checkpointing) but not implemented — the implementation is complex. `PTC_ALLOW_BASH` gates the bridged `bash` tool only; mutating tools are not gated at all — none of it constrains the Python process itself. Don't use this in untrusted workspaces.
 
 ## Requirements
 
@@ -10,18 +34,6 @@ Fork of [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chr
 - **Python ≥ 3.10** on PATH (or point `PTC_PYTHON_EXECUTABLE` at a suitable interpreter).
 - **`uv`** — optional; used for the shared venv and `provision_dependency` installs (see below).
 - **tmux + `pi-sock` + the `pi_subagents` module + a `subagents` Pi profile** — required *only* for subagent orchestration; every other feature works without them.
-
-## Install
-
-Install the extension:
-
-```bash
-pi install git:github.com/edxeth/pi-ptc-next
-```
-
-(Or `pi install /path/to/repo` for a local checkout.) No `npm install`/`npm run build` is needed — Pi compiles the TypeScript at load time. Start `pi` and the extension registers its tools on session start.
-
-> **⚠️ No sandboxing yet — yolo mode only.** Kernels run as plain host Python subprocesses with your real filesystem, permissions, and environment. Sandboxing is planned (VM-based checkpointing) but not implemented — the implementation is complex. Tool gating (`PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH`) limits what the *model* can reach; it does not constrain the Python process itself. Don't use this in untrusted workspaces.
 
 ## Usage
 
@@ -83,7 +95,7 @@ More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom
 |---|---|---|
 | `uv` | Preferred for creating the shared venv (`~/.cache/pi-ptc/python-env`) and for `provision_dependency` installs. | Venv creation falls back to `python3 -m venv`; `provision_dependency` fails (no pip fallback) — pre-install packages into the venv yourself. |
 | `pi_subagents` + tmux + `pi-sock` + a `subagents` Pi profile | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). `pi_subagents` is auto-provisioned at session start from git (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). | All core features work untouched; only `import pi_subagents` is unavailable (provisioning failure is a logged warning, never fatal). |
-| pi-tool-tree | Nicer subagent activity display and tool-call activity labels. | Plain rendering; panels/footers still work. |
+| pi-tool-tree *(experimental)* | Nicer subagent activity display and tool-call activity labels. Currently unstable — known rendering bugs. | Plain rendering; the subagent panel, timers, and the vendored shimmer animation all work without it — you only lose live agent activity labels. |
 
 Note: once the shared venv exists, every kernel prefers it over `python3`; set `PTC_PYTHON_EXECUTABLE` to pin your own interpreter.
 

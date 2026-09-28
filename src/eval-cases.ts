@@ -42,6 +42,11 @@ function isAcceptanceType(value: unknown): value is EvalCaseAcceptanceType {
   return typeof value === "string" && EVAL_CASE_ACCEPTANCE_TYPES.includes(value as EvalCaseAcceptanceType);
 }
 
+/**
+ * Validate one raw eval-case object; returns a list of human-readable errors
+ * (empty means valid). Also rejects acceptance rules whose key is not one of
+ * EVAL_CASE_ACCEPTANCE_RULE_KEYS so typos fail at load time.
+ */
 export function validateEvalCase(value: unknown): string[] {
   const errors: string[] = [];
 
@@ -103,6 +108,7 @@ export function validateEvalCase(value: unknown): string[] {
   return errors;
 }
 
+/** Validate and cast an eval case; throws (with `source` prefixed) listing every error. */
 export function parseEvalCase(value: unknown, source = "eval case"): EvalCase {
   const errors = validateEvalCase(value);
 

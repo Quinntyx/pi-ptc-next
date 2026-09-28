@@ -6,6 +6,15 @@ import time as _ptc_time
 import traceback as _ptc_traceback
 from typing import Any, Callable, Coroutine, Iterable, Sequence
 
+"""Cell-execution plumbing for the PTC Python kernel: stdout proxy, progress
+tracing, output serialization, and the `ptc` helpers exposed to user code.
+
+The host-built combined script concatenates rpc.py + tool wrappers + this
+module + user_main, then runs ``_runtime_main`` (one-shot) or session.py's
+persistent exec loop (PTC_MODE == "session"). Names defined here are runtime
+plumbing and are excluded from kernel digests.
+"""
+
 _current_line = 0
 _last_reported_line = 0
 _last_progress_at = 0.0
@@ -25,6 +34,7 @@ _ORIGINAL_STDOUT = _ptc_sys.stdout
 
 
 def _emit_protocol(message: dict[str, Any]) -> None:
+    """Write one JSONL protocol frame to the original (unproxied) stdout."""
     _ORIGINAL_STDOUT.write(_ptc_json.dumps(message) + "\n")
     _ORIGINAL_STDOUT.flush()
 
@@ -33,6 +43,11 @@ _ptc_protocol_write = _emit_protocol
 
 
 class _StdoutProxy:
+    """sys.stdout replacement for cells: forwards complete lines to the host as
+    stdout frames while spooling a per-cell transcript. Output past
+    _PTC_MAX_SPOOL_CHARS is silently dropped, but write() still reports the
+    full length so user code is unaffected."""
+
     def __init__(self):
         self._buffer = ""
         self.total_chars = 0
@@ -41,12 +56,16 @@ class _StdoutProxy:
         self.cell_text = ""
 
     def reset_cell(self) -> None:
+        """Clear the buffer, transcript, and counters before a new cell."""
         self._buffer = ""
         self.total_chars = 0
         self.accepted_chars = 0
         self.cell_text = ""
 
     def write(self, text: str) -> int:
+        """Accept text (up to the spool cap), emit complete lines as stdout
+        frames, and append the rest to the per-cell transcript. Always returns
+        len(text), even for dropped output."""
         if not text:
             return 0
 
@@ -65,6 +84,7 @@ class _StdoutProxy:
         return len(text)
 
     def flush(self) -> None:
+        """Emit any buffered partial line as a stdout frame."""
         if self._buffer:
             _emit_protocol({"type": "stdout", "text": self._buffer})
             self._buffer = ""
@@ -74,6 +94,8 @@ _stdout_proxy = _StdoutProxy()
 
 
 def _emit_progress_frame(lineno: int) -> None:
+    """Send an execution_progress frame (with the cell's total line count) now,
+    cancelling any scheduled coalesced flush; never raises."""
     global _last_progress_at, _last_reported_line
     # A newer frame supersedes any scheduled flush, and dropping the timer keeps a
     # finished chunk's interpreter from being held open by a stray callback.
@@ -87,6 +109,7 @@ def _emit_progress_frame(lineno: int) -> None:
 
 
 def _cancel_progress_flush() -> None:
+    """Cancel a scheduled coalesced-progress flush, if one is pending."""
     global _progress_flush_handle
     if _progress_flush_handle is not None:
         _progress_flush_handle.cancel()
@@ -94,6 +117,7 @@ def _cancel_progress_flush() -> None:
 
 
 def _flush_pending_progress() -> None:
+    """Timer callback: flush the newest suppressed progress line."""
     global _pending_progress_line, _progress_flush_handle
     _progress_flush_handle = None
     line = _pending_progress_line
@@ -103,6 +127,8 @@ def _flush_pending_progress() -> None:
 
 
 def _schedule_progress_flush() -> None:
+    """Schedule the pending progress line to flush after the 0.05s interval;
+    no-op when no event loop is running."""
     global _progress_flush_handle
     try:
         loop = _ptc_asyncio.get_running_loop()
@@ -113,6 +139,9 @@ def _schedule_progress_flush() -> None:
 
 
 def _report_execution_progress(lineno: int, force: bool = False) -> None:
+    """Rate-limited tracer reporting: unchanged lines are skipped, changed lines
+    capped at ~20 updates/s, and suppressed lines coalesced (never dropped) via
+    a timer flush. force=True bypasses both limits."""
     global _pending_progress_line
 
     # sys.settrace fires for every executed line. Emitting and flushing one JSON
@@ -139,6 +168,8 @@ def _report_execution_progress(lineno: int, force: bool = False) -> None:
 
 
 def _trace_lines(frame, event, arg):
+    """sys.settrace callback: map `user_main`/`_ptc_cell` frame lines to 1-based
+    user line numbers and report progress; other frames are ignored."""
     global _current_line
 
     if event != "line":
@@ -158,6 +189,9 @@ def _trace_lines(frame, event, arg):
 
 
 def _host_abspath(path: str) -> str:
+    """Map a runtime-side path to its host-side absolute path: paths under the
+    runtime workspace root are re-rooted onto the host workspace root, other
+    absolute paths pass through, and relative paths resolve against the host root."""
     if _ptc_os.path.isabs(path):
         runtime_root = _ptc_os.path.normpath(_PTC_RUNTIME_WORKSPACE_ROOT)
         normalized = _ptc_os.path.normpath(path)
@@ -170,10 +204,14 @@ def _host_abspath(path: str) -> str:
 
 
 class _PtcHelpers:
+    """Backing object of the `ptc` namespace available in user cells: bounded
+    parallel gather plus glob/read conveniences that call the host tools over RPC."""
+
     def __init__(self, max_parallel_tool_calls: int):
         self.max_parallel_tool_calls = max(1, max_parallel_tool_calls)
 
     async def gather_limit(self, coroutines: Iterable[Coroutine[Any, Any, Any]], limit: int | None = None):
+        """gather() the coroutines under a semaphore (default: max_parallel_tool_calls)."""
         semaphore = _ptc_asyncio.Semaphore(max(1, limit or self.max_parallel_tool_calls))
 
         async def _runner(coro: Coroutine[Any, Any, Any]):
@@ -183,14 +221,18 @@ class _PtcHelpers:
         return await _ptc_asyncio.gather(*[_runner(coro) for coro in coroutines])
 
     async def find_files(self, pattern: str, path: str = ".", max_files: int = 1000) -> Sequence[str]:
+        """Glob for files via the host `glob` tool; returns up to `max_files`
+        (default 1000) paths as the tool reports them."""
         return await glob(pattern=pattern, path=path, limit=max_files)
 
     async def find_files_abs(self, pattern: str, path: str = ".", max_files: int = 1000) -> Sequence[str]:
+        """Like find_files, but every returned path is made absolute (host-side)."""
         files = await self.find_files(pattern=pattern, path=path, max_files=max_files)
         base_path = _host_abspath(path)
         return [item if _ptc_os.path.isabs(item) else _ptc_os.path.join(base_path, item) for item in files]
 
     async def read_text(self, path: str, offset: int | None = None, limit: int | None = None) -> str:
+        """Read one file via the host `read` tool, with optional line offset/limit."""
         return await read(path=path, offset=offset, limit=limit)
 
     async def read_many(
@@ -201,6 +243,8 @@ class _PtcHelpers:
         offset: int | None = None,
         line_limit: int | None = None,
     ) -> Sequence[str]:
+        """Read many files concurrently, sharing one optional offset/line_limit;
+        `max_concurrency` bounds parallelism (default: max_parallel_tool_calls)."""
         return await self.gather_limit(
             [read(path=path, offset=offset, limit=line_limit) for path in paths],
             limit=max_concurrency,
@@ -215,6 +259,8 @@ class _PtcHelpers:
         offset: int | None = None,
         line_limit: int | None = None,
     ) -> Sequence[dict[str, Any]]:
+        """Glob + batched read in one call; returns [{"path", "content"}, ...]
+        aligned with the found files."""
         files = await self.find_files_abs(pattern=pattern, path=path, max_files=max_files)
         contents = await self.read_many(files, max_concurrency=concurrency, offset=offset, line_limit=line_limit)
         return [
@@ -226,6 +272,7 @@ class _PtcHelpers:
         ]
 
     def json_dump(self, value: Any) -> str:
+        """JSON-serialize with indent=2, sorted keys, and non-ASCII preserved."""
         return _ptc_json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
 
 
@@ -233,6 +280,10 @@ ptc = _PtcHelpers(globals().get("PTC_MAX_PARALLEL_TOOL_CALLS", 8))
 
 
 class _LazyModuleProxy:
+    """Proxy that imports the wrapped module on first attribute access, so heavy
+    imports (numpy/pandas/matplotlib) cost nothing until used. Also supports
+    item access, calling, dir(), and repr."""
+
     def __init__(self, module_name: str, setup_fn=None):
         self._module_name = module_name
         self._setup_fn = setup_fn
@@ -262,6 +313,7 @@ class _LazyModuleProxy:
         return repr(self._load())
 
 def _setup_matplotlib():
+    """Force the non-interactive Agg backend so figures can be captured headlessly."""
     try:
         import matplotlib
         matplotlib.use("Agg", force=True)
@@ -273,6 +325,9 @@ pd = _LazyModuleProxy("pandas")
 plt = _LazyModuleProxy("matplotlib.pyplot", setup_fn=_setup_matplotlib)
 
 def _capture_figures() -> list[dict[str, Any]]:
+    """Capture open matplotlib figures as base64 PNG dicts (max 4, dpi 150,
+    tight bbox); images over 2MB are downscaled to 1600x1200 when PIL is
+    available. Closes all figures. Best-effort: never raises."""
     captured = []
     try:
         import matplotlib.pyplot as _plt
@@ -324,9 +379,26 @@ def _capture_figures() -> list[dict[str, Any]]:
     return captured
 
 def _python_error_help(error: BaseException) -> str | None:
+    """A one-line recovery hint for common exception types, or None."""
     if isinstance(error, (ModuleNotFoundError, ImportError)):
         missing = getattr(error, "name", None)
-        distribution = str(missing).split(".")[0] if missing else "<distribution>"
+        top_level = str(missing).split(".")[0] if missing else None
+        # Only suggest provision_dependency for import names that are also PyPI
+        # distribution names. Common offenders have different distribution names
+        # (PIL -> pillow, cv2 -> opencv-python, sklearn -> scikit-learn, ...);
+        # suggesting the import name there installs a package that does not
+        # exist or the wrong one. The host's provision_dependency maps import
+        # names to distributions for the packages it knows about, so stay quiet
+        # for the mismatched ones instead of lying.
+        KNOWN_MISMATCHED_DISTRIBUTIONS = {
+            "PIL": "pillow", "cv2": "opencv-python", "sklearn": "scikit-learn",
+            "Crypto": "pycryptodome", "yaml": "pyyaml", "dateutil": "python-dateutil",
+            "dotenv": "python-dotenv", "serial": "pyserial", "pptx": "python-pptx",
+            "docx": "python-docx", "gi": "PyGObject", "usb": "pyusb",
+        }
+        if top_level is None:
+            return "help: install the module's PyPI distribution with provision_dependency('<distribution>') then re-run"
+        distribution = KNOWN_MISMATCHED_DISTRIBUTIONS.get(top_level, top_level)
         return f"help: install it with provision_dependency('{distribution}') then re-run"
     if isinstance(error, NameError):
         return "help: name is undefined — define it, or inspect_kernel to see live names (the kernel may have restarted)"
@@ -340,12 +412,17 @@ def _python_error_help(error: BaseException) -> str | None:
 
 
 def _traceback_with_help(error: BaseException) -> str:
+    """Format the current exception's traceback, appending a recovery hint when
+    _python_error_help has one for it."""
     traceback_text = _ptc_traceback.format_exc().rstrip()
     hint = _python_error_help(error)
     return f"{traceback_text}\n{hint}" if hint else traceback_text
 
 
 def _stringify_output(value: Any) -> str:
+    """Serialize a cell's return value for the host: strings pass through,
+    JSON-able values dump (sorted keys, repr fallback), everything else goes
+    through str(). Never raises."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -365,6 +442,9 @@ def _stringify_output(value: Any) -> str:
 
 
 async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
+    """One-shot entry: run user_main under the tracer/stdout proxy, then emit a
+    "complete" frame (spool-capped output plus captured figures), or an "error"
+    frame followed by exit(1) on failure."""
     try:
         _setup_matplotlib()
         await _rpc.start_reader()

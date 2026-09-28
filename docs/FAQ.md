@@ -6,7 +6,7 @@ Answers grounded in clean-environment install tests (fresh `PI_CODING_AGENT_DIR`
 
 Distilled from a verified clean install (pi 0.87.1, node v26, python 3.14, no `pi-profiles`, no `pi-tool-tree`):
 
-1. **Install the extension:** `pi install /path/to/repo` (local path, loads in place, no copy) or `pi install git:github.com/edxeth/pi-ptc-next` (clones to `<agent-dir>/git/github.com/edxeth/pi-ptc-next` and runs npm install — expect benign-looking npm warnings about unapproved install scripts for `koffi` and `protobufjs`).
+1. **Install the extension:** `pi install /path/to/repo` (local path, loads in place, no copy) or `pi install git:github.com/Quinntyx/pi-ptc-next` (clones to `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs npm install — expect benign-looking npm warnings about unapproved install scripts for `koffi` and `protobufjs`).
 2. **Have `python3` on PATH.** `uv` is optional (the venv falls back to `python3 -m venv`); no `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps. `shiki` is only a dynamic import with a plain-text fallback, so its absence is invisible.
 3. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s; no-uv fallback ~7.0s.
 
@@ -51,11 +51,11 @@ The old `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` startup gate was removed — there is
 
 ### Is there any sandboxing or cell-level confinement?
 
-No. Python cells run as a local subprocess and can spawn arbitrary child processes freely — `subprocess.run(['touch', ...])` inside a cell succeeds (rc 0). The extension currently only supports "yolo mode"; VM-based checkpointing is planned but complex and not implemented. `PTC_ALLOW_BASH` / `PTC_ALLOW_MUTATIONS` (both default **false**) only gate which *host tools* are bridged into Python — raw `subprocess` is never blocked.
+No. Python cells run as a local subprocess and can spawn arbitrary child processes freely — `subprocess.run(['touch', ...])` inside a cell succeeds (rc 0). The extension currently only supports "yolo mode"; VM-based checkpointing is planned but complex and not implemented. `PTC_ALLOW_BASH` (default **false**) gates only the bridged `bash` tool — raw `subprocess` is never blocked, and mutating tools are not gated at all.
 
 ### Why does calling `bash(...)` in a cell raise `NameError: name 'bash' is not defined`?
 
-With `PTC_ALLOW_BASH=false` / `PTC_ALLOW_MUTATIONS=false` (the defaults), blocked host tools are silently filtered out of the bridge (`src/tool-registry.ts:236-254`), so Python sees a missing name rather than a policy message. The model gets no hint that the tool exists but is blocked by policy — set `PTC_ALLOW_BASH=true` / `PTC_ALLOW_MUTATIONS=true` (or use `PTC_TRUSTED_READ_ONLY_TOOLS` / `PTC_CALLABLE_TOOLS` / `PTC_BLOCKED_TOOLS` to tune the allow/deny lists) if you want it.
+With `PTC_ALLOW_BASH=false` (the default), `bash` is silently filtered out of the bridge, so Python sees a missing name rather than a policy message. The model gets no hint that the tool exists but is blocked by policy — set `PTC_ALLOW_BASH=true` (or use `PTC_CALLABLE_TOOLS` / `PTC_BLOCKED_TOOLS` to tune the allow/deny lists) if you want it. Mutating tools like `edit`/`write` are not gated: filtering them is futile when cells can edit files natively (yolo mode).
 
 ### `provision_kernel` fails with `spawn python3 ENOENT` — what's wrong?
 
@@ -107,7 +107,7 @@ All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
 
 **Required:** none — all variables are optional. (The former mandatory `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` gate was removed; kernels run unsandboxed.)
 
-**Tools/policy:** `PTC_ALLOW_MUTATIONS` (false), `PTC_ALLOW_BASH` (false), `PTC_CALLABLE_TOOLS`, `PTC_BLOCKED_TOOLS`, `PTC_TRUSTED_READ_ONLY_TOOLS`.
+**Tools/policy:** `PTC_ALLOW_BASH` (false), `PTC_CALLABLE_TOOLS`, `PTC_BLOCKED_TOOLS`.
 
 **Routing/recovery/sessions:** `PTC_AUTO_ROUTE` (true), `PTC_AUTO_RECOVER` (false), `PTC_AUTO_RECOVER_MAX_ATTEMPTS` (1, parsed 0–4), `PTC_MAX_PYTHON_SESSIONS` (4, clamped 1–32; enforcement currently disabled), `PTC_DEBUG` (false — `[PTC]` debug lines), `PTC_SUBAGENT_FOOTER` (true).
 
@@ -121,7 +121,7 @@ All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
 
 ### What happens if I set a nonsense value for a `PTC_*` variable?
 
-Nothing — silently. Garbage values are swallowed by lenient parsing (`src/utils.ts:10-58`): booleans are true only for `1/true/yes/on`; `parseInt` semantics mean `12abc` → 12 (so `PTC_EXECUTION_TIMEOUT_MS=270_000` becomes 270); `0` fails the `> 0` check and falls back to the default (8 for parallel calls); `999` sessions clamps to 32. Nothing is ever reported. A run with `PTC_AUTO_ROUTE=banana PTC_MAX_PARALLEL_TOOL_CALLS=0 PTC_MAX_PYTHON_SESSIONS=999 PTC_MAX_OUTPUT_CHARS=-5 PTC_MAX_SPOOL_CHARS=oink PTC_ALLOW_BASH=banana PTC_ALLOW_MUTATIONS=banana PTC_EXECUTION_TIMEOUT_MS=hotdog` loaded, ran a kernel, and produced normal output.
+Nothing — silently. Garbage values are swallowed by lenient parsing (`src/utils.ts:10-58`): booleans are true only for `1/true/yes/on`; `parseInt` semantics mean `12abc` → 12 (so `PTC_EXECUTION_TIMEOUT_MS=270_000` becomes 270); `0` fails the `> 0` check and falls back to the default (8 for parallel calls); `999` sessions clamps to 32. Nothing is ever reported. A run with `PTC_AUTO_ROUTE=banana PTC_MAX_PARALLEL_TOOL_CALLS=0 PTC_MAX_PYTHON_SESSIONS=999 PTC_MAX_OUTPUT_CHARS=-5 PTC_MAX_SPOOL_CHARS=oink PTC_ALLOW_BASH=banana PTC_EXECUTION_TIMEOUT_MS=hotdog` loaded, ran a kernel, and produced normal output.
 
 ### Why does my cell keep getting interrupted with `KeyboardInterrupt`?
 
@@ -132,7 +132,7 @@ Nothing — silently. Garbage values are swallowed by lenient parsing (`src/util
 Cells producing more than `PTC_OUTPUT_PREVIEW_CHARS`/`PTC_MAX_OUTPUT_CHARS` (default **12 000** chars) come back as a head/tail preview with a pointer, e.g.:
 
 ```
-... 1 lines hidden (50004 of 50048 chars) — full output: read_cell_output(cell_idx=1)
+... 1 lines hidden (50004 of 50048 chars) — full output: read_cell_output(cellIdx=1)
 ```
 
 Full output is persisted in the notebook and readable via `read_cell_output(cellIdx, offset?, limit?)` (max 2 000 lines / 50 KB per call; `PTC_MAX_SPOOL_CHARS` = 10 M chars is only an emergency capture valve). Other fixed limits: 4 Python sessions max, 8 parallel nested tool calls, 270 s idle timeout, `PTC_AUTO_ROUTE=true`, `PTC_AUTO_RECOVER=false`.
@@ -147,7 +147,7 @@ Children spawned from a cell inherit the interpreter's RPC pipes. Any child that
 
 ### Which host tools can my Python code call, and how do I get more?
 
-By default a safe built-in subset is bridged (`read`, `glob`/`find`, `grep`, `ls`, and more — see README "Available Python functions" and `docs/tool-bridge.md`). Mutating tools and `bash` need `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH=true`; custom/extension tools need read-only metadata or `PTC_TRUSTED_READ_ONLY_TOOLS`. Blocked tools show up as bare `NameError`s (see above).
+By default a safe built-in subset is bridged (`read`, `glob`/`find`, `grep`, `ls`, and more — see README "Available Python functions" and `docs/tool-bridge.md`). `bash` needs `PTC_ALLOW_BASH=true`; mutating tools are not gated. Blocked tools show up as bare `NameError`s (see above).
 
 ### Where does the notebook library live?
 
@@ -167,7 +167,7 @@ By default a safe built-in subset is bridged (`read`, `glob`/`find`, `grep`, `ls
 
 Remove all of these (tested paths):
 
-- The extension: `pi remove <pkg>` (e.g. `pi remove git:github.com/edxeth/pi-ptc-next`, ~0.3s), and the `"packages"` entry it wrote in `settings.json` for local-path installs.
+- The extension: `pi remove <pkg>` (e.g. `pi remove git:github.com/Quinntyx/pi-ptc-next`, ~0.3s), and the `"packages"` entry it wrote in `settings.json` for local-path installs.
 - `PI_CODING_AGENT_DIR` tree (e.g. `/tmp/.../pi-home`) if you used a throwaway one.
 - `$HOME/.cache/pi-ptc` — the venv, the managed pi-subagents clone, `subagents-sync.log`, and the lock file.
 - `$HOME/.config/pi/profiles/subagents` if you created a subagents profile.

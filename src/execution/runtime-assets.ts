@@ -7,6 +7,7 @@ export interface PythonRuntimeSources {
   sessionCode: string;
 }
 
+/** Look for src/python-runtime/ then python-runtime/ under the extension root; throws when neither holds the full asset set. */
 function resolveRuntimeDir(extensionRoot: string): string {
   const candidates = [
     path.join(extensionRoot, "src", "python-runtime"),
@@ -24,6 +25,7 @@ function resolveRuntimeDir(extensionRoot: string): string {
   throw new Error(`Expected Python runtime assets in one of: ${candidates.join(", ")}`);
 }
 
+/** Read rpc.py, runtime.py, and session.py from the extension's Python runtime dir. */
 export function loadPythonRuntimeSources(extensionRoot: string): PythonRuntimeSources {
   const runtimeDir = resolveRuntimeDir(extensionRoot);
   const rpcPath = path.join(runtimeDir, "rpc.py");

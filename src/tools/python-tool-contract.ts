@@ -62,14 +62,18 @@ export const BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set(Object.keys(BUILT
 
 export interface PythonParamMetadata {
   name: string;
+  /** Rendered parameter annotation, e.g. `path: str` or `limit: Optional[int] = None`. */
   signature: string;
+  /** True when the param is optional and rendered keyword-only (after `*`). */
   keywordOnly: boolean;
 }
 
+/** Per-builtin metadata (read-only flag, Python return type, optional hand-written signature); undefined for unknown tools. */
 export function getBuiltinToolContract(toolName: string): BuiltinToolContract | undefined {
   return BUILTIN_TOOL_CONTRACTS[toolName];
 }
 
+/** Read-only classification: explicit `ptc.readOnly` wins, else the builtin contract, else false. */
 export function classifyBuiltinTool(toolName: string, ptc?: PtcToolOptions): { isReadOnly: boolean } {
   if (typeof ptc?.readOnly === "boolean") {
     return { isReadOnly: ptc.readOnly };
@@ -78,6 +82,7 @@ export function classifyBuiltinTool(toolName: string, ptc?: PtcToolOptions): { i
   return { isReadOnly: getBuiltinToolContract(toolName)?.isReadOnly ?? false };
 }
 
+/** True when the schema is a `T | null` union (i.e. the parameter accepts None). */
 export function isOptionalSchema(schema: TSchema): boolean {
   const anyOf = (schema as { anyOf?: TSchema[] }).anyOf;
   return Array.isArray(anyOf)
@@ -85,6 +90,7 @@ export function isOptionalSchema(schema: TSchema): boolean {
     : false;
 }
 
+/** Strip the `null` member from a `T | null` union schema; non-unions pass through. */
 export function extractNonNullSchema(schema: TSchema): TSchema {
   const anyOf = (schema as { anyOf?: TSchema[] }).anyOf;
   if (!Array.isArray(anyOf)) {
@@ -105,6 +111,11 @@ function collapseUnionTypes(types: string[]): string {
   return `Union[${unique.join(", ")}]`;
 }
 
+/**
+ * Map a TypeBox schema to a Python type annotation (`str`, `int`, `float`,
+ * `bool`, `List[T]`, `Dict[str, Any]`, `None`); unions become `Union[...]`
+ * (null members dropped) and unknown shapes degrade to `Any`.
+ */
 export function schemaToPythonType(schema: TSchema): string {
   const anyOf = (schema as { anyOf?: TSchema[] }).anyOf;
   if (Array.isArray(anyOf) && anyOf.length > 0) {
@@ -136,10 +147,16 @@ export function schemaToPythonType(schema: TSchema): string {
   }
 }
 
+/** The name the helper gets inside cells: `ptc.pythonName` if set, else the tool name. */
 export function getPythonHelperName(tool: ToolInfo): string {
   return tool.ptc?.pythonName || tool.name;
 }
 
+/**
+ * Reject duplicate Python helper names across the tool set, and helper names
+ * that shadow the builtin helpers or PTC machinery (`ptc`, `_rpc_call`, …)
+ * when claimed by a differently named tool. Throws with the offending names.
+ */
 export function validatePythonHelperNames(tools: ToolInfo[]): void {
   const seen = new Map<string, string>();
 
@@ -156,10 +173,16 @@ export function validatePythonHelperNames(tools: ToolInfo[]): void {
   }
 }
 
+/** Python return type for a tool: the builtin contract's type, else `Any`. */
 export function getPythonReturnType(tool: ToolInfo): string {
   return getBuiltinToolContract(tool.name)?.pythonReturnType ?? "Any";
 }
 
+/**
+ * Per-parameter Python metadata derived from the tool's JSON schema. Params
+ * that are not required, or whose schema accepts null, become keyword-only
+ * with `Optional[T] = None` (null members stripped from the type).
+ */
 export function buildPythonParamMetadata(tool: ToolInfo): PythonParamMetadata[] {
   const params = ((tool.parameters as { properties?: Record<string, TSchema> })?.properties) || {};
   const required = new Set(((tool.parameters as { required?: string[] })?.required) || []);
@@ -187,6 +210,7 @@ function splitPythonParams(params: PythonParamMetadata[]): {
   };
 }
 
+/** Single-line signature (helper documentation), required params first, optional ones after `*`. */
 export function buildInlinePythonSignature(
   pythonName: string,
   returnType: string,
@@ -206,6 +230,7 @@ export function buildInlinePythonSignature(
   return `${pythonName}(${parts.join(", ")}) -> ${returnType}`;
 }
 
+/** Multi-line `async def` source rendered into the generated tool wrappers. */
 export function buildMultilinePythonSignature(
   pythonName: string,
   returnType: string,
@@ -226,6 +251,11 @@ export function buildMultilinePythonSignature(
   return `${signature}\n) -> ${returnType}:`;
 }
 
+/**
+ * One-line signature for a tool's Python helper. Builtins with a
+ * hand-written signature (currently `read`) use it; everything else is
+ * synthesized from the tool's schema.
+ */
 export function describePythonHelper(tool: ToolInfo): string {
   const pythonName = getPythonHelperName(tool);
   const builtinSignature = getBuiltinToolContract(tool.name)?.helperSignature;
@@ -238,6 +268,7 @@ export function describePythonHelper(tool: ToolInfo): string {
   return buildInlinePythonSignature(pythonName, returnType, params);
 }
 
+/** Signatures for the full helper surface shown in the exec_cell description. */
 export function describePythonHelpers(tools: ToolInfo[]): string[] {
   return tools.map((tool) => describePythonHelper(tool));
 }

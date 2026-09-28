@@ -1,10 +1,20 @@
 import type { PtcSettings } from "./contracts/settings";
 import { PtcAbortError, PtcTimeoutError } from "./execution/execution-errors";
 
+/** Failure shapes that automatic recovery knows how to coach the model past. */
 export type RecoveryFailureClass = "missing-await" | "async-wrapper-iterated";
+/**
+ * How a request ended from the recovery system's viewpoint. Aborts and
+ * timeouts leave terminalState null (see noteCodeExecutionFailure).
+ */
 export type RecoveryTerminalState = "success" | "failed_without_recovery" | "failed_after_recovery";
+/** Whether the request's first tool use went through code execution or a direct tool call. */
 export type PtcFirstToolPath = "code_execution" | "direct";
 
+/**
+ * Per-request recovery bookkeeping, threaded through the extension's session
+ * state and stamped into exec_cell result details as telemetry.
+ */
 export interface PtcRecoveryState {
   autoRouted: boolean;
   firstToolPath: PtcFirstToolPath | null;
@@ -16,6 +26,7 @@ export interface PtcRecoveryState {
   terminalState: RecoveryTerminalState | null;
 }
 
+/** Model-safe subset of PtcRecoveryState emitted in tool result details. */
 export interface PtcExecutionTelemetry {
   autoRouted: boolean;
   firstToolPath: PtcFirstToolPath | null;
@@ -25,12 +36,14 @@ export interface PtcExecutionTelemetry {
   terminalState: RecoveryTerminalState | null;
 }
 
+/** Whether automatic recovery was eligible, attempted, and for what failure class. */
 export interface PtcRecoveryDetails {
   eligible: boolean;
   attempted: boolean;
   failureClass: RecoveryFailureClass | null;
 }
 
+/** Fresh per-request state; every counter null/zero. */
 export function createPtcRecoveryState(): PtcRecoveryState {
   return {
     autoRouted: false,
@@ -44,10 +57,12 @@ export function createPtcRecoveryState(): PtcRecoveryState {
   };
 }
 
+/** Mark that the routing heuristic (not the model) pushed this request toward exec_cell. */
 export function noteAutomaticRouting(state: PtcRecoveryState): void {
   state.autoRouted = true;
 }
 
+/** Record one code-execution attempt and set firstToolPath if this is the first. */
 export function noteCodeExecutionAttempt(state: PtcRecoveryState): void {
   state.routedToCodeExecution = true;
   if (!state.firstToolPath) {
@@ -67,6 +82,7 @@ export function noteDirectToolCall(state: PtcRecoveryState): void {
   }
 }
 
+/** Whether an automatic recovery prompt may still be armed for this request. */
 export function canAttemptAutomaticRecovery(
   state: PtcRecoveryState,
   settings: Pick<PtcSettings, "autoRecover" | "autoRecoverMaxAttempts">
@@ -80,6 +96,10 @@ export function canAttemptAutomaticRecovery(
   );
 }
 
+/**
+ * Arm one automatic recovery attempt (consuming budget) for the given failure
+ * class. Returns false when recovery is disabled or the attempt cap is hit.
+ */
 export function armAutomaticRecovery(
   state: PtcRecoveryState,
   settings: Pick<PtcSettings, "autoRecover" | "autoRecoverMaxAttempts">,
@@ -95,20 +115,25 @@ export function armAutomaticRecovery(
   return true;
 }
 
+/** Stamp the request as successfully finished. */
 export function noteCodeExecutionSuccess(state: PtcRecoveryState): void {
   state.terminalState = "success";
 }
 
+/**
+ * Stamp a terminal failure state, distinguishing recovered from unrecovered
+ * runs. User aborts (Ctrl-C) and host-side timeouts are not recoverable
+ * execution failures: stamping them as terminal failures misrepresents the run
+ * as one where recovery logic failed, so terminalState is left untouched.
+ */
 export function noteCodeExecutionFailure(state: PtcRecoveryState, error?: unknown): void {
-  // User aborts (Ctrl-C) and host-side timeouts are not recoverable execution
-  // failures: stamping them as terminal failures misrepresents the run as one
-  // where recovery logic failed, so leave terminalState untouched.
   if (error instanceof PtcAbortError || error instanceof PtcTimeoutError) {
     return;
   }
   state.terminalState = state.recoveryAttempted ? "failed_after_recovery" : "failed_without_recovery";
 }
 
+/** Project the request state into the model-safe telemetry shape. */
 export function buildPtcExecutionTelemetry(state: PtcRecoveryState): PtcExecutionTelemetry {
   return {
     autoRouted: state.autoRouted,
@@ -120,6 +145,7 @@ export function buildPtcExecutionTelemetry(state: PtcRecoveryState): PtcExecutio
   };
 }
 
+/** Project whether recovery was eligible/attempted (and its failure class) for result details. */
 export function buildPtcRecoveryDetails(state: PtcRecoveryState): PtcRecoveryDetails {
   return {
     eligible: state.failureClass !== null,

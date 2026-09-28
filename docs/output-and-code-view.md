@@ -22,7 +22,7 @@ The renderer parses this same text back into sections with `parseSectionedOutput
 `collapseOutputPreview` (`src/utils.ts`) caps the model-visible result at `settings.outputPreviewChars` (default 12,000, from `PTC_OUTPUT_PREVIEW_CHARS`). Over the limit, it builds a whole-line preview — roughly 70% head, 30% tail — with a settled marker line:
 
 ```
-... N lines hidden (M of T chars) — full output: read_cell_output(cell_idx=K) ...
+... N lines hidden (M of T chars) — full output: read_cell_output(cellIdx=K) ...
 ```
 
 The marker's own width eats into the budget, so a fixed-point loop (up to 8 passes) settles the digit widths before the final cut; a configured limit so small that both sides cannot fit is trimmed at the inner edges. The untruncated output is never modified — it is persisted to the notebook and re-read by `read_cell_output`.
@@ -75,7 +75,7 @@ The model receives (abridged):
 ```
 output:
   <describe() output, or the head/tail preview if it exceeds 12,000 chars>
-  ... 812 lines hidden (34,551 of 41,203 chars) — full output: read_cell_output(cell_idx=3) ...
+  ... 812 lines hidden (34,551 of 41,203 chars) — full output: read_cell_output(cellIdx=3) ...
 
 return (Out[3]):
   region    amount    count
@@ -116,6 +116,5 @@ Colors in the code view, `[PTC]` header, and approval box come from the active p
 - **Shiki is bundled, but highlight failure is silent.** `shiki` is a regular dependency of the package, so the approval popup works out of the box. Under the extension's jiti-based TypeScript loader the ESM import is shimmed specially; if highlighting ever fails you get plain text and, with `PTC_DEBUG=1`, a `[PTC] shiki unavailable...` line. No action needed.
 - **`PTC_CODE_THEME` must be a valid Shiki theme name** (e.g. `github-dark`, `github-light`, `one-dark-pro`). An invalid name logs a debug message and falls back to plain text; it does not crash the popup.
 - **Subagent panel and shimmer are optional.** The `subagents:` section, the workflow rollup, the footer status, and the shimmer animation only appear when the cell actually spawned `pi_subagents` pools, and the shimmer integrates with the `pi-tool-tree` extension via a `globalThis` API when installed. Without those extensions everything degrades to plain rendering — no extra setup.
-- **Preview marker parameter name.** The collapse marker tells the model to continue with `read_cell_output(cell_idx=K)`, but the tool's actual parameter is `cellIdx` (camelCase). If you see the model pass `cell_idx`, this is why (known issue, logged in `BUGS.md`); the docstring and schema use `cellIdx`.
 - **Cell numbering includes sourced prefix cells.** If a kernel was provisioned with a `source` notebook, prefix cells (including markdown) count toward numbering — with 7 source cells, the first new cell is 8. `read_cell_output` matches the `execution_count` shown in `Out[n]` and previews, so use those numbers, not the position in the file.
 - **The full output lives in the notebook file.** `read_cell_output` reads the `.ipynb` bound to the most recently used kernel. If you moved or deleted the notebook mid-session, paging fails with a `could not read notebook ...` error; keep the file in place until the session ends.

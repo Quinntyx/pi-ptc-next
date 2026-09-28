@@ -1,9 +1,13 @@
 import { formatWithOptions } from "util";
 import type { PtcSettings } from "./contracts/settings";
 
+/** Default model-visible exec-result preview budget (characters, head+tail combined). */
 export const DEFAULT_OUTPUT_PREVIEW_CHARS = 12_000;
+/** Runtime-side emergency spool ceiling for total captured cell output (characters, not a model-facing limit). */
 export const DEFAULT_MAX_SPOOL_CHARS = 10_000_000;
+/** Default max lines returned per read_cell_output page. */
 export const DEFAULT_CELL_OUTPUT_LINES = 2_000;
+/** Per-page UTF-8 byte cap for cell output; also the overlong-single-line truncation point. */
 export const DEFAULT_CELL_OUTPUT_BYTES = 50 * 1024;
 const DEFAULT_EXECUTION_TIMEOUT_MS = 270_000;
 const DEFAULT_MAX_PARALLEL_TOOL_CALLS = 8;
@@ -60,6 +64,11 @@ function emptyToUndefined(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+/**
+ * Parse PTC_* environment variables into a PtcSettings (documented defaults
+ * applied for unset/invalid values). Also flips process-wide debug logging on
+ * when PTC_DEBUG is truthy; call once at extension load.
+ */
 export function loadSettingsFromEnv(): PtcSettings {
   const settings = {
     executionTimeoutMs: parsePositiveIntEnv(
@@ -71,7 +80,6 @@ export function loadSettingsFromEnv(): PtcSettings {
       DEFAULT_OUTPUT_PREVIEW_CHARS
     ),
     maxSpoolChars: parsePositiveIntEnv(process.env.PTC_MAX_SPOOL_CHARS, DEFAULT_MAX_SPOOL_CHARS),
-    allowMutations: parseBooleanEnv(process.env.PTC_ALLOW_MUTATIONS, false),
     allowBash: parseBooleanEnv(process.env.PTC_ALLOW_BASH, false),
     maxParallelToolCalls: parsePositiveIntEnv(
       process.env.PTC_MAX_PARALLEL_TOOL_CALLS,
@@ -81,7 +89,6 @@ export function loadSettingsFromEnv(): PtcSettings {
     autoRoute: parseBooleanEnv(process.env.PTC_AUTO_ROUTE, true),
     autoRecover: parseBooleanEnv(process.env.PTC_AUTO_RECOVER, false),
     autoRecoverMaxAttempts: parseClampedIntEnv(process.env.PTC_AUTO_RECOVER_MAX_ATTEMPTS, 1, 0, 4),
-    trustedReadOnlyTools: parseListEnv(process.env.PTC_TRUSTED_READ_ONLY_TOOLS),
     callableTools: parseListEnv(process.env.PTC_CALLABLE_TOOLS),
     blockedTools: parseListEnv(process.env.PTC_BLOCKED_TOOLS),
     maxPythonSessions: parseClampedIntEnv(process.env.PTC_MAX_PYTHON_SESSIONS, 4, 1, 32),
@@ -94,12 +101,23 @@ export function loadSettingsFromEnv(): PtcSettings {
   return settings;
 }
 
+/**
+ * Heuristic mutation-flavor detector over the prompt text. Used to suppress
+ * auto-routing to exec_cell and to disallow automatic recovery for
+ * mutation-y requests (mutating work stays on the direct tool path).
+ */
 export function isMutationPrompt(prompt: string): boolean {
   return /\b(edit|write|modify|change|update|fix|create|delete|rename|refactor|patch|implement|add|remove)\b/.test(
     prompt.trim().toLowerCase()
   );
 }
 
+/**
+ * Heuristic router: true when the prompt looks like a fan-out/aggregation job
+ * that belongs in a Python kernel (explicit exec-tool mentions always route;
+ * mutation prompts never do). Conservative by design — false negatives are
+ * fine, false positives hijack the request.
+ */
 export function shouldAutoRoutePromptToCodeExecution(prompt: string): boolean {
   const normalized = prompt.trim().toLowerCase();
   if (!normalized) {
@@ -151,7 +169,12 @@ function countNewlines(text: string): number {
 // prefix-trust: a cell that prints "kernel:" lands *inside* the output section,
 // visibly distinct from the real marker.
 
-export const OUTPUT_SECTION_NAMES = ["output", "return", "kernel", "subagents"] as const;
+/**
+ * Column-0 section marker names the host composes/parses in exec results.
+ * Note the host also emits a `tools:` section (nested-call summary) that is
+ * not listed here.
+ */
+export const OUTPUT_SECTION_NAMES = ["output", "return", "kernel", "subagents", "tools"] as const;
 
 /** Indent a cell-produced body under a column-0 host marker. */
 export function sectionize(name: string, body: string): string {
@@ -175,7 +198,7 @@ export interface OutputSection {
  * caller can render it verbatim.
  */
 export function parseSectionedOutput(text: string): OutputSection[] | null {
-  const markerRe = /^(output|return|kernel|subagents)\b[^\n]*?:(.*)$/;
+  const markerRe = /^(output|return|kernel|subagents|tools)\b[^\n]*?:(.*)$/;
   const sections: OutputSection[] = [];
   let current: OutputSection | undefined;
   let sawMarker = false;
@@ -242,7 +265,7 @@ export function collapseOutputPreview(output: string, previewChars: number, cell
     ({ headEnd, tailStart } = previewBounds(output, contentChars));
     const hiddenChars = tailStart - headEnd;
     const hiddenLines = hiddenLineCount(output, headEnd, tailStart);
-    const nextMarker = `... ${hiddenLines} lines hidden (${hiddenChars} of ${output.length} chars) — full output: read_cell_output(cell_idx=${cellIdx}) ...`;
+    const nextMarker = `... ${hiddenLines} lines hidden (${hiddenChars} of ${output.length} chars) — full output: read_cell_output(cellIdx=${cellIdx}) ...`;
     if (nextMarker === marker) break;
     marker = nextMarker;
   }
@@ -272,7 +295,13 @@ function truncateUtf8Head(text: string, maxBytes: number): string {
   return buffer.subarray(0, end).toString("utf8");
 }
 
-/** Apply read-like 1-based line slicing and bounded single-line handling. */
+/**
+ * Apply read-like 1-based line slicing and bounded single-line handling:
+ * offsets beyond the end throw; a single overlong first line (>
+ * DEFAULT_CELL_OUTPUT_BYTES UTF-8 bytes) is head-truncated; pages over
+ * DEFAULT_CELL_OUTPUT_LINES lines or DEFAULT_CELL_OUTPUT_BYTES bytes get a
+ * continuation notice.
+ */
 export function sliceCellOutput(
   output: string,
   options: { cellIdx: number; offset?: number; limit?: number }
@@ -333,6 +362,11 @@ export function pythonErrorHelpHint(errorText: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Append a single deterministic `help:` hint for common Python exceptions to a
+ * traceback (or return the hint alone when there is no traceback). Skipped
+ * when a help line is already present.
+ */
 export function appendPythonErrorHelp(traceback: string | undefined, message: string): string | undefined {
   const hint = pythonErrorHelpHint(`${message}\n${traceback ?? ""}`);
   if (!hint || traceback?.split("\n").some((line) => line.startsWith("help:"))) {
@@ -341,10 +375,16 @@ export function appendPythonErrorHelp(traceback: string | undefined, message: st
   return traceback ? `${traceback.trimEnd()}\n${hint}` : hint;
 }
 
+/** Rough model-token estimate (~4 chars/token, rounded up). */
 export function estimateTokensFromChars(chars: number): number {
   return Math.ceil(chars / 4);
 }
 
+/**
+ * Pre-execution guard for model-authored cells. Throws (before the cell runs)
+ * on asyncio.run(...) — top-level await already works — and on direct
+ * _rpc_call(...) — generated helpers must be used instead.
+ */
 export function validateUserCode(userCode: string): void {
   if (/\basyncio\.run\s*\(/.test(userCode)) {
     throw new Error(
@@ -367,12 +407,17 @@ function formatLogMessage(message: string, args: unknown[]): string {
   return `${DEBUG_PREFIX} ${message}${suffix}`;
 }
 
+/**
+ * Debug logger, gated on the PTC_DEBUG setting captured by
+ * loadSettingsFromEnv; writes `[PTC] ...` lines to stdout.
+ */
 export function debugLog(message: string, ...args: unknown[]): void {
   if (debugLoggingEnabled) {
     process.stdout.write(`${formatLogMessage(message, args)}\n`);
   }
 }
 
+/** Emit a process warning tagged with code "PTC" and the same [PTC] prefix. */
 export function logWarning(message: string, ...args: unknown[]): void {
   process.emitWarning(formatLogMessage(message, args), { code: "PTC" });
 }

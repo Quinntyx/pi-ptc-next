@@ -22,10 +22,12 @@ export const PTC_TOOL_NAMES = [...BASE_PTC_TOOL_NAMES, "read_cell_output"] as co
 
 const PTC_OWNED_TOOLS: ReadonlySet<string> = new Set(PTC_TOOL_NAMES);
 
+/** Whether `name` is one of the PTC-owned tool names (see PTC_TOOL_NAMES). */
 function isPtcOwnedTool(name: string): boolean {
   return PTC_OWNED_TOOLS.has(name);
 }
 
+/** Read-only classification for a tool: explicit `ptc.readOnly` wins, else the builtin contract, else false. */
 function classifyTool(name: string, ptc?: PtcToolOptions): { isReadOnly: boolean } {
   return classifyBuiltinTool(name, ptc);
 }
@@ -53,16 +55,23 @@ function getConfiguredCallers(tool: ToolInfo): Set<PtcCaller> {
   return new Set(["direct"]);
 }
 
+/** Whether the tool may be invoked directly by the model (not just from inside a cell). */
 function toolAllowsDirectCaller(tool: ToolInfo): boolean {
   return getConfiguredCallers(tool).has("direct");
 }
 
+/** Whether the tool is exposed as a Python helper inside `exec_cell` cells. */
 function toolAllowsCodeExecutionCaller(tool: ToolInfo): boolean {
   return getConfiguredCallers(tool).has("code_execution");
 }
 
 export interface CallableToolRuntime {
+  /** The filtered, validated tool set exposed to cells (mirrors getCallableTools). */
   tools: ToolInfo[];
+  /**
+   * Execute one bridged tool call from inside a cell. Throws for unknown tool
+   * names or schema-invalid params; `nestedCallId` becomes the tool call id.
+   */
   runTool(toolName: string, params: unknown, nestedCallId: string): Promise<unknown>;
 }
 
@@ -77,6 +86,7 @@ type BuiltinTool =
 
 type BuiltinToolFactory = (cwd: string) => BuiltinTool;
 
+/** Validate `params` against the tool's TypeBox schema; throws with up to three error details. */
 function validateToolParams(tool: ToolInfo, params: unknown): void {
   if (Value.Check(tool.parameters as TSchema, params)) {
     return;
@@ -90,12 +100,22 @@ function validateToolParams(tool: ToolInfo, params: unknown): void {
   throw new Error(`Invalid parameters for ${tool.name}.${suffix}`.trim());
 }
 
+/**
+ * Unified view over builtin, custom (extension-registered), and host tools.
+ *
+ * Extension-registered tools shadow host tools with the same name; PTC-owned
+ * tools are kept out of the callable set (cells reach them via the RPC bridge
+ * instead). Bash is gated by `settings.allowBash`; mutating tools are not
+ * gated — the Python process is unsandboxed (yolo mode), so filtering them
+ * would be futile enforcement.
+ */
 export class ToolRegistry {
   private customTools = new Map<string, ToolInfo>();
   private extensionOwnedToolNames = new Set<string>();
 
   constructor(private pi: ExtensionAPI) {}
 
+  /** Register or replace an extension-owned tool; it shadows any host tool with the same name. */
   upsertTool<TParams extends TSchema, TDetails>(tool: ToolDefinition<TParams, TDetails>): void {
     const ptc = (tool as PtcToolDefinition<TParams, TDetails>).ptc;
     const classification = classifyTool(tool.name, ptc);
@@ -111,6 +131,10 @@ export class ToolRegistry {
     });
   }
 
+  /**
+   * Remove a previously upserted custom tool. Returns false when no custom
+   * tool with that name existed (builtins and host tools are never removed).
+   */
   removeTool(name: string): boolean {
     // Only claim the name as extension-owned when a custom tool was actually
     // removed; otherwise a no-op removeTool("bash") would permanently hide the
@@ -213,15 +237,21 @@ export class ToolRegistry {
     return allTools;
   }
 
+  /** All known tools (builtin + custom + host), custom winning over host on name collisions. */
   getAllTools(cwd?: string): ToolInfo[] {
     return Array.from(this.buildToolMap(cwd).values());
   }
 
+  /**
+   * Tools exposed to cells as Python helpers: PTC-owned and blocked/allow-listed
+   * tools are excluded, bash requires `settings.allowBash`, and a tool must
+   * permit the `code_execution` caller (builtin/alias, or `ptc.enabled` for
+   * extension tools). Throws on duplicate or reserved Python helper names.
+   */
   getCallableTools(cwd: string, settings: PtcSettings): ToolInfo[] {
     const allTools = this.getAllTools(cwd);
     const allowSet = settings.callableTools ? new Set(settings.callableTools) : null;
     const blockedSet = new Set(settings.blockedTools || []);
-    const trustedReadOnlyTools = new Set(settings.trustedReadOnlyTools || []);
 
     const callableTools = allTools.filter((tool) => {
       if (isPtcOwnedTool(tool.name)) {
@@ -237,22 +267,12 @@ export class ToolRegistry {
         return false;
       }
 
+      // Mutations are NOT gated here: the Python process itself is unsandboxed
+      // (yolo mode), so filtering mutating host tools is futile enforcement —
+      // a cell can just as well use native file operations. PTC_ALLOW_BASH
+      // still gates the bash bridge; real isolation arrives with the planned
+      // VM-based sandboxing.
       const isBuiltin = tool.source === "builtin" || tool.source === "alias";
-      const isTrustedReadOnlyCustom =
-        !isBuiltin &&
-        tool.ptc?.enabled === true &&
-        tool.ptc?.readOnly === true &&
-        trustedReadOnlyTools.has(tool.name);
-
-      if (!settings.allowMutations) {
-        if (!isBuiltin && !isTrustedReadOnlyCustom) {
-          return false;
-        }
-        if (!tool.isReadOnly && !isTrustedReadOnlyCustom) {
-          return false;
-        }
-      }
-
       return toolAllowsCodeExecutionCaller(tool) && (isBuiltin || tool.ptc?.enabled === true);
     });
 
@@ -260,6 +280,7 @@ export class ToolRegistry {
     return callableTools;
   }
 
+  /** Names of tools the model may still call directly even when auto-routing to code execution. */
   getAutoRoutableToolNames(cwd: string, settings: PtcSettings): string[] {
     const callableNames = new Set(this.getCallableTools(cwd, settings).map((tool) => tool.name));
     return this.getAllTools(cwd)
@@ -269,6 +290,11 @@ export class ToolRegistry {
       .map((tool) => tool.name);
   }
 
+  /**
+   * Build the runtime handed to a cell: the callable tool set plus a `runTool`
+   * that stamps a `code_execution` caller (with parent/nested call ids) into
+   * the extension context before dispatching.
+   */
   createCallableToolRuntime(
     cwd: string,
     settings: PtcSettings,

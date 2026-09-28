@@ -21,6 +21,7 @@ export const BENCHMARK_OBSERVED_FIRST_PATHS = ["code_execution", "direct", "none
 
 export type BenchmarkObservedFirstPath = (typeof BENCHMARK_OBSERVED_FIRST_PATHS)[number];
 
+/** One case's measured outcome (mirrors EvalCase's snake_case JSON style). */
 export interface BenchmarkResult {
   case_id: string;
   provider: string;
@@ -46,7 +47,9 @@ export interface BenchmarkResultRecord {
 
 export interface BenchmarkRunSummary {
   total_cases: number;
+  /** Cases whose acceptance rules all passed (result.success). */
   successful_cases: number;
+  /** Cases whose observed_first_path is "code_execution". */
   routed_cases: number;
   recovery_attempts: number;
 }
@@ -59,6 +62,7 @@ export interface BenchmarkRegression {
 
 export interface BenchmarkComparison {
   baseline_path: string;
+  /** Routing/recovery/success regressions vs the baseline (see BenchmarkRegression.kind). */
   regressions: BenchmarkRegression[];
   added_case_ids: string[];
   removed_case_ids: string[];
@@ -97,9 +101,15 @@ export interface BenchmarkRunOptions {
   provider: string;
   model: string;
   evalsPath?: string;
+  /** Subset of case ids to run; unknown ids throw. */
   caseIds?: string[];
   baselinePath?: string;
+  /** Overrides generated_at; must be a valid ISO-like timestamp. */
   timestamp?: string;
+  /**
+   * Per-case observation source. Defaults to the deterministic offline executor,
+   * so the suite runs without a model.
+   */
   executor?: BenchmarkCaseExecutor;
 }
 
@@ -108,6 +118,7 @@ interface RuleExpectation {
   value: string;
 }
 
+/** Acceptance-rule string of the form `key=value`; malformed rules never match. */
 function parseRuleExpectation(rule: string): RuleExpectation | null {
   const equalsIndex = rule.indexOf("=");
   if (equalsIndex === -1) {
@@ -159,6 +170,7 @@ function parseFailureClass(value: string | undefined): RecoveryFailureClass | nu
   return null;
 }
 
+/** True only for strings Date.parse accepts that also match the ISO-like shape (guards loose parsing). */
 export function isValidIsoTimestamp(value: string): boolean {
   const trimmed = value.trim();
   return ISO_TIMESTAMP_PATTERN.test(trimmed) && Number.isFinite(Date.parse(trimmed));
@@ -172,10 +184,12 @@ function sanitizeTimestampForFilename(timestamp: string): string {
   return timestamp.replace(/[^A-Za-z0-9._-]+/g, "-");
 }
 
+/** Resolve the eval-case root: `evalsPath` if given, else PTC_EVALS_PATH, else .pi/evals/ptc under cwd. */
 export function resolveBenchmarkEvalsPath(cwd: string = process.cwd(), evalsPath: string = process.env.PTC_EVALS_PATH || ".pi/evals/ptc"): string {
   return path.resolve(cwd, evalsPath);
 }
 
+/** `<provider>__<model>` directory/file slug; non-alphanumeric runs collapse to dashes. */
 export function getProviderModelSlug(provider: string, model: string): string {
   const normalize = (value: string) => {
     const slug = value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -185,14 +199,22 @@ export function getProviderModelSlug(provider: string, model: string): string {
   return `${normalize(provider)}__${normalize(model)}`;
 }
 
+/** Result file location: <evalsPath>/results/<provider-model-slug>/<timestamp>.json. */
 export function getDefaultBenchmarkResultPath(evalsPath: string, provider: string, model: string, timestamp: string): string {
   return path.join(evalsPath, "results", getProviderModelSlug(provider, model), `${sanitizeTimestampForFilename(timestamp)}.json`);
 }
 
+/** Baseline file location: <evalsPath>/baselines/<provider-model-slug>.json. */
 export function getDefaultBenchmarkBaselinePath(evalsPath: string, provider: string, model: string): string {
   return path.join(evalsPath, "baselines", `${getProviderModelSlug(provider, model)}.json`);
 }
 
+/**
+ * Load (and validate) every `cases/*.json` under the evals path, sorted by
+ * filename. With `caseIds`, only those cases are returned and unknown ids
+ * throw (listing the available ids). Throws with the file path on parse or
+ * validation failure.
+ */
 export function loadEvalCasesFromDisk(evalsPath: string, caseIds?: string[]): EvalCase[] {
   const casesDir = path.join(evalsPath, "cases");
   const fileNames = fs
@@ -232,6 +254,13 @@ export function loadEvalCasesFromDisk(evalsPath: string, caseIds?: string[]): Ev
   return matched;
 }
 
+/**
+ * Offline executor for CI: routes via the same heuristic as production
+ * auto-routing but never invokes a model. Recovery/failure-class/output_json
+ * expectations are read from the case's acceptance rules; token counts are
+ * ceil(chars/4) of a synthesized char count and durations are char counts —
+ * estimates, not real timings.
+ */
 export function createDeterministicBenchmarkExecutor(): BenchmarkCaseExecutor {
   return (evalCase, context) => {
     const observed_first_path: BenchmarkObservedFirstPath = shouldAutoRoutePromptToCodeExecution(evalCase.prompt)
@@ -301,6 +330,11 @@ function evaluateRule(rule: string, record: BenchmarkResult, output: string | un
   }
 }
 
+/**
+ * Evaluate every acceptance rule for a case against one observation and
+ * package the outcome. `success` defaults to all non-`success=` rules passing
+ * unless the observation states it; rule_outcomes records each rule's verdict.
+ */
 export function buildBenchmarkResultRecord(
   evalCase: EvalCase,
   provider: string,
@@ -384,6 +418,7 @@ function validateBenchmarkRunShape(value: unknown, filePath: string): BenchmarkR
   return value as unknown as BenchmarkRun;
 }
 
+/** Read and shape-check a previously written benchmark run file; throws on parse or shape errors. */
 export function readBenchmarkRun(filePath: string): BenchmarkRun {
   let parsed: unknown;
   try {
@@ -396,6 +431,12 @@ export function readBenchmarkRun(filePath: string): BenchmarkRun {
   return validateBenchmarkRunShape(parsed, filePath);
 }
 
+/**
+ * Diff a current run against a baseline: flags cases that regressed in routing
+ * (baseline met its expectation, current doesn't), lost recovery, changed
+ * failure class, or lost success. Cases present on only one side are reported
+ * as added/removed, not regressions.
+ */
 export function compareBenchmarkRuns(current: BenchmarkRun, baseline: BenchmarkRun, baselinePath: string): BenchmarkComparison {
   const regressions: BenchmarkRegression[] = [];
   const currentIds = new Set(current.results.map((record) => record.result.case_id));
@@ -455,6 +496,11 @@ export function compareBenchmarkRuns(current: BenchmarkRun, baseline: BenchmarkR
   };
 }
 
+/**
+ * Run the eval suite through `executor` (deterministic offline by default) and
+ * assemble the BenchmarkRun, including a baseline comparison when
+ * `baselinePath` is given. Results are ordered by the executor's completion.
+ */
 export async function runBenchmarkSuite(options: BenchmarkRunOptions): Promise<BenchmarkRun> {
   const evalsPath = resolveBenchmarkEvalsPath(process.cwd(), options.evalsPath);
   const executor = options.executor ?? createDeterministicBenchmarkExecutor();
@@ -483,6 +529,7 @@ export async function runBenchmarkSuite(options: BenchmarkRunOptions): Promise<B
   return run;
 }
 
+/** Write a run as pretty-printed JSON (2-space, trailing newline), creating parent dirs. */
 export function writeBenchmarkRun(filePath: string, run: BenchmarkRun): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(run, null, 2)}\n`, "utf8");
@@ -507,6 +554,7 @@ function requireCliValue(argv: string[], flagIndex: number, flag: string): strin
   return value;
 }
 
+/** Parse the runner CLI; throws on unknown flags, missing values, or a non-ISO --timestamp. */
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
   const parsed: ParsedCliArgs = {
     provider: "local",
@@ -563,6 +611,11 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   return parsed;
 }
 
+/**
+ * CLI entry point: parse args, run the suite, write the result file (default
+ * path from provider/model/timestamp), and print a one-line JSON status with
+ * the results path, summary, and any baseline comparison.
+ */
 export async function runBenchmarkCli(argv: string[] = process.argv.slice(2)): Promise<BenchmarkRun> {
   const parsed = parseCliArgs(argv);
   const evalsPath = resolveBenchmarkEvalsPath(process.cwd(), parsed.evalsPath);
