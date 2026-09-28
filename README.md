@@ -99,7 +99,7 @@ More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom
 | Dependency | What it provides | Without it |
 |---|---|---|
 | `uv` | Preferred for creating the shared venv (`~/.cache/pi-ptc/python-env`) and for `provision_dependency` installs. | Venv creation falls back to `python3 -m venv`; `provision_dependency` fails (no pip fallback) — pre-install packages into the venv yourself. |
-| `pi_subagents` + tmux + `pi-sock` + a `subagents` Pi profile | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). `pi_subagents` is auto-provisioned at session start from git (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). | All core features work untouched; only `import pi_subagents` is unavailable (provisioning failure is a logged warning, never fatal). |
+| `pi_subagents` + tmux + `pi-sock` | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). `pi_subagents` is auto-provisioned at session start from git (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). Subagents run under your own agent dir by default; `PI_CODING_SUBAGENT_DIR` gives them a separate one. | All core features work untouched; only `import pi_subagents` is unavailable (provisioning failure is a logged warning, never fatal). |
 | pi-tool-tree *(experimental)* | Nicer subagent activity display and tool-call activity labels. Currently unstable — known rendering bugs. | Plain rendering; the subagent panel, timers, and the vendored shimmer animation all work without it — you only lose live agent activity labels. |
 
 Note: once the shared venv exists, every kernel prefers it over `python3`; set `PTC_PYTHON_EXECUTABLE` to pin your own interpreter.

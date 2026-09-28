@@ -191,7 +191,7 @@ Handle operations: `await h` / `h.wait(timeout)` -> `AgentResult`;
 `h.state()`, `h.activity()`, `h.agent_state()` for inspection. A settled
 session continues via `stage.submit(new_task, session_handle=h)` - same tmux
 window, new handle and result, old results untouched; omitted model/thinking/
-cwd/profile inherit the session, conflicts raise `SessionReuseError`, and
+cwd/agentDir inherit the session, conflicts raise `SessionReuseError`, and
 `session_name="..."` renames the live session.
 
 Result fields: `task`, `stage`, `handle`, `body` (str or dict response),
@@ -202,7 +202,7 @@ Result fields: `task`, `stage`, `handle`, `body` (str or dict response),
 
 - Every `pi_subagents` object is introspectable: call `help(obj)` (e.g. `help(pool)`, `help(task)`, `help(result)`) inside a cell to see all attributes and methods when this skill is silent on a detail. `dir(obj)` lists them tersely.
 - Resolve every named model: `subagents.best_model_match("flash")` returns one
-  pick (exact slug > profile default provider > first-party > proxied);
+  pick (exact slug > agent dir's default provider > first-party > proxied);
   `model_slugs`/`resolve_models`/`list_models` give full rows. Pass a full
   `provider/model` slug when a specific provider's variant matters.
 - The catalog expires (`PI_SUBAGENTS_CATALOG_TTL`, 120 s) and re-checks live on
