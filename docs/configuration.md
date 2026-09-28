@@ -1,6 +1,6 @@
 # Configuration reference
 
-Everything `pi-ptc-next` does is configured through environment variables. There is no
+Everything `pi-pycells` does is configured through environment variables. There is no
 settings file: the extension reads `process.env` once when it loads (`loadSettingsFromEnv`,
 `src/utils.ts:63`), builds a `PtcSettings` object (`src/contracts/settings.ts`), and uses it
 for the lifetime of the pi session. This page lists every variable, its type, its default,

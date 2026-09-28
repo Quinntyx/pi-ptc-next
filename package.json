@@ -1,7 +1,7 @@
 {
-  "name": "@quinntyx/pi-ptc-next",
+  "name": "pi-pycells",
   "version": "0.1.1",
-  "description": "Programmatic Tool Calling (PTC) extension for pi-coding-agent - enables Python code execution with async tool calls",
+  "description": "Programmatic tool calling (PTC) for pi-coding-agent: persistent Python kernels whose cells call pi tools as async functions",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {

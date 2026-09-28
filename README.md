@@ -1,8 +1,8 @@
-# pi-ptc-next
+# pi-pycells
 
-`pi-ptc-next` (package `@quinntyx/pi-ptc-next`) is an extension for [Pi](https://github.com/mariozechner/pi-coding-agent) that implements Programmatic Tool Calling (PTC): instead of streaming every tool result back into the model's context, the model writes Python cells against a persistent, Jupyter-like kernel and calls Pi's tools (`read`, `grep`, `glob`, …) as ordinary `async` Python functions. Only each cell's final output reaches the model, so multi-step work costs a fraction of the tokens. The same kernels double as launch pads for parallel subagent orchestration (optional; see below).
+`pi-pycells` is an extension for [Pi](https://github.com/earendil-works/pi) that implements Programmatic Tool Calling (PTC): instead of streaming every tool result back into the model's context, the model writes Python cells against a persistent, Jupyter-like kernel and calls Pi's tools (`read`, `grep`, `glob`, …) as ordinary `async` Python functions. Only each cell's final output reaches the model, so multi-step work costs a fraction of the tokens. The same kernels double as launch pads for parallel subagent orchestration (optional; see below).
 
-Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which itself forked [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chris Egersdoerfer.
+Fork of [`edxeth/pi-pycells`](https://github.com/edxeth/pi-pycells), which itself forked [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chris Egersdoerfer.
 
 ## Install
 
@@ -11,10 +11,10 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 1. **Install the extension into Pi:**
 
    ```bash
-   pi install git:github.com/Quinntyx/pi-ptc-next
+   pi install git:github.com/Quinntyx/pi-pycells
    ```
 
-   Pi downloads the extension into its own folder (`~/.pi/agent/git/github.com/Quinntyx/pi-ptc-next` by default) and runs `npm install` there; it usually takes under a minute. For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
+   Pi downloads the extension into its own folder (`~/.pi/agent/git/github.com/Quinntyx/pi-pycells` by default) and runs `npm install` there; it usually takes under a minute. For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
 
 2. **That's the whole install.** No `npm run build` is needed — Pi compiles the extension's TypeScript at load time — and no environment variables are required. On the next `pi` start, the extension registers `provision_kernel`, `exec_cell`, and friends.
 
@@ -28,7 +28,7 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
 4. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is provisioned automatically in the background on first use — provisioning problems are logged to `~/.cache/pi-ptc/subagents-sync.log` and never block the core extension.
 
-To remove: `pi remove git:github.com/Quinntyx/pi-ptc-next`.
+To remove: `pi remove git:github.com/Quinntyx/pi-pycells`.
 
 > **⚠️ Yolo mode — no sandbox.** Pi itself runs tools with your full permissions, and so do these Python kernels: plain processes with full file/network access, nothing sandboxed or gated (cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Don't point it at untrusted code.
 

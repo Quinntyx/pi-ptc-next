@@ -2,7 +2,7 @@
 
 ## What it does
 
-pi-ptc-next lets you extend both the model and the Python runtime with your own tools by dropping plain JavaScript files into the extension's `tools/` directory. Each file defines one tool that pi registers as a normal model-callable tool; by adding a small `ptc` metadata block you can also expose the tool to Python cells running in `exec_cell`, where it appears as an automatically generated `async` helper function. The extension watches the directory while the session runs, so new, edited, renamed, and deleted tool files are picked up without restarting.
+pi-pycells lets you extend both the model and the Python runtime with your own tools by dropping plain JavaScript files into the extension's `tools/` directory. Each file defines one tool that pi registers as a normal model-callable tool; by adding a small `ptc` metadata block you can also expose the tool to Python cells running in `exec_cell`, where it appears as an automatically generated `async` helper function. The extension watches the directory while the session runs, so new, edited, renamed, and deleted tool files are picked up without restarting.
 
 ## How it works
 

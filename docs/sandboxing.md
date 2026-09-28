@@ -2,7 +2,7 @@
 
 ## What it does
 
-`pi-ptc-next` executes Python by spawning a real interpreter process on your host machine — there is no container, VM, or other isolation substrate. **There is currently no sandboxing at all: the extension only supports “yolo mode.”** Sandboxing is work-in-progress/planned — the intended direction is some form of VM-based checkpointing, but the implementation is complex and not started. There is no policy layer at all: gating the model's tools is futile enforcement when the Python process itself can run `os.system`, spawn `subprocess`, and write files natively. In short: the “sandbox” is plain host execution, not isolation.
+`pi-pycells` executes Python by spawning a real interpreter process on your host machine — there is no container, VM, or other isolation substrate. **There is currently no sandboxing at all: the extension only supports “yolo mode.”** Sandboxing is work-in-progress/planned — the intended direction is some form of VM-based checkpointing, but the implementation is complex and not started. There is no policy layer at all: gating the model's tools is futile enforcement when the Python process itself can run `os.system`, spawn `subprocess`, and write files natively. In short: the “sandbox” is plain host execution, not isolation.
 
 ## How it works
 

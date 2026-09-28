@@ -6,7 +6,7 @@ Answers grounded in clean-environment install tests (fresh `PI_CODING_AGENT_DIR`
 
 Distilled from a verified clean install (pi 0.87.1, node v26, python 3.14, no `pi-profiles`, no `pi-tool-tree`):
 
-1. **Install the extension:** `pi install git:github.com/Quinntyx/pi-ptc-next` (the normal way), or `pi install /path/to/repo` for a local checkout (clones to `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs npm install there).
+1. **Install the extension:** `pi install git:github.com/Quinntyx/pi-pycells` (the normal way), or `pi install /path/to/repo` for a local checkout (clones to `<agent-dir>/git/github.com/Quinntyx/pi-pycells` and runs npm install there).
 2. **Have `uv` on PATH — it is required.** uv provisions the Python environment (default CPython 3.14, downloaded automatically if missing) and powers on-demand package installs. No `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps.
 3. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → venv → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s.
 
@@ -18,7 +18,7 @@ No environment variables are required — but note there is **no sandboxing**: k
 
 ### Do I need pi-profiles?
 
-No. There is no pi-profiles *package* dependency anywhere in pi-ptc-next, and kernels don't need profiles. Subagent spawning (via `pi_subagents`) runs spawned agents under the **orchestrator's own agent dir by default** (`PI_CODING_AGENT_DIR` else `~/.pi/agent`) — same config, extensions, and auth, zero setup. To give subagents a separate config, set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config (a pi-profiles-managed profile directory works). Resolution lives entirely in pi-subagents.
+No. There is no pi-profiles *package* dependency anywhere in pi-pycells, and kernels don't need profiles. Subagent spawning (via `pi_subagents`) runs spawned agents under the **orchestrator's own agent dir by default** (`PI_CODING_AGENT_DIR` else `~/.pi/agent`) — same config, extensions, and auth, zero setup. To give subagents a separate config, set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config (a pi-profiles-managed profile directory works). Resolution lives entirely in pi-subagents.
 
 ### Does it work without tmux?
 
@@ -169,7 +169,7 @@ By default the read-only builtins are bridged (`read`, `glob`/`find`, `grep`, `l
 
 Remove all of these (tested paths):
 
-- The extension: `pi remove <pkg>` (e.g. `pi remove git:github.com/Quinntyx/pi-ptc-next`, ~0.3s), and the `"packages"` entry it wrote in `settings.json` for local-path installs.
+- The extension: `pi remove <pkg>` (e.g. `pi remove git:github.com/Quinntyx/pi-pycells`, ~0.3s), and the `"packages"` entry it wrote in `settings.json` for local-path installs.
 - `PI_CODING_AGENT_DIR` tree (e.g. `/tmp/.../pi-home`) if you used a throwaway one.
 - `$HOME/.cache/pi-ptc` — the venv, the managed pi-subagents clone, `subagents-sync.log`, and the lock file.
 - `$HOME/.pi/agent/profiles/subagents` if you gave subagents their own pi-profiles-managed profile via `PI_CODING_SUBAGENT_DIR`.

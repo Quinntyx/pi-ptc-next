@@ -1,6 +1,6 @@
-# pi-ptc-next — master documentation
+# pi-pycells — master documentation
 
-`pi-ptc-next` (package `@quinntyx/pi-ptc-next`) is a **Programmatic Tool Calling (PTC)** extension for [Pi](https://github.com/mariozechner/pi-coding-agent): it gives the model a persistent, Jupyter-like Python kernel (`provision_kernel` + `exec_cell`) that can call the host's pi tools (`read`, `glob`, `grep`, …) as ordinary `async` Python functions, so repo-wide fan-out work happens inside Python cells and only compact final results reach the model's context. It is configured entirely through environment variables, keeps a durable `.ipynb` record of everything it runs, and adds an auto-routing/auto-recovery layer plus an optional multi-agent orchestration runtime (`pi_subagents`).
+`pi-pycells` (package `pi-pycells`) is a **Programmatic Tool Calling (PTC)** extension for [Pi](https://github.com/earendil-works/pi): it gives the model a persistent, Jupyter-like Python kernel (`provision_kernel` + `exec_cell`) that can call the host's pi tools (`read`, `glob`, `grep`, …) as ordinary `async` Python functions, so repo-wide fan-out work happens inside Python cells and only compact final results reach the model's context. It is configured entirely through environment variables, keeps a durable `.ipynb` record of everything it runs, and adds an auto-routing/auto-recovery layer plus an optional multi-agent orchestration runtime (`pi_subagents`).
 
 ## Table of contents
 
@@ -23,7 +23,7 @@
 **1. Install.** No build step and no required environment variables:
 
 ```bash
-pi install git:github.com/Quinntyx/pi-ptc-next
+pi install git:github.com/Quinntyx/pi-pycells
 pi                                             # start pi; the extension registers its tools on session_start
 ```
 
