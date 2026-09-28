@@ -227,7 +227,10 @@ function rotateLogIfNeeded(logFile: string): void {
 
 function hasCommand(cmd: string): boolean {
   try {
-    execFileSync(process.platform === "win32" ? "where" : "which", [cmd], { stdio: "ignore" });
+    // Probe the command directly rather than shelling to `which`/`where`:
+    // minimal containers and some Nix setups lack `which`, which used to make
+    // uv detection silently fail and push venv creation onto the python3 path.
+    execFileSync(cmd, ["--version"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -502,7 +505,9 @@ async function createVenv(paths: Paths): Promise<boolean> {
   if (hasCommand("uv")) {
     return runLogged(paths.logFile, "uv", ["venv", paths.venvDir]);
   }
-  return runLogged(paths.logFile, "python3", ["-m", "venv", paths.venvDir]);
+  // Some systems ship only `python` (no `python3` alias); try both.
+  if (await runLogged(paths.logFile, "python3", ["-m", "venv", paths.venvDir])) return true;
+  return runLogged(paths.logFile, "python", ["-m", "venv", paths.venvDir]);
 }
 
 async function pipEditableInstall(paths: Paths, pkgDir: string): Promise<boolean> {

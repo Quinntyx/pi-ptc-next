@@ -5,3 +5,5 @@ package-lock.json
 .DS_Store
 *.tsbuildinfo
 .claude/
+
+.ptc-subagents-sync.json

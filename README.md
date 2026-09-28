@@ -1,10 +1,12 @@
 # pi-ptc-next
 
-`pi-ptc-next` (package `@cegersdo/pi-ptc`) is an extension for [Pi](https://github.com/mariozechner/pi-coding-agent) that implements Programmatic Tool Calling (PTC): instead of streaming every tool result back into the model's context, the model writes Python cells against a persistent, Jupyter-like kernel and calls Pi's tools (`read`, `grep`, `glob`, …) as ordinary `async` Python functions. Only each cell's final output reaches the model, so multi-step work costs a fraction of the tokens. The same kernels double as launch pads for parallel subagent orchestration (optional; see below).
+`pi-ptc-next` (package `@quinntyx/pi-ptc-next`) is an extension for [Pi](https://github.com/mariozechner/pi-coding-agent) that implements Programmatic Tool Calling (PTC): instead of streaming every tool result back into the model's context, the model writes Python cells against a persistent, Jupyter-like kernel and calls Pi's tools (`read`, `grep`, `glob`, …) as ordinary `async` Python functions. Only each cell's final output reaches the model, so multi-step work costs a fraction of the tokens. The same kernels double as launch pads for parallel subagent orchestration (optional; see below).
 
 Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which itself forked [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chris Egersdoerfer.
 
 ## Install
+
+**Before you start:** make sure plain `pi` answers a normal prompt (run `pi -p "hi"` once; if it errors with auth/quota JSON, run `/login` in `pi` and get a working model first — nothing here works until that does). You'll also need **Python ≥ 3.10** (`python3 --version`) — or [`uv`](https://docs.astral.sh/uv/), which can fetch Python for you — and `git`.
 
 1. **Install the extension into Pi:**
 
@@ -12,28 +14,30 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
    pi install git:github.com/Quinntyx/pi-ptc-next
    ```
 
-   Pi clones the repo into `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs `npm install` for it (a few benign-looking npm warnings about unapproved install scripts are normal). For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
+   Pi downloads the extension into its own folder (`~/.pi/agent/git/github.com/Quinntyx/pi-ptc-next` by default) and runs `npm install` there — expect yellow npm warnings about "unapproved install scripts" and a vulnerabilities summary; both are pre-existing transitive-dependency noise and safe to ignore (don't run `npm audit fix`). It usually takes under a minute. For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
 
 2. **That's the whole install.** No `npm run build` is needed — Pi compiles the extension's TypeScript at load time — and no environment variables are required. On the next `pi` start, the extension registers `provision_kernel`, `exec_cell`, and friends.
 
-3. **Verify it works.** Start `pi` and describe a PTC-shaped task, or check headless:
+3. **Verify it works.** Start `pi` and describe a PTC-shaped task, or run once non-interactively (`-p`):
 
    ```bash
    pi -p "Use provision_kernel and exec_cell to print 1+1 in a Python cell."
    ```
 
-4. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is auto-provisioned into `~/.cache/pi-ptc/python-env` at session start.
+   Success looks like the cell returning `Out[2]: 2` (or similar) in a few seconds. Warnings about *other* packages can be ignored — only an error mentioning `provision_kernel`/`exec_cell` is PTC's.
+
+4. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is provisioned automatically in the background on first use — provisioning problems are logged to `~/.cache/pi-ptc/subagents-sync.log` and never block the core extension.
 
 To remove: `pi remove git:github.com/Quinntyx/pi-ptc-next`.
 
-> **⚠️ No sandboxing yet — yolo mode only.** Kernels run as plain host Python subprocesses with your real filesystem, permissions, and environment. Sandboxing is planned (VM-based checkpointing) but not implemented — the implementation is complex. No tools are policy-gated — `os.system` and `subprocess` reach the same places the bridged `bash` tool would, so filtering is futile; none of it constrains the Python process itself. Don't use this in untrusted workspaces.
+> **⚠️ Trust warning: no sandbox.** Python cells run as plain processes under your user account, with full access to your files and network — nothing is sandboxed or gated (the model's cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Use it only in repos you trust; never point it at untrusted code.
 
 ## Requirements
 
-- **Node.js** and **Pi** (the host agent).
-- **Python ≥ 3.10** on PATH (or point `PTC_PYTHON_EXECUTABLE` at a suitable interpreter).
-- **`uv`** — optional; used for the shared venv and `provision_dependency` installs (see below).
-- **tmux + `pi-sock` + the `pi_subagents` module + a `subagents` Pi profile** — required *only* for subagent orchestration; every other feature works without them.
+- **Node.js** and **Pi** (the host agent; tested with pi ≥ 0.87 and Node ≥ 20).
+- **Python ≥ 3.10** on PATH — or **`uv`**, which can fetch and manage Python for you (if `uv` is installed, `python3` on PATH is optional). `PTC_PYTHON_EXECUTABLE` pins a specific interpreter.
+- **`uv`** — optional but recommended; powers `provision_dependency` installs and the shared Python environment.
+- **Subagent orchestration only:** the terminal multiplexer **tmux** (`tmux -V` to check), a small relay helper called **pi-sock**, and the **pi_subagents** Python module (installed for you at session start), running in a dedicated pi settings folder (`subagents` profile — a directory pi-profiles manages for you). If that sounds like more setup than you want today, skip it: every other feature works without it.
 
 ## Usage
 

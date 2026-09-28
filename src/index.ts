@@ -1784,7 +1784,16 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     // Memoized and shared: the session manager's readiness gate awaits this
     // same promise before its first kernel spawn, so a first-install kernel
     // does not lock in system python3 while packages land in the venv.
-    void startSubagentsEnv({ extensionRoot });
+    // Provisioning is best-effort, but its failure must not be fully silent:
+    // log one warning (details live in ~/.cache/pi-ptc/subagents-sync.log).
+    void startSubagentsEnv({ extensionRoot }).then((result) => {
+      if (result.status === "failed") {
+        console.warn(
+          `[PTC] pi_subagents provisioning failed: ${result.reason}. ` +
+          "Core Python kernels are unaffected; see ~/.cache/pi-ptc/subagents-sync.log for details."
+        );
+      }
+    });
   }
 
   registerPtcCommand(pi, sessionManager, sessionState);

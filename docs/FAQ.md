@@ -6,8 +6,8 @@ Answers grounded in clean-environment install tests (fresh `PI_CODING_AGENT_DIR`
 
 Distilled from a verified clean install (pi 0.87.1, node v26, python 3.14, no `pi-profiles`, no `pi-tool-tree`):
 
-1. **Install the extension:** `pi install /path/to/repo` (local path, loads in place, no copy) or `pi install git:github.com/Quinntyx/pi-ptc-next` (clones to `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs npm install — expect benign-looking npm warnings about unapproved install scripts for `koffi` and `protobufjs`).
-2. **Have `python3` on PATH.** `uv` is optional (the venv falls back to `python3 -m venv`); no `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps. `shiki` is only a dynamic import with a plain-text fallback, so its absence is invisible.
+1. **Install the extension:** `pi install git:github.com/Quinntyx/pi-ptc-next` (the normal way), or `pi install /path/to/repo` for a local checkout (clones to `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs npm install — expect benign-looking npm warnings about unapproved install scripts for `koffi` and `protobufjs`).
+2. **Have `python3` on PATH — unless `uv` is installed** (uv can fetch a managed CPython itself, downloading ~35 MB on first run); without uv the venv falls back to `python3 -m venv`; no `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps. `shiki` is only a dynamic import with a plain-text fallback, so its absence is invisible.
 3. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s; no-uv fallback ~7.0s.
 
 No environment variables are required — but note there is **no sandboxing**: kernels run as plain host Python subprocesses (yolo mode only; VM-based checkpointing is planned).
@@ -75,7 +75,7 @@ On first session start the extension creates `~/.cache/pi-ptc/python-env` (with 
 fatal: could not read Username for 'https://git.quinntyx.dev': No such device or address
 ```
 
-in `~/.cache/pi-ptc/subagents-sync.log`. The stamp `<pkg>/src/.ptc-subagents-sync.json` gets `"ok": false` and sync retries next session. **You will see nothing in chat** — the initial-clone failure is fire-and-forget and silent (`src/index.ts:1641`; only the clone-*update* path logs a warning, `src/subagents-env.ts:416`). Kernels and sessions work fine; the first symptom is a later cell dying with `ModuleNotFoundError: No module named 'pi_subagents'`. Check `~/.cache/pi-ptc/subagents-sync.log` when that happens. The README's advice applies: if you use a private pi-subagents repo, make sure your git credential helper can read it.
+in `~/.cache/pi-ptc/subagents-sync.log`. The stamp `<pkg>/src/.ptc-subagents-sync.json` gets `"ok": false` and sync retries next session. **You will see nothing in chat** — the initial-clone failure is fire-and-forget and silent (`src/index.ts:1641`; only the clone-*update* path logs a warning, `src/subagents-env.ts:416`). Kernels and sessions work fine; the first symptom is a later cell dying with `ModuleNotFoundError: No module named 'pi_subagents'`. Check `~/.cache/pi-ptc/subagents-sync.log` when that happens. If you point `PTC_SUBAGENTS_REPO_URL` at a private repo, make sure your git credential helper can read it.
 
 A dev checkout at `~/docs/src/pi-subagents` (or `PTC_SUBAGENTS_SOURCE`) is preferred over the managed clone and skips git entirely.
 
@@ -125,7 +125,7 @@ Nothing — silently. Garbage values are swallowed by lenient parsing (`src/util
 
 ### Why does my cell keep getting interrupted with `KeyboardInterrupt`?
 
-`PTC_EXECUTION_TIMEOUT_MS` is an **idle/silence** timeout that re-arms on every interpreter frame (`src/python-session-manager.ts:443-467`) — not a wall-clock cap, despite the README's "hard execution timeout" claim. Tiny values fire almost immediately: `PTC_EXECUTION_TIMEOUT_MS=1` made `time.sleep(2)` die instantly with `KeyboardInterrupt: chunk execution was interrupted`, and the model then retried for 4 minutes, dragging a 3-second question out to 4m07s. Keep it at or above the 270 000 ms default.
+`PTC_EXECUTION_TIMEOUT_MS` is an **idle/silence** timeout that re-arms on every interpreter frame (`src/python-session-manager.ts:443-467`) — not a wall-clock cap. Tiny values fire almost immediately: `PTC_EXECUTION_TIMEOUT_MS=1` made `time.sleep(2)` die instantly with `KeyboardInterrupt: chunk execution was interrupted`, and the model then retried for 4 minutes, dragging a 3-second question out to 4m07s. Keep it at or above the 270 000 ms default.
 
 ### Why is my cell output truncated?
 
@@ -143,11 +143,11 @@ No. A second pi session on the same notebook got `NameError: name 'persistent_va
 
 ### My kernel hangs when I use `subprocess` in a cell — why?
 
-Children spawned from a cell inherit the interpreter's RPC pipes. Any child that reads stdin or writes to stdout can corrupt the protocol and hang the kernel. Always pass `stdin=subprocess.DEVNULL, capture_output=True` (README, "Kernel footgun"; also `docs/tool-bridge.md`).
+Children spawned from a cell inherit the interpreter's RPC pipes. Any child that reads stdin or writes to stdout can corrupt the protocol and hang the kernel. Always pass `stdin=subprocess.DEVNULL, capture_output=True` (see `docs/tool-bridge.md`).
 
 ### Which host tools can my Python code call, and how do I get more?
 
-By default a safe built-in subset is bridged (`read`, `glob`/`find`, `grep`, `ls`, and more — see README "Available Python functions" and `docs/tool-bridge.md`). Nothing is gated. (Historical note: tools excluded via `PTC_BLOCKED_TOOLS`/`PTC_CALLABLE_TOOLS` show up as bare `NameError`s — see above.)
+By default the read-only builtins are bridged (`read`, `glob`/`find`, `grep`, `ls`, and more — see `docs/tool-bridge.md`). Nothing is gated. (Historical note: tools excluded via `PTC_BLOCKED_TOOLS`/`PTC_CALLABLE_TOOLS` show up as bare `NameError`s — see above.)
 
 ### Where does the notebook library live?
 
@@ -179,4 +179,4 @@ Verified no orphans remained after cleanup (`ps aux` for `python-env/bin/python`
 
 ### Known documentation/behavior mismatches
 
-For the record (tracked in `BUGS.md`): the README claims a "hard execution timeout" where the implementation is an idle timeout; the `ModuleNotFoundError` recovery hint recommends a PyPI package that doesn't exist; blocked tools surface as bare `NameError`s with no policy hint; nonsense env values are silently accepted; and the sync stamp lands in `<pkg>/src/` under production loading, not `<pkg>/` as the tracked file assumes.
+For the record (tracked in `BUGS.md`): the `ModuleNotFoundError` recovery hint used to recommend a PyPI package that doesn't exist (fixed); blocked tools surface as bare `NameError`s with no policy hint; nonsense env values are silently accepted; and the sync stamp lands in `<pkg>/src/` under production loading, not `<pkg>/` as the tracked file assumes.
