@@ -34,7 +34,7 @@ To remove: `pi remove git:github.com/Quinntyx/pi-pycells`.
 
 - **Node.js** and **Pi** (the host agent; tested with pi ≥ 0.87 and Node ≥ 20).
 - **[`uv`](https://docs.astral.sh/uv/) — required.** It provisions the Python environment (default CPython 3.14, downloaded automatically if missing) and powers on-demand package installs. You do not need Python on PATH; `PTC_PYTHON_EXECUTABLE` pins a specific interpreter if you want one.
-- **Subagent orchestration only:** the terminal multiplexer **tmux** (`tmux -V` to check), a small relay helper called **pi-sock** installed in your normal pi config, and the **pi_subagents** Python module (installed for you at session start). Subagents run under your own agent dir by default — no profiles or extra setup; `PI_CODING_SUBAGENT_DIR` gives them a separate config if you ever want one.
+- **Subagent orchestration only:** the terminal multiplexer **tmux** (`tmux -V` to check), a small relay helper called **pi-sock** installed in your normal pi config, and the **pi_subagents** Python module (installed for you at session start). By default, subagents are additional pi instances that run under your own Pi configuration. To use a separate pi agent directory for subagents, set `PI_CODING_SUBAGENT_DIR`.
 
 ## Usage
 
@@ -97,7 +97,7 @@ More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom
 | Dependency | What it provides | Without it |
 |---|---|---|
 | `uv` | Preferred for creating the shared venv (`~/.cache/pi-pycells/python-env`) and for `provision_dependency` installs. | Venv creation falls back to `python3 -m venv`; `provision_dependency` fails (no pip fallback) — pre-install packages into the venv yourself. |
-| `pi_subagents` + tmux + `pi-sock` | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). `pi_subagents` is auto-provisioned at session start from git (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). Subagents run under your own agent dir by default; `PI_CODING_SUBAGENT_DIR` gives them a separate one. | All core features work untouched; only `import pi_subagents` is unavailable (provisioning failure is a logged warning, never fatal). |
+| `pi_subagents` + tmux + `pi-sock` | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). `pi_subagents` is auto-provisioned at session start from git (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). By default, subagents run under your own Pi configuration; `PI_CODING_SUBAGENT_DIR` gives them a separate pi agent directory. | All core features work untouched; only `import pi_subagents` is unavailable (provisioning failure is a logged warning, never fatal). |
 | pi-tool-tree *(experimental)* | Nicer subagent activity display and tool-call activity labels. Currently unstable — known rendering bugs. | Plain rendering; the subagent panel, timers, and the vendored shimmer animation all work without it — you only lose live agent activity labels. |
 
 Note: once the shared venv exists, every kernel prefers it over `python3`; set `PTC_PYTHON_EXECUTABLE` to pin your own interpreter.
