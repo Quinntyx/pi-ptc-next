@@ -158,11 +158,11 @@ Items that assume the author's machine layout, and the workaround for each:
   (a pi-profiles-managed profile directory works) to give them a separate environment.
 - **Venv and cache root under `~/.cache/pi-pycells`.** The provisioner creates
   `~/.cache/pi-pycells/python-env-3.14` (via `uv venv --python 3.14`; uv is required) and a managed
-  `pi-subagents` clone there. Once that venv exists, every kernel prefers its interpreter
-  over `python3` (`resolvePythonExecutable`, `src/sandbox-manager.ts:35-42`) — even if you
-  never use subagents. Set `PTC_PYTHON_EXECUTABLE` to pin your own interpreter; the target
+  `pi-subagents` clone there. Kernels always run on that venv's interpreter
+  (`resolvePythonExecutable`, `src/sandbox-manager.ts`) — there is no system-python fallback.
+  Set `PTC_PYTHON_EXECUTABLE` to pin your own interpreter; the target
   must be Python ≥ 3.10 (kernels fail fast otherwise).
-- **pi agent-dir convention.** `PTC_LIBRARY_DIR`'s default assumes pi's
+pi agent-dir convention.** `PTC_LIBRARY_DIR`'s default assumes pi's
   `$PI_CODING_AGENT_DIR`/`~/.pi/agent` layout, and `PTC_EVALS_PATH`'s default `.pi/evals/ptc`
   assumes a pi project with that directory. Set either variable explicitly if your layout
   differs.

@@ -6,7 +6,9 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
 ## Install
 
-**Before you start:** make sure plain `pi` answers a normal prompt (run `pi -p "hi"` once; if it errors with auth/quota JSON, run `/login` in `pi` and get a working model first — nothing here works until that does). You'll also need **Python ≥ 3.10** (`python3 --version`) — or [`uv`](https://docs.astral.sh/uv/), which can fetch Python for you — and `git`.
+**⚠️ Yolo mode — no sandbox.** Pi itself runs tools with your full permissions, and so do these Python kernels: plain processes with full file/network access, nothing sandboxed or gated (cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Don't point it at untrusted code.
+
+**Before you start:** make sure plain `pi` answers a normal prompt (run `pi -p "hi"` once; if it errors with auth/quota JSON, run `/login` in `pi` and get a working model first — nothing here works until that does). You'll also need **[`uv`](https://docs.astral.sh/uv/)** — required; it provisions the Python environment (CPython 3.14 by default, downloaded for you if missing) — and `git`.
 
 1. **Install the extension into Pi:**
 
@@ -16,21 +18,17 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
    Pi downloads the extension into its own folder (`~/.pi/agent/git/github.com/Quinntyx/pi-pycells` by default) and runs `npm install` there; it usually takes under a minute. For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
 
-2. **That's the whole install.** No `npm run build` is needed — Pi compiles the extension's TypeScript at load time — and no environment variables are required. On the next `pi` start, the extension registers `provision_kernel`, `exec_cell`, and friends.
-
-3. **Verify it works.** Start `pi` and describe a PTC-shaped task, or run once non-interactively (`-p`):
+2. **Verify it works.** Start `pi` and describe a PTC-shaped task, or run once non-interactively (`-p`):
 
    ```bash
    pi -p "Use provision_kernel and exec_cell to print 1+1 in a Python cell."
    ```
 
-   Success looks like the cell returning `Out[2]: 2` (or similar) in a few seconds. Warnings about *other* packages can be ignored — only an error mentioning `provision_kernel`/`exec_cell` is PTC's.
+   Success looks like the cell returning `Out[2]: 2` (or similar) in a few seconds.
 
-4. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is provisioned automatically in the background on first use — provisioning problems are logged to `~/.cache/pi-pycells/subagents-sync.log` and never block the core extension.
+3. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is provisioned automatically in the background on first use — provisioning problems are logged to `~/.cache/pi-pycells/subagents-sync.log` and never block the core extension.
 
 To remove: `pi remove git:github.com/Quinntyx/pi-pycells`.
-
-> **⚠️ Yolo mode — no sandbox.** Pi itself runs tools with your full permissions, and so do these Python kernels: plain processes with full file/network access, nothing sandboxed or gated (cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Don't point it at untrusted code.
 
 ## Requirements
 

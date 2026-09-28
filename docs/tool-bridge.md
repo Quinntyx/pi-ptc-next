@@ -131,13 +131,14 @@ Things that depend on the author's machine setup, and how to work around each:
 
 - **Python interpreter resolution.** The kernel picks the interpreter in this
   order: `PTC_PYTHON_EXECUTABLE`, then the PTC venv at
-  `~/.cache/pi-pycells/python-env/bin/python` (`Scripts\python.exe` on Windows) if
-  it exists, then `python3`. The runtime requires **Python ≥ 3.10** and fails
-  fast at startup otherwise. If your `python3` is older, set
-  `PTC_PYTHON_EXECUTABLE=/path/to/python3.11`.
+  `~/.cache/pi-pycells/python-env-3.14/bin/python` (`Scripts\python.exe` on
+  Windows) — created by provisioning, which requires **uv**. There is no
+  system-python fallback: with no venv and no `PTC_PYTHON_EXECUTABLE`, kernel
+  start fails with an error naming the cause. The runtime requires
+  **Python ≥ 3.10**; provision a different version with
+  `provision_kernel({ version: "3.11" })` or set `PTC_PYTHON_EXECUTABLE`.
 - **The `~/.cache/pi-pycells` venv** is created by the pi-subagents integration,
-  not the tool bridge; on a fresh machine it simply won't exist and the
-  fallback applies. Nothing in the tool bridge needs packages from that venv.
+  not the tool bridge; nothing in the tool bridge needs packages from that venv.
 - **Reserved helper names.** The names `ptc`, `_rpc_call`, `read`, `find`,
   `glob`, `grep`, `ls`, `bash`, `edit`, `write` are reserved in the kernel
   namespace; a custom tool cannot claim them (only a tool literally named that
