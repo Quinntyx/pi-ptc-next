@@ -6,7 +6,8 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
 ## Install
 
-**⚠️ Yolo mode — no sandbox.** Pi itself runs tools with your full permissions, and so do these Python kernels: plain processes with full file/network access, nothing sandboxed or gated (cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Don't point it at untrusted code.
+
+> **⚠️ Yolo mode — no sandbox.** Pi itself runs tools with your full permissions, and so do these Python kernels: plain processes with full file/network access, nothing sandboxed or gated (cells can even run shell commands natively). Sandboxing is planned (VM-based checkpointing) but not implemented. Don't point it at untrusted code.
 
 **Before you start:** make sure plain `pi` answers a normal prompt (run `pi -p "hi"` once; if it errors with auth/quota JSON, run `/login` in `pi` and get a working model first — nothing here works until that does). You'll also need **[`uv`](https://docs.astral.sh/uv/)** — required; it provisions the Python environment (CPython 3.14 by default, downloaded for you if missing) — and `git`.
 
@@ -34,7 +35,7 @@ To remove: `pi remove git:github.com/Quinntyx/pi-pycells`.
 
 - **Node.js** and **Pi** (the host agent; tested with pi ≥ 0.87 and Node ≥ 20).
 - **[`uv`](https://docs.astral.sh/uv/) — required.** It provisions the Python environment (default CPython 3.14, downloaded automatically if missing) and powers on-demand package installs. You do not need Python on PATH; `PTC_PYTHON_EXECUTABLE` pins a specific interpreter if you want one.
-- **Subagent orchestration only:** the terminal multiplexer **tmux** (`tmux -V` to check), a small relay helper called **pi-sock** installed in your normal pi config, and the **pi_subagents** Python module (installed for you at session start). By default, subagents are additional pi instances that run under your own Pi configuration. To give subagents their own pi agent directory, set `PI_CODING_SUBAGENT_DIR` — [`pi-profiles`](https://github.com/chaychoong/pi-profiles) is the easiest way to create and manage those — one command per profile, each an isolated pi config.
+- **Subagent orchestration only:** [tmux](https://github.com/tmux/tmux) (the terminal multiplexer; `tmux -V` to check), [pi-sock](https://github.com/Quinntyx/pi-sock) — a small relay helper installed in your normal pi config — and the [pi_subagents](https://github.com/Quinntyx/pi-subagents) Python module (installed for you at session start). By default, subagents are additional pi instances that run under your own Pi configuration. To give subagents their own pi agent directory, set `PI_CODING_SUBAGENT_DIR` — [`pi-profiles`](https://github.com/chaychoong/pi-profiles) is the easiest way to create and manage those — one command per profile, each an isolated pi config.
 
 ## Usage
 
@@ -55,7 +56,7 @@ counts = {f: (await read(f)).count('TODO') for f in files}
 sorted(counts.items(), key=lambda kv: -kv[1])[:5]
 ```
 
-The kernel is bound to a real `.ipynb` notebook — the durable record of the session. By default the notebook is created under `/tmp/pi-pycells/notebooks/` — throwaway kernels shouldn't litter your project. Tell the model to pass an explicit notebook path when you want one kept with the project (or promoted to the notebook library). Variables, imports, and definitions persist across cells and conversation turns. Long cell output is always saved in full in the notebook — the model just sees the start and end with the middle cut out, and can page through the full version with `read_cell_output`.
+The kernel is bound to a real `.ipynb` notebook — the durable record of the session. By default the notebook is created under `/tmp/pi-pycells/notebooks/` — throwaway kernels shouldn't litter your project. Any notebook can be promoted to the library later, regardless of where it lives; pass an explicit notebook path when you want the file itself kept with the project. Variables, imports, and definitions persist across cells and conversation turns. Long cell output is always saved in full in the notebook — the model just sees the start and end with the middle cut out, and can page through the full version with `read_cell_output`.
 
 The model picks between its normal tools and a kernel on its own: a one-off lookup stays an ordinary `read`/`grep` call, while anything that means many tool calls in a row (repo-wide scans, bulk conversions, aggregations, "compact JSON only") makes a cell the obvious move. If a cell fails, bounded auto-recovery can retry it with a fix.
 
@@ -110,6 +111,30 @@ The docs above cover day-to-day use. For full detail:
 - **[DOCS.md](DOCS.md)** — the complete reference: all features, configuration table, optional dependencies, standalone-setup notes.
 - **[docs/](docs/)** — one deep-dive per feature: [kernels](docs/kernels.md) · [tool-bridge](docs/tool-bridge.md) · [custom-tools](docs/custom-tools.md) · [output-and-code-view](docs/output-and-code-view.md) · [sandboxing](docs/sandboxing.md) · [auto-routing-and-recovery](docs/auto-routing-and-recovery.md) · [notebook-library](docs/notebook-library.md) · [subagents](docs/subagents.md) · [configuration](docs/configuration.md) (every `PTC_*` env var) · [benchmarks-and-evals](docs/benchmarks-and-evals.md)
 - **[docs/FAQ.md](docs/FAQ.md)** — verified install steps, standalone setups, and troubleshooting.
+
+## Roadmap
+
+Done since the fork from [pi-ptc-next](https://github.com/edxeth/pi-ptc-next):
+
+- [x] Persistent notebook-backed kernels with `provision_kernel` / `exec_cell`
+- [x] Pi tools callable from Python via the RPC bridge (`read`, `grep`, `find`, …)
+- [x] Custom tools from `tools/` with a `ptc:` metadata block
+- [x] Subagent orchestration from cells (`pi_subagents`), auto-provisioned
+- [x] Notebook library: promote, reuse, and Python-version pinning for promoted workflows
+- [x] uv-managed runtime (pinned CPython, on-demand package installs)
+- [x] `provision_kernel(version=...)` for explicit interpreter selection
+- [x] No-gating yolo mode (removed `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` / `PTC_ALLOW_MUTATIONS` / `PTC_ALLOW_BASH`)
+- [x] Subagent agent-dir selection via `PI_CODING_SUBAGENT_DIR` (no pi-profiles dependency)
+- [x] Vendored shimmer renderer; theme-aware Shiki highlighting
+- [x] `/workflow` command for orchestrated subagent runs
+
+Planned:
+
+- [ ] Sandboxing (VM-based checkpointing)
+- [ ] Background / foreground `exec_cell` runs (`/ptc background|foreground`)
+- [ ] Bridging third-party extension tools into cells (needs an upstream pi API)
+- [ ] `provision_dependency` pip fallback (uv-less environments)
+- [ ] Atomic multi-stage `AgentPool.submit_all` (upstream, pi-subagents)
 
 ## License
 
