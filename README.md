@@ -14,7 +14,7 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
    pi install git:github.com/Quinntyx/pi-ptc-next
    ```
 
-   Pi downloads the extension into its own folder (`~/.pi/agent/git/github.com/Quinntyx/pi-ptc-next` by default) and runs `npm install` there — expect yellow npm warnings about "unapproved install scripts" and a vulnerabilities summary; both are pre-existing transitive-dependency noise and safe to ignore (don't run `npm audit fix`). It usually takes under a minute. For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
+   Pi downloads the extension into its own folder (`~/.pi/agent/git/github.com/Quinntyx/pi-ptc-next` by default) and runs `npm install` there; it usually takes under a minute. For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
 
 2. **That's the whole install.** No `npm run build` is needed — Pi compiles the extension's TypeScript at load time — and no environment variables are required. On the next `pi` start, the extension registers `provision_kernel`, `exec_cell`, and friends.
 

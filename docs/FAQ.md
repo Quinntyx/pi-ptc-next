@@ -6,7 +6,7 @@ Answers grounded in clean-environment install tests (fresh `PI_CODING_AGENT_DIR`
 
 Distilled from a verified clean install (pi 0.87.1, node v26, python 3.14, no `pi-profiles`, no `pi-tool-tree`):
 
-1. **Install the extension:** `pi install git:github.com/Quinntyx/pi-ptc-next` (the normal way), or `pi install /path/to/repo` for a local checkout (clones to `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs npm install — expect benign-looking npm warnings about unapproved install scripts for `koffi` and `protobufjs`).
+1. **Install the extension:** `pi install git:github.com/Quinntyx/pi-ptc-next` (the normal way), or `pi install /path/to/repo` for a local checkout (clones to `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs npm install there).
 2. **Have `python3` on PATH — unless `uv` is installed** (uv can fetch a managed CPython itself, downloading ~35 MB on first run); without uv the venv falls back to `python3 -m venv`; no `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps. `shiki` is only a dynamic import with a plain-text fallback, so its absence is invisible.
 3. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s; no-uv fallback ~7.0s.
 
