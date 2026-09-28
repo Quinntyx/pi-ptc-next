@@ -67,21 +67,14 @@ import os, json
 return json.dumps({k: v for k, v in os.environ.items() if k.startswith("PTC_")}, indent=2)
 ```
 
-Note the two `true` values above are required before anything works: without
-`PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true` the extension refuses to start Python at all
-(`createSandbox` rejects with an explanatory error, `src/sandbox-manager.ts:112-119`), and
-without `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH` only read-only tools are callable from cells.
+Note that without `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH` only read-only tools are callable from cells.
+There is no required opt-in for Python execution itself: kernels run unsandboxed as host subprocesses
+(yolo mode — sandboxing is planned, not implemented).
 
 ## Environment variables
 
 Parsed by `loadSettingsFromEnv()` (`src/utils.ts`). Defaults are the constants at the top of
 that file.
-
-### Startup gate
-
-| Variable | Type | Default | Effect |
-|---|---|---|---|
-| `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` | bool | `false` | Must be `true`; the extension runs Python as a local subprocess and rejects startup otherwise. |
 
 ### Execution
 

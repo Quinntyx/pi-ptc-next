@@ -61,3 +61,21 @@ test("parseEvalCase surfaces the source name in deterministic validation failure
     /broken\.json validation failed: acceptance.type must be "exact", "structural", or "behavioral"; acceptance.rules must be a non-empty array of strings/
   );
 });
+
+test("validateEvalCase rejects rules with unknown keys or missing key=value form", () => {
+  const errors = validateEvalCase({
+    id: "typo-case",
+    prompt: "hi",
+    expected_first_path: "direct",
+    acceptance: {
+      type: "behavioral",
+      rules: ["observed_first_path=code_execution", "recovery_atempted=true", "success", "=true", "output_json=true"],
+    },
+  });
+
+  assert.deepEqual(errors, [
+    'acceptance.rules[1] has unknown rule key "recovery_atempted" (expected one of: observed_first_path, success, recovery_attempted, failure_class, output_json)',
+    'acceptance.rules[2] must match "key=value" with a known rule key',
+    'acceptance.rules[3] must match "key=value" with a known rule key',
+  ]);
+});

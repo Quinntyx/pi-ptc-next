@@ -20,10 +20,10 @@
 
 ## Getting started / usage flow
 
-**1. Install and opt in.** The extension runs Python as a local host subprocess and refuses to start otherwise, so one environment variable is mandatory:
+**1. Install.** No build step and no required environment variables:
 
 ```bash
-export PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true   # required, or Python never runs
+pi install git:github.com/edxeth/pi-ptc-next
 pi                                             # start pi; the extension registers its tools on session_start
 ```
 
@@ -156,7 +156,7 @@ More: [docs/notebook-library.md](docs/notebook-library.md)
 
 ## Sandboxing and subprocess policy
 
-There is **no** container, VM, or isolation substrate: each kernel is `python -u -c <code>` in your cwd with the full host environment inherited, seeing your real filesystem with your real permissions. Because of that, `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true` is a hard startup gate — without it the extension refuses to run Python at all. The second policy layer is tool gating: `bash` needs `PTC_ALLOW_BASH=true` and all mutating tools need `PTC_ALLOW_MUTATIONS=true`, so a minimal install gives Python read-only repo access only. On non-Windows platforms kernels spawn as a detached process group, and cleanup SIGTERMs then SIGKILLs the whole group (including grandchildren such as subagent instances) after a 1 s grace. Don't enable the subprocess flag in untrusted workspaces; don't enable both mutation flags unless you intend the model to run shell commands and edit files.
+There is **no** container, VM, or isolation substrate — the extension currently only supports "yolo mode" — and there is no opt-in gate either: if the extension is loaded, kernels run as plain `python -u -c <code>` host subprocesses in your cwd with the full host environment inherited, seeing your real filesystem with your real permissions. Sandboxing is planned (VM-based checkpointing) but not implemented. The only barrier that exists today is tool gating: `bash` needs `PTC_ALLOW_BASH=true` and all mutating tools need `PTC_ALLOW_MUTATIONS=true`, so a minimal install gives the *model* read-only repo access — though the Python process itself is unconstrained. On non-Windows platforms kernels spawn as a detached process group, and cleanup SIGTERMs then SIGKILLs the whole group (including grandchildren such as subagent instances) after a 1 s grace. Don't use this in untrusted workspaces; don't enable both mutation flags unless you intend the model to run shell commands and edit files.
 
 More: [docs/sandboxing.md](docs/sandboxing.md)
 
@@ -177,12 +177,6 @@ More: [docs/benchmarks-and-evals.md](docs/benchmarks-and-evals.md)
 ## Configuration
 
 Everything is configured through environment variables, read **once** at extension load (`loadSettingsFromEnv`, `src/utils.ts`) — there is no settings file, so changing a variable requires starting a new pi session. Kernels inherit the extension's environment, so the same variables are visible inside cells. Booleans accept `1/true/yes/on`; the main variables:
-
-### Startup gate
-
-| Variable | Default | Effect |
-|---|---|---|
-| `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` | `false` | **Must be `true`.** Master gate; without it Python execution is refused entirely. |
 
 ### Execution and output
 

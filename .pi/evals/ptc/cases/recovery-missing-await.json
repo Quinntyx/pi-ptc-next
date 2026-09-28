@@ -1,6 +1,6 @@
 {
   "id": "recovery-missing-await",
-  "prompt": "Use Python to read package.json, extract the package name and scripts keys, and return compact JSON only.",
+  "prompt": "Use Python to read package.json, count the top-level keys, and return compact JSON only.",
   "expected_first_path": "code_execution",
   "acceptance": {
     "type": "behavioral",

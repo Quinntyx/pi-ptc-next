@@ -1,56 +1,143 @@
-import type { Theme } from "@mariozechner/pi-coding-agent";
-import type { SubagentAgentRow, SubagentRuntimeSnapshot } from "../contracts/execution-types";
-/**
- * Shimmer sweep for a running action word, shared with the activity tree's label sweep
- * (published on pi-tool-tree's API). Renders muted when that extension is absent.
- */
-function shimmerWord(word: string, theme: Theme): string {
-	if (!word) return "";
-	const activity = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
-	if (typeof activity?.shimmerText === "function") return activity.shimmerText(word, theme);
-	return theme.fg("muted", word);
-}
+import type { Theme, ThemeColor } from "@mariozechner/pi-coding-agent";
+import type {
+  SubagentAgentRow,
+  SubagentPoolStageState,
+  SubagentRuntimeSnapshot,
+} from "../contracts/execution-types";
 
 const PTC_CTX_LIMIT_FALLBACK = 200_000;
+const MAX_QUEUED_ROWS = 2;
+const TERMINAL_FAILURES = new Set(["failed", "dead", "stopped", "cancelled"]);
 
-function formatCtx(ctx: { tokens?: number | null; limit?: number | null; percent?: number | null } | null | undefined, theme: Theme): string {
+function paint(theme: Theme | undefined, color: ThemeColor, text: string): string {
+  return theme ? theme.fg(color, text) : text;
+}
+
+function subdued(theme: Theme | undefined, text: string): string {
+  // `dim` is explicitly the theme's "more subtle than muted" semantic color.
+  return paint(theme, "dim", text);
+}
+
+/**
+ * Shimmer sweep for a running action word, shared with the activity tree's label
+ * sweep. It renders muted when that extension is absent.
+ */
+function shimmerWord(word: string, theme: Theme): string {
+  if (!word) return "";
+  const activity = (globalThis as any)[Symbol.for("pi-tool-tree:api")];
+  if (typeof activity?.shimmerText === "function") return activity.shimmerText(word, theme);
+  return theme.fg("muted", word);
+}
+
+function isDone(agent: SubagentAgentRow): boolean {
+  return agent.status === "settled" || agent.status === "closed";
+}
+
+function isFailed(agent: SubagentAgentRow): boolean {
+  return TERMINAL_FAILURES.has(agent.status);
+}
+
+function isIdle(agent: SubagentAgentRow): boolean {
+  if (agent.status !== "running") return false;
+  if (agent.idle === true) return true;
+  // Defensive compatibility with snapshots produced before the explicit idle
+  // bit: pi-tool-tree commonly reports this label between retained turns.
+  return (agent.label ?? agent.phase)?.toLowerCase() === "idle";
+}
+
+function isExecuting(agent: SubagentAgentRow): boolean {
+  return agent.status === "starting" || (agent.status === "running" && !isIdle(agent));
+}
+
+type AgentCtx = { tokens?: number | null; limit?: number | null; percent?: number | null };
+
+function formatCtxValue(ctx: AgentCtx | null | undefined): string {
   if (!ctx || ctx.tokens === undefined || ctx.tokens === null) return "";
-  const tokens = ctx.tokens;
-  const fmt = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}m` : `${Math.round(n / 1000)}k`);
-  const limit = ctx.limit ?? 200_000;
-  const percent = ctx.percent !== undefined && ctx.percent !== null ? Math.round(ctx.percent) : Math.round((tokens / limit) * 100);
-  return theme.fg("muted", ` · ctx ${fmt(tokens)}/${fmt(limit)} (${percent}%)`);
+  const fmt = (n: number) =>
+    n >= 1_000_000
+      ? `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}m`
+      : `${Math.round(n / 1000)}k`;
+  const limit = ctx.limit ?? PTC_CTX_LIMIT_FALLBACK;
+  const calculatedPercent = limit > 0 ? Math.round((ctx.tokens / limit) * 100) : 0;
+  const percent =
+    ctx.percent !== undefined && ctx.percent !== null ? Math.round(ctx.percent) : calculatedPercent;
+  return `ctx ${fmt(ctx.tokens)}/${fmt(limit)} (${percent}%)`;
+}
+
+function formatCtx(ctx: AgentCtx | null | undefined, theme?: Theme): string {
+  const value = formatCtxValue(ctx);
+  return value ? subdued(theme, ` · ${value}`) : "";
 }
 
 function formatAgentSeconds(ms: number | undefined | null): string {
   if (ms === undefined || ms === null) return "";
-  if (ms < 1000) return "<1s";
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1).replace(/\.0$/, "")}s`;
-  return `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
+  const safeMs = Math.max(0, ms);
+  const seconds = safeMs / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  return `${Math.floor(seconds / 60)}m ${String(Math.floor(seconds % 60)).padStart(2, "0")}s`;
 }
 
-function agentCallsSegment(calls: number | null | undefined, theme: Theme): string {
+function agentCallsSegment(calls: number | null | undefined, theme?: Theme): string {
   if (!calls) return "";
-  return theme.fg("muted", ` · ${calls} tool call${calls === 1 ? "" : "s"}`);
+  return subdued(theme, ` · ${calls} tool call${calls === 1 ? "" : "s"}`);
 }
 
-/**
- * Rows relevant to the exec currently being streamed. An interpreter can be
- * long-lived and its registry holds agents from earlier chunks (earlier PTC
- * calls), so the viewer keeps:
- *  - agents spawned in this exec, and
- *  - agents of earlier execs that are still running (their results are still
- *    awaited)
- * and drops everything settled before this exec began.
- */
-export function relevantAgents(snapshot: SubagentRuntimeSnapshot | undefined, execId?: string): SubagentAgentRow[] {
-  if (!snapshot || !Array.isArray(snapshot.agents)) {
-    return [];
+function stageForGroup(
+  snapshot: SubagentRuntimeSnapshot,
+  group: string,
+): SubagentPoolStageState | undefined {
+  return (snapshot.pools ?? []).flatMap((pool) => pool.stages ?? []).find((stage) => stage.name === group);
+}
+
+function stageBusyMs(stage: SubagentPoolStageState, wallNow: number): number | null {
+  if (stage.busyMs === undefined && stage.activeSince === undefined) return null;
+  return Math.max(0, stage.busyMs ?? 0) +
+    (stage.activeSince !== undefined && stage.activeSince !== null
+      ? Math.max(0, wallNow - stage.activeSince)
+      : 0);
+}
+
+function groupElapsedMs(
+  snapshot: SubagentRuntimeSnapshot,
+  group: string,
+  agents: SubagentAgentRow[],
+  startedAt: number,
+  wallNow: number,
+): number {
+  const stage = stageForGroup(snapshot, group);
+  if (stage) {
+    const busy = stageBusyMs(stage, wallNow);
+    if (busy !== null) return busy;
   }
-  if (!execId) {
-    return snapshot.agents; // no scoping context (e.g. the global runtime API)
-  }
+  if (agents.some(isExecuting)) return Math.max(0, wallNow - startedAt);
+  // No task is executing, so freeze at the furthest completed/busy endpoint
+  // represented by this group rather than continuing to age the group itself.
+  return Math.max(
+    0,
+    ...agents.map((agent) =>
+      Math.max(0, (agent.startedAt ?? startedAt) + (agent.elapsedMs ?? agent.busyMs ?? 0) - startedAt),
+    ),
+  );
+}
+
+function sortAgents(agents: SubagentAgentRow[]): SubagentAgentRow[] {
+  const rank = (agent: SubagentAgentRow): number => {
+    if (agent.status === "starting" || agent.status === "running") return 0;
+    if (agent.status === "queued") return 1;
+    return 2;
+  };
+  return [...agents].sort(
+    (a, b) => rank(a) - rank(b) || (a.startedAt ?? Number.MAX_SAFE_INTEGER) - (b.startedAt ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+
+/** Rows relevant to the exec currently being streamed. */
+export function relevantAgents(
+  snapshot: SubagentRuntimeSnapshot | undefined,
+  execId?: string,
+): SubagentAgentRow[] {
+  if (!snapshot || !Array.isArray(snapshot.agents)) return [];
+  if (!execId) return snapshot.agents;
   return snapshot.agents.filter(
     (agent) =>
       agent.execScope === execId ||
@@ -60,37 +147,29 @@ export function relevantAgents(snapshot: SubagentRuntimeSnapshot | undefined, ex
   );
 }
 
-function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme: Theme, execId?: string): string[] {
-  // A pool's declared stages render even with no agents (idle rows), so a
-  // workflow whose cells have not reached pass two yet still shows its shape.
+function renderSubagentFan(
+  snapshot: SubagentRuntimeSnapshot | undefined,
+  theme: Theme,
+  execId?: string,
+): string[] {
   const declaredStages = (snapshot?.pools ?? [])
     .filter((pool) => pool.status !== "closed")
     .flatMap((pool) => pool.stages ?? []);
-  if (
-    !snapshot ||
-    !Array.isArray(snapshot.agents) ||
-    (snapshot.agents.length === 0 && declaredStages.length === 0)
-  ) {
+  if (!snapshot || !Array.isArray(snapshot.agents) || (snapshot.agents.length === 0 && declaredStages.length === 0)) {
     return [];
   }
 
-  // Animation and elapsed time run on the wall clock. The snapshot's timestamp is
-  // only used to extrapolate the values it carries: pinning `now` to it (as this
-  // once did) froze the shimmer between snapshots, so it advanced at the ~1 Hz
-  // rate of subagent_state frames instead of the repaint rate.
   const wallNow = Date.now();
   const drift = snapshot.timestamp ? Math.max(0, wallNow - snapshot.timestamp) : 0;
   const agents = relevantAgents(snapshot, execId);
-  if (agents.length === 0 && declaredStages.length === 0) {
-    return [];
-  }
-  // Totals describe the filtered view, not the whole (possibly long-lived)
-  // interpreter registry.
+  if (agents.length === 0 && declaredStages.length === 0) return [];
+
   const totals = {
-    queued: agents.filter((a) => a.status === "queued").length,
-    running: agents.filter((a) => a.status === "running" || a.status === "starting").length,
-    settled: agents.filter((a) => a.status === "settled").length,
-    failed: agents.filter((a) => ["failed", "dead", "stopped", "cancelled"].includes(a.status)).length,
+    queued: agents.filter((agent) => agent.status === "queued").length,
+    running: agents.filter(isExecuting).length,
+    idle: agents.filter(isIdle).length,
+    settled: agents.filter(isDone).length,
+    failed: agents.filter(isFailed).length,
   };
   const groups = snapshot.groups ?? {};
   const groupOrder: string[] = [];
@@ -98,169 +177,208 @@ function renderSubagentFan(snapshot: SubagentRuntimeSnapshot | undefined, theme:
     const group = agent.group ?? "";
     if (!groupOrder.includes(group)) groupOrder.push(group);
   }
-  // ungrouped agents always render last
-  const withEmpty = groupOrder.filter((g) => g !== "").concat(groupOrder.filter((g) => g === ""));
+  const orderedGroups = groupOrder.filter(Boolean).concat(groupOrder.filter((group) => !group));
 
   const lines: string[] = [];
-  for (const group of withEmpty) {
-    const groupAgents = agents.filter((a) => (a.group ?? "") === group);
-    const startedAt = groups[group] ?? Math.min(...groupAgents.map((a) => a.startedAt ?? wallNow));
+  let queuedRowsShown = 0;
+  let hiddenQueued = 0;
+  for (const group of orderedGroups) {
+    const allGroupAgents = sortAgents(agents.filter((agent) => (agent.group ?? "") === group));
+    const groupAgents = allGroupAgents.filter((agent) => {
+      if (agent.status !== "queued") return true;
+      if (queuedRowsShown < MAX_QUEUED_ROWS) {
+        queuedRowsShown += 1;
+        return true;
+      }
+      hiddenQueued += 1;
+      return false;
+    });
+    const startedAt = groups[group] ?? Math.min(...allGroupAgents.map((agent) => agent.startedAt ?? wallNow));
     if (group) {
-  
-      const runningCount = groupAgents.filter((a) => a.status === "running" || a.status === "starting").length;
-      const head = runningCount > 0
-        ? `${theme.fg("success", "●")} ${theme.fg("accent", group)} ${theme.fg("muted", `· ${formatAgentSeconds(wallNow - startedAt)}`)}`
-        : `${theme.fg("success", "●")} ${theme.fg("muted", group)} ${theme.fg("muted", `· ${formatAgentSeconds(wallNow - startedAt)}`)}`;
+      const executing = allGroupAgents.some(isExecuting);
+      const elapsed = formatAgentSeconds(groupElapsedMs(snapshot, group, allGroupAgents, startedAt, wallNow));
+      const head = executing
+        ? `${theme.fg("success", "●")} ${theme.fg("accent", group)} ${subdued(theme, `· ${elapsed}`)}`
+        : `${theme.fg("success", "●")} ${theme.fg("muted", group)} ${subdued(theme, `· ${elapsed}`)}`;
       lines.push(`    ${head}`);
     }
 
     groupAgents.forEach((agent, index) => {
       const last = index === groupAgents.length - 1;
       const branch = last ? "╰" : "├";
-      const rail = (s: string) => theme.fg("muted", s);
       const gutter = agent.awaited ? theme.fg("accent", "  ▶ ") : "    ";
 
       if (agent.status === "queued") {
-        lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", "… " + agent.name)}`);
+        lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", `… ${agent.name}`)}`);
         lines.push(`    ${theme.fg("muted", last ? "  " : "│ ")}${theme.fg("muted", "╰ waiting for a pool slot")}`);
         lines.push("");
         return;
       }
 
       if (agent.status === "starting") {
-        lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", "○ " + agent.name)}`);
+        lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", `○ ${agent.name}`)}`);
         lines.push(`    ${theme.fg("muted", last ? "  " : "│ ")}${theme.fg("muted", "╰ starting…")}`);
         lines.push("");
         return;
       }
 
-      const running = agent.status === "running";
-      const light = running
-        ? theme.fg("success", "●")
-        : agent.status === "settled" || agent.status === "closed"
-          ? theme.fg("success", "✓")
-          : theme.fg("warning", "!");
-      // Running values tick with the wall clock between snapshots; settled ones are final.
+      const idle = isIdle(agent);
+      const running = agent.status === "running" && !idle;
+      const light = idle
+        ? theme.fg("muted", "…")
+        : running
+          ? theme.fg("success", "●")
+          : isDone(agent)
+            ? theme.fg("success", "✓")
+            : theme.fg("warning", "✗");
       const elapsedMs = (agent.elapsedMs ?? 0) + (running ? drift : 0);
       const labelElapsedMs =
         agent.labelElapsedMs === null || agent.labelElapsedMs === undefined
           ? null
           : agent.labelElapsedMs + (running ? drift : 0);
 
-      // agent row: name · elapsed · tool calls · ctx
       const segments = [
-        theme.fg("muted", `· ${formatAgentSeconds(elapsedMs)}`),
+        idle ? "" : subdued(theme, `· ${formatAgentSeconds(elapsedMs)}`),
         agentCallsSegment(agent.toolCalls, theme),
         formatCtx(agent.ctx, theme),
       ].filter(Boolean);
-      lines.push(`${gutter}${theme.fg("muted", branch)} ${light} ${theme.fg("text", agent.name)} ${segments.join("")}`);
+      lines.push(
+        `${gutter}${theme.fg("muted", branch)} ${light} ${theme.fg("text", agent.name)}` +
+          (segments.length ? ` ${segments.join("")}` : ""),
+      );
 
-      // detail line: shimmering action word · label elapsed · calls · thinking · live tool
-      const word = agent.label ?? agent.phase;
       const detailBits: string[] = [];
-      if (word) {
-        detailBits.push(running ? shimmerWord(word, theme) : theme.fg("muted", word));
-      }
-      if (labelElapsedMs) {
-        detailBits.push(theme.fg("muted", ` · ${formatAgentSeconds(labelElapsedMs)}`));
-      }
-      if (agent.labelCalls) {
-        detailBits.push(theme.fg("muted", ` · ${agent.labelCalls} tool call${agent.labelCalls === 1 ? "" : "s"}`));
-      }
-      if (agent.thinkingMs) {
-        detailBits.push(theme.fg("muted", ` · thinking ${formatAgentSeconds(agent.thinkingMs)}`));
-      }
-      if (agent.liveTool) {
-        detailBits.push(theme.fg("muted", ` · ${agent.liveTool.length > 48 ? `${agent.liveTool.slice(0, 45)}...` : agent.liveTool}`));
+      if (idle) {
+        detailBits.push(theme.fg("muted", "idle · waiting for orchestrator"));
+      } else {
+        const word = agent.label ?? agent.phase;
+        if (word) detailBits.push(running ? shimmerWord(word, theme) : theme.fg("muted", word));
+        if (labelElapsedMs !== null && labelElapsedMs > 0) {
+          detailBits.push(subdued(theme, ` · ${formatAgentSeconds(labelElapsedMs)}`));
+        }
+        if (agent.labelCalls) {
+          detailBits.push(subdued(theme, ` · ${agent.labelCalls} tool call${agent.labelCalls === 1 ? "" : "s"}`));
+        }
+        if (agent.thinkingMs) {
+          detailBits.push(subdued(theme, ` · thinking ${formatAgentSeconds(agent.thinkingMs)}`));
+        }
+        if (agent.liveTool) {
+          const liveTool = agent.liveTool.length > 48 ? `${agent.liveTool.slice(0, 45)}...` : agent.liveTool;
+          detailBits.push(subdued(theme, ` · ${liveTool}`));
+        }
       }
       if (detailBits.length > 0) {
-        const detailRail = last ? "  " : "│ ";
-        lines.push(`    ${theme.fg("muted", detailRail)}${theme.fg("muted", "╰")} ${detailBits.join("")}`);
+        lines.push(`    ${theme.fg("muted", last ? "  " : "│ ")}${theme.fg("muted", "╰")} ${detailBits.join("")}`);
       }
-
-      if (!last) {
-        lines.push(`    ${theme.fg("muted", "│")}`);
-      }
+      if (!last) lines.push(`    ${theme.fg("muted", "│")}`);
     });
     lines.push("");
   }
 
-  // Declared stages with no agents in this view still render — same header and
-  // rails as live stages, with the dot replaced by a checkmark — so the
-  // workflow's structure is always visible: an empty stage is distinguishable
-  // from a stage the orchestrating cell never created.
-  const renderedGroups = new Set(withEmpty.filter(Boolean));
+  const renderedGroups = new Set(orderedGroups.filter(Boolean));
   for (const pool of snapshot.pools ?? []) {
     if (pool.status === "closed") continue;
     for (const stage of pool.stages ?? []) {
       if (renderedGroups.has(stage.name)) continue;
       renderedGroups.add(stage.name);
-      const stageElapsed = formatAgentSeconds(wallNow - (stage.startedAt ?? wallNow));
-      lines.push(`    ${theme.fg("success", "✓")} ${theme.fg("muted", stage.name)} ${theme.fg("muted", `· ${stageElapsed}`)}`);
-      const detail =
-        stage.submitted === 0
-          ? "idle"
-          : `${stage.settled}/${stage.submitted} done (earlier cell)`;
+      const busy = stageBusyMs(stage, wallNow);
+      const stageElapsed = formatAgentSeconds(busy ?? 0);
+      lines.push(`    ${theme.fg("success", "✓")} ${theme.fg("muted", stage.name)} ${subdued(theme, `· ${stageElapsed}`)}`);
+      const detail = stage.submitted === 0 ? "idle" : `${stage.settled}/${stage.submitted} done (earlier cell)`;
       lines.push(`    ${theme.fg("muted", "╰")} ${theme.fg("muted", detail)}`);
       lines.push("");
     }
   }
 
-  // footer summary
-  const queued = totals.queued ?? 0;
-  const running = totals.running ?? agents.filter((a) => a.status === "running" || a.status === "starting").length;
-  const settled = totals.settled ?? agents.filter((a) => a.status === "settled").length;
-  const failed = totals.failed ?? agents.filter((a) => ["failed", "dead", "stopped", "cancelled"].includes(a.status)).length;
+  if (hiddenQueued > 0) lines.push(theme.fg("muted", `    … ${hiddenQueued} more queued`));
+
   const parts: string[] = [];
-  if (queued) parts.push(theme.fg("muted", `… ${queued} queued`));
-  if (running) parts.push(theme.fg("success", `● ${running} running`));
-  if (settled) parts.push(theme.fg("success", `✓ ${settled} done`));
-  if (failed) parts.push(theme.fg("warning", `! ${failed} stopped/failed`));
-  if (parts.length > 0) {
-    lines.push(theme.fg("muted", "subagents: ") + parts.join(theme.fg("muted", " · ")));
-  }
+  if (totals.queued) parts.push(theme.fg("muted", `… ${totals.queued} queued`));
+  if (totals.running) parts.push(theme.fg("success", `● ${totals.running} running`));
+  if (totals.idle) parts.push(theme.fg("muted", `… ${totals.idle} idle`));
+  if (totals.settled) parts.push(theme.fg("success", `✓ ${totals.settled} done`));
+  if (totals.failed) parts.push(theme.fg("warning", `✗ ${totals.failed} stopped/failed`));
+  if (parts.length > 0) lines.push(theme.fg("muted", "subagents: ") + parts.join(theme.fg("muted", " · ")));
   return lines;
 }
 
 export function renderSubagentPanel(
   snapshot: SubagentRuntimeSnapshot | undefined,
   theme: Theme,
-  execId?: string
+  execId?: string,
 ): string[] {
   return renderSubagentFan(snapshot, theme, execId);
 }
 
-/**
- * Plain-text notification for a finished exec, emitted as a
- * "subagent-notification" custom message so the completed workflow stays
- * visible in the transcript (pi-tool-tree frames these; tool results collapse
- * into grouped one-line rows). Uses the vocabulary pi-tool-tree's formatter
- * expects: a glyph header, metadata lines, then "⎿" detail lines.
- */
-export function renderSubagentNotification(snapshot: SubagentRuntimeSnapshot | undefined, execId?: string): string | null {
-  const agents = relevantAgents(snapshot, execId);
-  if (agents.length === 0) {
-    return null;
+function notificationGlyph(agent: SubagentAgentRow, theme?: Theme): string {
+  if (isDone(agent)) return paint(theme, "success", "✓");
+  if (isFailed(agent)) return paint(theme, "warning", "✗");
+  if (isIdle(agent) || agent.status === "queued" || agent.status === "starting") {
+    return paint(theme, "muted", "…");
   }
-  const statusGlyph = (status: string): string => {
-    if (status === "settled" || status === "closed") return "✓";
-    if (status === "failed" || status === "dead") return "✗";
-    if (status === "cancelled" || status === "stopped") return "■";
-    return "●";
-  };
-  const lines: string[] = [];
-  const done = agents.filter((a) => a.status === "settled" || a.status === "closed").length;
-  const failed = agents.filter((a) => ["failed", "dead", "stopped", "cancelled"].includes(a.status)).length;
-  const stillGoing = agents.filter((a) => ["queued", "starting", "running"].includes(a.status)).length;
+  return paint(theme, "success", "●");
+}
+
+/**
+ * Transcript notification for a finished exec. Theme ANSI is preserved by
+ * pi-tool-tree, matching the themed call site in index.ts.
+ */
+export function renderSubagentNotification(
+  snapshot: SubagentRuntimeSnapshot | undefined,
+  theme: Theme,
+  execId?: string,
+): string | null {
+  const agents = relevantAgents(snapshot, execId);
+  if (!snapshot || agents.length === 0) return null;
+
+  const done = agents.filter(isDone).length;
+  const failed = agents.filter(isFailed).length;
+  const stillGoing = agents.filter((agent) => ["queued", "starting", "running"].includes(agent.status)).length;
   const headerBits = [`${done} done`];
   if (failed) headerBits.push(`${failed} failed`);
   if (stillGoing) headerBits.push(`${stillGoing} still working`);
-  lines.push(`${stillGoing ? "●" : failed ? "✗" : "✓"} subagents · ${headerBits.join(" · ")}`);
+  const headerGlyph = stillGoing
+    ? paint(theme, "success", "●")
+    : failed
+      ? paint(theme, "warning", "✗")
+      : paint(theme, "success", "✓");
+  const lines = [`${headerGlyph} ${paint(theme, "text", "subagents")} ${subdued(theme, `· ${headerBits.join(" · ")}`)}`];
+
+  const groups: string[] = [];
   for (const agent of agents) {
-    const bits = [`${formatAgentSeconds(agent.elapsedMs) || "—"}`, `${agent.toolCalls || 0} calls`];
-    const ctx = agent.ctx;
-    if (ctx?.percent !== undefined && ctx.percent !== null) bits.push(`ctx ${Math.round(ctx.percent)}%`);
-    lines.push(`⎿ ${statusGlyph(agent.status)} ${agent.name} · ${bits.join(" · ")}`);
+    const group = agent.group ?? "";
+    if (!groups.includes(group)) groups.push(group);
   }
+  const wallNow = Date.now();
+  let queued = 0;
+  for (const group of groups.filter(Boolean).concat(groups.filter((group) => !group))) {
+    const grouped = sortAgents(agents.filter((agent) => (agent.group ?? "") === group));
+    const visible = grouped.filter((agent) => {
+      if (agent.status !== "queued") return true;
+      queued += 1;
+      return false;
+    });
+    if (group) {
+      const startedAt = snapshot.groups?.[group] ?? Math.min(...grouped.map((agent) => agent.startedAt ?? wallNow));
+      const executing = grouped.some(isExecuting);
+      const elapsed = formatAgentSeconds(groupElapsedMs(snapshot, group, grouped, startedAt, wallNow));
+      lines.push(
+        `${paint(theme, "success", "●")} ` +
+          `${paint(theme, executing ? "accent" : "muted", group)} ${subdued(theme, `· ${elapsed}`)}`,
+      );
+    }
+    for (const agent of visible) {
+      const bits = [formatAgentSeconds(agent.elapsedMs) || "—", `${agent.toolCalls || 0} tool calls`];
+      if (agent.ctx?.tokens !== undefined && agent.ctx.tokens !== null) {
+        bits.push(formatCtxValue(agent.ctx));
+      } else if (agent.ctx?.percent !== undefined && agent.ctx.percent !== null) {
+        bits.push(`ctx ${Math.round(agent.ctx.percent)}%`);
+      }
+      lines.push(
+        `⎿ ${notificationGlyph(agent, theme)} ${paint(theme, "text", agent.name)} ${subdued(theme, `· ${bits.join(" · ")}`)}`,
+      );
+    }
+  }
+  if (queued > 0) lines.push(`⎿ ${paint(theme, "muted", `… ${queued} more queued`)}`);
   return lines.join("\n");
 }

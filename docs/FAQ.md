@@ -6,16 +6,11 @@ Answers grounded in clean-environment install tests (fresh `PI_CODING_AGENT_DIR`
 
 Distilled from a verified clean install (pi 0.87.1, node v26, python 3.14, no `pi-profiles`, no `pi-tool-tree`):
 
-1. **Export `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true` first.** Without it, the very next pi start hard-fails with exit code 1:
-   ```
-   Error: Failed to load extension ".../src/index.ts": Failed to load extension:
-   PTC runs Python as a local subprocess. Set PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true to opt in.
-   Hint: Start without extensions using "pi -ne".
-   ```
-   This is a mandatory install step, not optional hardening (see `src/index.ts:1600`, `src/sandbox-manager.ts:111-118`).
-2. **Install the extension:** `pi install /path/to/repo` (local path, loads in place, no copy) or `pi install git:github.com/edxeth/pi-ptc-next` (clones to `<agent-dir>/git/github.com/edxeth/pi-ptc-next` and runs npm install — expect benign-looking npm warnings about unapproved install scripts for `koffi` and `protobufjs`).
-3. **Have `python3` on PATH.** `uv` is optional (the venv falls back to `python3 -m venv`); no `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps. `shiki` is only a dynamic import with a plain-text fallback, so its absence is invisible.
-4. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s; no-uv fallback ~7.0s.
+1. **Install the extension:** `pi install /path/to/repo` (local path, loads in place, no copy) or `pi install git:github.com/edxeth/pi-ptc-next` (clones to `<agent-dir>/git/github.com/edxeth/pi-ptc-next` and runs npm install — expect benign-looking npm warnings about unapproved install scripts for `koffi` and `protobufjs`).
+2. **Have `python3` on PATH.** `uv` is optional (the venv falls back to `python3 -m venv`); no `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps. `shiki` is only a dynamic import with a plain-text fallback, so its absence is invisible.
+3. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s; no-uv fallback ~7.0s.
+
+No environment variables are required — but note there is **no sandboxing**: kernels run as plain host Python subprocesses (yolo mode only; VM-based checkpointing is planned).
 
 ---
 
@@ -50,19 +45,13 @@ No. `package.json` declares `pi.extensions: ["./src/index.ts"]` and pi compiles 
 
 ## First-run failures
 
-### Why won't pi start after I install the extension?
+### Why won't Python run after I install the extension?
 
-Almost certainly `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` is not set. `ptcExtension` awaits `createSandbox(settings)` unguarded at extension entry (`src/index.ts:1600`), and `createSandbox` rejects unless the flag is set (`src/sandbox-manager.ts:111-118`, default `false` in `src/utils.ts:79`). The whole extension — and therefore the whole pi session — dies with exit code 1 in both `-p` and TUI mode. The fix is one line in your shell profile:
+The old `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` startup gate was removed — there is no required opt-in anymore, and the extension starts out of the box. If Python still fails to run, check `python3` is on PATH (see the ENOENT question below) and set `PTC_DEBUG=1` to see the `[PTC] Using subprocess runtime (no sandboxing substrate yet)` line at load.
 
-```bash
-export PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true
-```
+### Is there any sandboxing or cell-level confinement?
 
-If the extension loaded but routing seems dead, set `PTC_DEBUG=1` and check for the `[PTC] Using subprocess runtime (PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true)` line.
-
-### What does `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true` actually opt into?
-
-Python cells run as a local subprocess and can spawn arbitrary child processes freely — `subprocess.run(['touch', ...])` inside a cell succeeds (rc 0). The opt-in *is* the sandbox decision; there is no further cell-level confinement. `PTC_ALLOW_BASH` / `PTC_ALLOW_MUTATIONS` (both default **false**) only gate which *host tools* are bridged into Python — raw `subprocess` is never blocked.
+No. Python cells run as a local subprocess and can spawn arbitrary child processes freely — `subprocess.run(['touch', ...])` inside a cell succeeds (rc 0). The extension currently only supports "yolo mode"; VM-based checkpointing is planned but complex and not implemented. `PTC_ALLOW_BASH` / `PTC_ALLOW_MUTATIONS` (both default **false**) only gate which *host tools* are bridged into Python — raw `subprocess` is never blocked.
 
 ### Why does calling `bash(...)` in a cell raise `NameError: name 'bash' is not defined`?
 
@@ -116,7 +105,7 @@ Not extension-related. With a fresh `PI_CODING_AGENT_DIR` and no model auth, pi 
 
 All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
 
-**Required:** `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` (default `false` — but see the mandatory note above).
+**Required:** none — all variables are optional. (The former mandatory `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` gate was removed; kernels run unsandboxed.)
 
 **Tools/policy:** `PTC_ALLOW_MUTATIONS` (false), `PTC_ALLOW_BASH` (false), `PTC_CALLABLE_TOOLS`, `PTC_BLOCKED_TOOLS`, `PTC_TRUSTED_READ_ONLY_TOOLS`.
 

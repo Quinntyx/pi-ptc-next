@@ -9,6 +9,10 @@ const {
   createDeterministicBenchmarkExecutor,
   getDefaultBenchmarkResultPath,
   getProviderModelSlug,
+  isValidIsoTimestamp,
+  loadEvalCasesFromDisk,
+  parseCliArgs,
+  readBenchmarkRun,
   resolveBenchmarkEvalsPath,
   runBenchmarkCli,
   runBenchmarkSuite,
@@ -152,6 +156,8 @@ test("compareBenchmarkRuns reports routing and recovery regressions deterministi
 
   assert.deepEqual(comparison, {
     baseline_path: "/tmp/baseline.json",
+    added_case_ids: [],
+    removed_case_ids: [],
     regressions: [
       {
         case_id: "recovery-missing-await",
@@ -273,14 +279,19 @@ test("runBenchmarkCli writes a result file and emits comparison output for a see
   });
 });
 
-test("benchmark helper paths stay under the eval root", () => {
+test("benchmark helper paths stay under the eval root and sanitize the timestamp", () => {
   const evalsPath = resolveBenchmarkEvalsPath("/repo", ".pi/evals/ptc");
 
   assert.equal(evalsPath, path.join("/repo", ".pi", "evals", "ptc"));
   assert.equal(getProviderModelSlug("OpenAI", "gpt-5.4-mini"), "openai__gpt-5.4-mini");
+  // Colons are unsafe in filenames on Windows and hostile to shells.
   assert.equal(
     getDefaultBenchmarkResultPath(evalsPath, "OpenAI", "gpt-5.4-mini", "2026-03-16T00:00:00.000Z"),
-    path.join(evalsPath, "results", "openai__gpt-5.4-mini", "2026-03-16T00:00:00.000Z.json")
+    path.join(evalsPath, "results", "openai__gpt-5.4-mini", "2026-03-16T00-00-00.000Z.json")
+  );
+  assert.equal(
+    getDefaultBenchmarkResultPath(evalsPath, "openai", "gpt", "bad:timestamp:with:colons"),
+    path.join(evalsPath, "results", "openai__gpt", "bad-timestamp-with-colons.json")
   );
 });
 
@@ -312,4 +323,169 @@ test("deterministic benchmark executor derives recovery hints from eval rules", 
     provider: "local",
     model: "seeded",
   });
+});
+
+test("parseCliArgs rejects missing or flag-like values for value-taking flags", () => {
+  assert.throws(() => parseCliArgs(["--provider"]), /--provider requires a value \(no value provided\)/);
+  assert.throws(() => parseCliArgs(["--provider", "--model", "m"]), /--provider requires a value/);
+  assert.throws(() => parseCliArgs(["--model", "--cases", "x"]), /--model requires a value/);
+  assert.throws(() => parseCliArgs(["--evals-path"]), /--evals-path requires a value/);
+  assert.throws(() => parseCliArgs(["--baseline", ""]), /--baseline requires a value/);
+  assert.throws(() => parseCliArgs(["--results-path", "--timestamp"]), /--results-path requires a value/);
+  assert.throws(() => parseCliArgs(["--cases"]), /--cases requires a value/);
+  assert.throws(() => parseCliArgs(["--timestamp"]), /--timestamp requires a value/);
+
+  const parsed = parseCliArgs([
+    "--provider",
+    "openai",
+    "--model",
+    "gpt-5.4-mini",
+    "--cases",
+    "a,b",
+    "--timestamp",
+    "2026-03-16T00:00:00.000Z",
+  ]);
+  assert.equal(parsed.provider, "openai");
+  assert.equal(parsed.model, "gpt-5.4-mini");
+  assert.deepEqual(parsed.caseIds, ["a", "b"]);
+  assert.equal(parsed.timestamp, "2026-03-16T00:00:00.000Z");
+});
+
+test("parseCliArgs validates the timestamp format", () => {
+  assert.throws(() => parseCliArgs(["--timestamp", "not-a-date"]), /--timestamp must be an ISO-like timestamp/);
+  assert.throws(() => parseCliArgs(["--timestamp", "2026-03-16T99:00:00Z"]), /--timestamp must be an ISO-like timestamp/);
+  assert.equal(isValidIsoTimestamp("2026-03-16T00:00:00.000Z"), true);
+  assert.equal(isValidIsoTimestamp("2026-03-16"), true);
+  assert.equal(isValidIsoTimestamp("nope"), false);
+  assert.equal(isValidIsoTimestamp("2026:03:16"), false);
+});
+
+test("runBenchmarkSuite errors when requested case ids match no shipped case", async () => {
+  await assert.rejects(
+    () =>
+      runBenchmarkSuite({
+        provider: "local",
+        model: "seeded",
+        evalsPath: seededEvalsPath,
+        caseIds: ["does-not-exist", "also-missing"],
+      }),
+    (error: Error) => {
+      assert.match(error.message, /Unknown eval case id\(s\): also-missing, does-not-exist/);
+      assert.match(error.message, /Available case id\(s\):/);
+      return true;
+    }
+  );
+});
+
+test("loadEvalCasesFromDisk includes the file path in malformed JSON errors", () => {
+  const tempDir = makeTempDir();
+  fs.mkdirSync(path.join(tempDir, "cases"));
+  fs.writeFileSync(path.join(tempDir, "cases", "broken.json"), "{ not json");
+
+  assert.throws(() => loadEvalCasesFromDisk(tempDir), (error: Error) => {
+    assert.match(error.message, /Failed to parse eval case file/);
+    assert.match(error.message, /broken\.json/);
+    return true;
+  });
+});
+
+test("loadEvalCasesFromDisk surfaces the file path in validation errors", () => {
+  const tempDir = makeTempDir();
+  fs.mkdirSync(path.join(tempDir, "cases"));
+  fs.writeFileSync(
+    path.join(tempDir, "cases", "invalid.json"),
+    JSON.stringify({ id: "invalid", prompt: "hi", expected_first_path: "nonsense", acceptance: { type: "exact", rules: ["success=true"] } })
+  );
+
+  assert.throws(() => loadEvalCasesFromDisk(tempDir), /invalid\.json validation failed/);
+});
+
+test("readBenchmarkRun rejects shape-mismatched baseline files", () => {
+  const tempDir = makeTempDir();
+  const filePath = path.join(tempDir, "baseline.json");
+
+  fs.writeFileSync(filePath, JSON.stringify({ provider: "local", results: "not-an-array" }));
+  assert.throws(() => readBenchmarkRun(filePath), /results must be an array/);
+
+  fs.writeFileSync(filePath, JSON.stringify({ results: [{ result: { case_id: "" } }], summary: {} }));
+  assert.throws(() => readBenchmarkRun(filePath), /results\[0\]\.result\.case_id must be a non-empty string/);
+
+  fs.writeFileSync(filePath, "not json at all");
+  assert.throws(() => readBenchmarkRun(filePath), /Failed to parse benchmark run file/);
+});
+
+test("compareBenchmarkRuns reports added and removed case ids", () => {
+  const baseline = {
+    provider: "local",
+    model: "seeded",
+    generated_at: "2026-03-16T00:00:00.000Z",
+    results: [
+      {
+        result: {
+          case_id: "removed-case",
+          provider: "local",
+          model: "seeded",
+          expected_first_path: "direct",
+          observed_first_path: "direct",
+          success: true,
+          recovery_attempted: false,
+          failure_class: null,
+          total_tokens: 1,
+          duration_ms: 1,
+        },
+        rule_outcomes: [],
+      },
+    ],
+    summary: { total_cases: 1, successful_cases: 1, routed_cases: 0, recovery_attempts: 0 },
+  };
+  const current = {
+    provider: "local",
+    model: "seeded",
+    generated_at: "2026-03-16T00:00:01.000Z",
+    results: [
+      {
+        result: {
+          case_id: "added-case",
+          provider: "local",
+          model: "seeded",
+          expected_first_path: "direct",
+          observed_first_path: "direct",
+          success: true,
+          recovery_attempted: false,
+          failure_class: null,
+          total_tokens: 1,
+          duration_ms: 1,
+        },
+        rule_outcomes: [],
+      },
+    ],
+    summary: { total_cases: 1, successful_cases: 1, routed_cases: 0, recovery_attempts: 0 },
+  };
+
+  const comparison = compareBenchmarkRuns(current, baseline, "/tmp/baseline.json");
+
+  assert.deepEqual(comparison.added_case_ids, ["added-case"]);
+  assert.deepEqual(comparison.removed_case_ids, ["removed-case"]);
+  assert.deepEqual(comparison.regressions, []);
+});
+
+test("shipped eval cases all pass under the deterministic executor (smoke)", async () => {
+  const run = await runBenchmarkSuite({
+    provider: "local",
+    model: "smoke",
+    evalsPath: seededEvalsPath,
+    timestamp: "2026-03-16T00:00:00.000Z",
+  });
+
+  assert.equal(run.summary.total_cases, 6);
+  for (const record of run.results) {
+    assert.equal(
+      record.result.observed_first_path,
+      record.result.expected_first_path,
+      `${record.result.case_id} did not route as expected`
+    );
+    for (const outcome of record.rule_outcomes) {
+      assert.equal(outcome.passed, true, `${record.result.case_id} failed rule: ${outcome.rule}`);
+    }
+  }
 });

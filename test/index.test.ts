@@ -1,6 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+// These are host-extension tests, not nested-agent behavior tests. A depth of
+// zero also suppresses unrelated background subagent-environment provisioning.
+process.env.PI_SUBAGENT_DEPTH = "0";
+
 function setModuleExports(modulePath, exports) {
   const resolved = require.resolve(modulePath);
   const previous = require.cache[resolved];
@@ -43,20 +47,21 @@ function makeFakeSessionManager(sandbox) {
       return this.execute(sessionId, code);
     }
 
-    async execBackground() {
-      return { execId: "bg-1" };
+    async readCellOutput(cellIdx, options) {
+      return {
+        text: `cell ${cellIdx} offset ${options.offset ?? 1} limit ${options.limit ?? "default"}`,
+        notebookPath: "/tmp/test.ipynb",
+        cellIdx,
+      };
     }
 
-    async waitForExec() {
-      return this.execute("s1", "wait_for");
-    }
-
-    async toScript() {
-      return { path: "/tmp/script.py", cells: 2, wrappedAsync: false };
-    }
-
-    pendingBackground() {
-      return [];
+    async promoteToSkillNotebook(options) {
+      return {
+        name: options.name,
+        path: `/tmp/library/${options.name}.ipynb`,
+        notebookPath: options.notebookPath ?? "/tmp/test.ipynb",
+        overwritten: false,
+      };
     }
 
     list() {
@@ -139,7 +144,7 @@ function restoreInjectedModules(sandbox, overrides = {}) {
   const restoreRegistry = setModuleExports("../dist/tool-registry.js", {
     ToolRegistry: class FakeToolRegistry {
       getCallableTools() {
-        return [];
+        return [{ name: "read", source: "builtin", isReadOnly: true }];
       }
 
       getAutoRoutableToolNames() {
@@ -247,8 +252,32 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
     const toolNames = registered.map((tool) => tool.name).sort();
     assert.deepEqual(
       toolNames.sort(),
-      ["exec_cell", "inspect_kernel", "list_kernels", "provision_dependency", "provision_kernel"].sort(),
+      ["exec_cell", "inspect_kernel", "list_kernels", "promote_to_skill_notebook", "provision_dependency", "provision_kernel", "read_cell_output"].sort(),
     );
+    const readCellOutput = registered.find((tool) => tool.name === "read_cell_output");
+    assert.deepEqual(Object.keys(readCellOutput.parameters.properties), ["cellIdx", "offset", "limit"]);
+    const readResult = await readCellOutput.execute(
+      "read-output",
+      { cellIdx: 3, offset: 2, limit: 4 },
+      undefined,
+      undefined,
+      { cwd: process.cwd() }
+    );
+    assert.equal(readResult.content[0].text, "cell 3 offset 2 limit 4");
+
+    const provisionKernel = registered.find((tool) => tool.name === "provision_kernel");
+    assert.deepEqual(Object.keys(provisionKernel.parameters.properties), ["notebook", "source"]);
+    const promote = registered.find((tool) => tool.name === "promote_to_skill_notebook");
+    assert.deepEqual(Object.keys(promote.parameters.properties), ["name", "notebookPath", "overwrite"]);
+    const promoted = await promote.execute(
+      "promote",
+      { name: "review-workflow", notebookPath: "/tmp/review.ipynb" },
+      undefined,
+      undefined,
+      { cwd: process.cwd() }
+    );
+    assert.equal(promoted.details.path, "/tmp/library/review-workflow.ipynb");
+
     assert.ok(commands.ptc);
     assert.equal(managerInstance.started, 1);
 
@@ -289,12 +318,17 @@ test("ptc extension auto-routes repo-wide analysis prompts toward exec_cell", as
     await ptcExtension(pi);
     await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
 
+    const execCell = registered.find((tool) => tool.name === "exec_cell");
+    const inspectKernel = registered.find((tool) => tool.name === "inspect_kernel");
+    assert.match(execCell.description, /Host tools callable from Python in this kernel: read/);
+    assert.match(inspectKernel.description, /Available Python helpers:/);
+
     const routeResult = eventHandlers.get("before_agent_start")({
       prompt: "Analyze the first 8 test/**/*.test.ts files and return compact JSON only",
       systemPrompt: "base prompt",
     });
 
-    assert.deepEqual(activeTools, ["exec_cell", "provision_kernel"]);
+    assert.deepEqual(activeTools, ["exec_cell", "provision_kernel", "read_cell_output"]);
     assert.match(routeResult.systemPrompt, /strong fit for exec_cell/);
     assert.match(routeResult.systemPrompt, /provision_kernel/);
 
@@ -421,6 +455,7 @@ test("ptc extension resets recovery state for each user request", async () => {
     assert.deepEqual(firstTelemetry, {
       autoRouted: false,
       firstToolPath: "code_execution",
+      routedToCodeExecution: true,
       codeExecutionAttempts: 1,
       recoveryAttemptCount: 0,
       terminalState: "success",
@@ -428,6 +463,7 @@ test("ptc extension resets recovery state for each user request", async () => {
     assert.deepEqual(secondResult.details.telemetry, {
       autoRouted: false,
       firstToolPath: "code_execution",
+      routedToCodeExecution: true,
       codeExecutionAttempts: 2,
       recoveryAttemptCount: 0,
       terminalState: "success",
@@ -440,6 +476,7 @@ test("ptc extension resets recovery state for each user request", async () => {
     assert.deepEqual(thirdResult.details.telemetry, {
       autoRouted: false,
       firstToolPath: "code_execution",
+      routedToCodeExecution: true,
       codeExecutionAttempts: 1,
       recoveryAttemptCount: 0,
       terminalState: "success",
@@ -688,6 +725,7 @@ test("ptc extension includes recovery telemetry in successful exec_cell details 
     assert.deepEqual(result.details.telemetry, {
       autoRouted: false,
       firstToolPath: "code_execution",
+      routedToCodeExecution: true,
       codeExecutionAttempts: 2,
       recoveryAttemptCount: 1,
       terminalState: "success",
@@ -751,6 +789,7 @@ test("ptc extension includes first-path telemetry in non-recovered exec_cell det
     assert.deepEqual(result.details.telemetry, {
       autoRouted: true,
       firstToolPath: "code_execution",
+      routedToCodeExecution: true,
       codeExecutionAttempts: 1,
       recoveryAttemptCount: 0,
       terminalState: "success",
@@ -820,6 +859,212 @@ test("ptc extension does not auto-recover literal zero-match path failures", asy
     } else {
       process.env.PTC_AUTO_RECOVER = previousAutoRecover;
     }
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
+test("exec_cell file mode records and validates the real file contents", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("sandbox spawn should not be used"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+  };
+  let captured;
+  const restore = restoreInjectedModules(sandbox, {
+    async execForeground(sessionId, code, options) {
+      captured = { sessionId, code, options };
+      return successResult();
+    },
+  });
+
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+
+    const execCell = registered.find((tool) => tool.name === "exec_cell");
+    await execCell.execute(
+      "file-call",
+      { session_id: "s1", file: "test/index.test.ts" },
+      undefined,
+      undefined,
+      { cwd: process.cwd() }
+    );
+
+    assert.match(captured.code, /const test = require\("node:test"\)/);
+    assert.equal(captured.options.file, require("node:path").resolve("test/index.test.ts"));
+    assert.notEqual(captured.code, "(exec_cell file mode)\n");
+  } finally {
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
+test("completed exec_cell rendering omits missing durations instead of printing NaN", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("sandbox spawn should not be used"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+  };
+  const restore = restoreInjectedModules(sandbox);
+
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    const execCell = registered.find((tool) => tool.name === "exec_cell");
+    const theme = { fg(_color, text) { return text; } };
+    const rendered = execCell.renderResult(
+      {
+        content: [{ type: "text", text: "validation failed" }],
+        details: {
+          nestedToolCalls: 0,
+          nestedToolNames: [],
+          nestedResultChars: 0,
+          nestedResultCount: 0,
+          nestedErrors: 1,
+          estimatedAvoidedTokens: 0,
+        },
+      },
+      { isPartial: false },
+      theme
+    ).render(100).join("\n");
+    assert.doesNotMatch(rendered, /NaN/);
+  } finally {
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
+test("parallel exec_cell calls retain independent default command targets", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("sandbox spawn should not be used"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+  };
+  const pending = new Map();
+  const interrupted = [];
+  const restore = restoreInjectedModules(sandbox, {
+    execForeground(sessionId) {
+      return new Promise((resolve) => pending.set(sessionId, resolve));
+    },
+    list() {
+      return [
+        { id: "s1", chunks: 0, running: false },
+        { id: "s2", chunks: 0, running: false },
+      ];
+    },
+    mostRecentActive() { return null; },
+    interruptRunning(sessionId) {
+      interrupted.push(sessionId);
+      return true;
+    },
+  });
+
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi, commands } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    const execCell = registered.find((tool) => tool.name === "exec_cell");
+    const ctx = { cwd: process.cwd() };
+
+    const first = execCell.execute("call-1", { session_id: "s1", code: "1" }, undefined, undefined, ctx);
+    const second = execCell.execute("call-2", { session_id: "s2", code: "2" }, undefined, undefined, ctx);
+    await commands.ptc.handler("interrupt", { ui: { notify() {} } });
+    assert.equal(interrupted.at(-1), "s2");
+
+    pending.get("s1")(successResult());
+    await first;
+    await commands.ptc.handler("interrupt", { ui: { notify() {} } });
+    assert.equal(interrupted.at(-1), "s2");
+
+    pending.get("s2")(successResult());
+    await second;
+  } finally {
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
+test("failed exec_cell tool results receive terminal telemetry", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("sandbox spawn should not be used"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+  };
+  const restore = restoreInjectedModules(sandbox, {
+    execForeground() { throw new Error("kernel failed"); },
+  });
+
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    eventHandlers.get("before_agent_start")({ prompt: "Analyze files", systemPrompt: "base" });
+
+    const execCell = registered.find((tool) => tool.name === "exec_cell");
+    await assert.rejects(
+      execCell.execute("failed-call", { session_id: "s1", code: "1" }, undefined, undefined, { cwd: process.cwd() }),
+      /kernel failed/
+    );
+    const transformed = eventHandlers.get("tool_result")({
+      toolName: "exec_cell",
+      isError: true,
+      details: undefined,
+    });
+    assert.equal(transformed.details.telemetry.terminalState, "failed_without_recovery");
+    assert.equal(transformed.details.telemetry.routedToCodeExecution, true);
+  } finally {
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
+test("provision_dependency does not treat spawn failures as successful installs", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("sandbox spawn should not be used"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+    resolvePythonExecutable() { return "python3"; },
+  };
+  const restore = restoreInjectedModules(sandbox);
+  const previousPath = process.env.PATH;
+
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    const provisionDependency = registered.find((tool) => tool.name === "provision_dependency");
+
+    process.env.PATH = "/definitely/missing";
+    const result = await provisionDependency.execute(
+      "dependency-call",
+      { package: "example-package" },
+      undefined,
+      undefined,
+      { cwd: process.cwd() }
+    );
+    const text = result.content[0].text;
+    assert.match(text, /executable not found \(ENOENT\)/);
+    assert.doesNotMatch(text, /already satisfied/);
+  } finally {
+    process.env.PATH = previousPath;
     restore();
     delete require.cache[require.resolve("../dist/index.js")];
   }

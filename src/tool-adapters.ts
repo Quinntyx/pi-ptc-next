@@ -37,6 +37,9 @@ function estimateChars(value: unknown): number {
   }
 }
 
+const TRUNCATION_NOTICE_LINE_RE =
+  /^\[(?:Showing lines \d|Use offset=|\d+ more lines in file|\d+ (?:results|entries|matches) limit reached|\d[\d.]*[KMG]?B limit reached|Some lines truncated to \d+ chars|Output truncated\b)/;
+
 function splitNonEmptyLines(text: string, emptyMarkers: string[] = []): string[] {
   const trimmed = text.trim();
   if (!trimmed || emptyMarkers.includes(trimmed)) {
@@ -47,7 +50,91 @@ function splitNonEmptyLines(text: string, emptyMarkers: string[] = []): string[]
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
-    .filter((line) => !/^\[(Showing|Use offset=|Output truncated)/.test(line));
+    .filter((line) => !TRUNCATION_NOTICE_LINE_RE.test(line));
+}
+
+/**
+ * Returns the tool's text output with truncation notices removed.
+ *
+ * Prefer pi's structured details over notice-format knowledge. A truncation
+ * detail carries the exact pre-notice content; result/entry/match limit details
+ * confirm that pi appended one trailing bracketed notice, which can then be
+ * removed without interpreting its wording. Regex filtering is only the
+ * compatibility fallback for hosts that omit structured details.
+ */
+function extractCleanText(result: ToolExecutionResult, limitDetailKeys: string[] = []): string {
+  const text = extractTextContent(result);
+  if (!isRecord(result.details)) {
+    return text;
+  }
+  const details = result.details;
+
+  if (isRecord(details.truncation) && typeof details.truncation.content === "string") {
+    return details.truncation.content;
+  }
+
+  if (limitDetailKeys.some((key) => typeof details[key] === "number")) {
+    return text.replace(/(?:\r?\n)+\[[^\r\n]*\]\s*$/, "");
+  }
+
+  return text;
+}
+
+interface ParsedGrepMatch {
+  [key: string]: unknown;
+  path: string;
+  line: number;
+  text: string;
+  kind: "match" | "context";
+}
+
+/** Parses a `path:line: text` (match) or `path-line- text` (context) line relative to a known path. */
+function parseGrepLineRelativeTo(line: string, filePath: string): ParsedGrepMatch | null {
+  const colonPrefix = `${filePath}:`;
+  if (line.startsWith(colonPrefix)) {
+    const match = line.slice(colonPrefix.length).match(/^(\d+):\s?(.*)$/);
+    if (match) {
+      return { path: filePath, line: Number.parseInt(match[1], 10), text: match[2], kind: "match" };
+    }
+  }
+
+  const hyphenPrefix = `${filePath}-`;
+  if (line.startsWith(hyphenPrefix)) {
+    const match = line.slice(hyphenPrefix.length).match(/^(\d+)-\s?(.*)$/);
+    if (match) {
+      return { path: filePath, line: Number.parseInt(match[1], 10), text: match[2], kind: "context" };
+    }
+  }
+
+  return null;
+}
+
+function parseGrepLineGeneric(line: string): ParsedGrepMatch | null {
+  // Match lines: anchor on the LAST `:<digits>:` so paths containing
+  // hyphen-digit segments (`v2-2024-report.md:12: x`) are not split early.
+  const match = line.match(/^(.*):(\d+):\s?(.*)$/);
+  if (match) {
+    return {
+      path: match[1],
+      line: Number.parseInt(match[2], 10),
+      text: match[3],
+      kind: "match",
+    };
+  }
+
+  // Context lines use `path-line- text`; the greedy path keeps hyphen-digit
+  // paths whole (pi never emits a bare `-` separator before the line number).
+  const context = line.match(/^(.+)-(\d+)-\s?(.*)$/);
+  if (context) {
+    return {
+      path: context[1],
+      line: Number.parseInt(context[2], 10),
+      text: context[3],
+      kind: "context",
+    };
+  }
+
+  return null;
 }
 
 function parseGrepMatches(text: string): Array<Record<string, unknown>> {
@@ -57,20 +144,23 @@ function parseGrepMatches(text: string): Array<Record<string, unknown>> {
   }
 
   const matches: Array<Record<string, unknown>> = [];
-  for (const line of trimmed.split(/\r?\n/)) {
-    const match = line.match(/^(.*?)([:\-])(\d+)([:\-])\s?(.*)$/);
-    if (!match) {
-      continue;
-    }
+  let currentPath: string | null = null;
 
-    const [, path, firstSep, lineNumber, secondSep, textPart] = match;
-    const isContext = firstSep === "-" || secondSep === "-";
-    matches.push({
-      path,
-      line: Number.parseInt(lineNumber, 10),
-      text: textPart,
-      kind: isContext ? "context" : "match",
-    });
+  for (const line of trimmed.split(/\r?\n/)) {
+    // Prefer parsing relative to the most recently confirmed path: anchoring on
+    // the known path keeps paths with `:digits:` / `-digits-` segments intact.
+    if (currentPath !== null) {
+      const relative = parseGrepLineRelativeTo(line, currentPath);
+      if (relative) {
+        matches.push(relative);
+        continue;
+      }
+    }
+    const generic = parseGrepLineGeneric(line);
+    if (generic) {
+      currentPath = generic.path;
+      matches.push(generic);
+    }
   }
 
   return matches;
@@ -93,18 +183,25 @@ export function normalizeToolResult(toolName: string, result: ToolExecutionResul
 
     case "find":
     case "glob": {
-      const lines = splitNonEmptyLines(text, ["No files found matching pattern"]);
+      const lines = splitNonEmptyLines(extractCleanText(result, ["resultLimitReached"]), ["No files found matching pattern"]);
       return { value: lines, estimatedChars: estimateChars(lines) };
     }
 
     case "ls": {
-      const lines = splitNonEmptyLines(text, ["(empty directory)"]);
+      const lines = splitNonEmptyLines(extractCleanText(result, ["entryLimitReached"]), ["(empty directory)"]);
       return { value: lines, estimatedChars: estimateChars(lines) };
     }
 
     case "grep": {
-      const matches = parseGrepMatches(text);
-      return { value: matches, estimatedChars: estimateChars(matches) };
+      const matches = parseGrepMatches(extractCleanText(result, ["matchLimitReached"]));
+      // Surface pi's structured truncation signal so Python can tell truncated
+      // result sets from complete ones (review item M3).
+      const matchLimitReached =
+        isRecord(result.details) && typeof result.details.matchLimitReached === "number"
+          ? result.details.matchLimitReached
+          : null;
+      const value = { matches, matchLimitReached };
+      return { value, estimatedChars: estimateChars(value) };
     }
 
     case "bash": {

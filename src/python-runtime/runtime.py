@@ -15,7 +15,12 @@ _PTC_PROGRESS_INTERVAL_SECONDS = 0.05
 _PTC_HOST_WORKSPACE_ROOT = globals().get("PTC_HOST_WORKSPACE_ROOT", _ptc_os.getcwd())
 _PTC_RUNTIME_WORKSPACE_ROOT = globals().get("PTC_RUNTIME_WORKSPACE_ROOT", _ptc_os.getcwd())
 _PTC_USER_CODE_LINE_COUNT = globals().get("PTC_USER_CODE_LINE_COUNT", 0)
-_PTC_MAX_OUTPUT_CHARS = max(1, int(globals().get("PTC_MAX_OUTPUT_CHARS", 100_000)))
+# Canonical full-capture site. The host never truncates a second time; it only
+# collapses a model-facing preview after this emergency per-cell safety valve.
+_PTC_MAX_SPOOL_CHARS = max(1, int(globals().get(
+    "PTC_MAX_SPOOL_CHARS",
+    globals().get("PTC_MAX_OUTPUT_CHARS", _ptc_os.environ.get("PTC_MAX_SPOOL_CHARS", 10_000_000)),
+)))
 _ORIGINAL_STDOUT = _ptc_sys.stdout
 
 
@@ -32,8 +37,13 @@ class _StdoutProxy:
         self._buffer = ""
         self.total_chars = 0
         self.accepted_chars = 0
-        # Per-cell transcript for the notebook writer (session.py resets it at
-        # the start of every cell).
+        # Per-cell transcript for the notebook writer.
+        self.cell_text = ""
+
+    def reset_cell(self) -> None:
+        self._buffer = ""
+        self.total_chars = 0
+        self.accepted_chars = 0
         self.cell_text = ""
 
     def write(self, text: str) -> int:
@@ -41,7 +51,7 @@ class _StdoutProxy:
             return 0
 
         self.total_chars += len(text)
-        remaining = _PTC_MAX_OUTPUT_CHARS - self.accepted_chars
+        remaining = _PTC_MAX_SPOOL_CHARS - self.accepted_chars
         if remaining <= 0:
             return len(text)
 
@@ -313,6 +323,28 @@ def _capture_figures() -> list[dict[str, Any]]:
         pass
     return captured
 
+def _python_error_help(error: BaseException) -> str | None:
+    if isinstance(error, (ModuleNotFoundError, ImportError)):
+        missing = getattr(error, "name", None)
+        distribution = str(missing).split(".")[0] if missing else "<distribution>"
+        return f"help: install it with provision_dependency('{distribution}') then re-run"
+    if isinstance(error, NameError):
+        return "help: name is undefined — define it, or inspect_kernel to see live names (the kernel may have restarted)"
+    if isinstance(error, SyntaxError):
+        return "help: fix the syntax error at the reported line"
+    if isinstance(error, FileNotFoundError):
+        return "help: verify the path exists (read/ls the parent dir)"
+    if isinstance(error, AttributeError):
+        return "help: inspect_kernel to discover the real attribute/API"
+    return None
+
+
+def _traceback_with_help(error: BaseException) -> str:
+    traceback_text = _ptc_traceback.format_exc().rstrip()
+    hint = _python_error_help(error)
+    return f"{traceback_text}\n{hint}" if hint else traceback_text
+
+
 def _stringify_output(value: Any) -> str:
     if value is None:
         return ""
@@ -350,7 +382,7 @@ async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
         images = _capture_figures()
         final_output = _stringify_output(output)
         total_output_chars = _stdout_proxy.total_chars + len(final_output)
-        remaining_output_chars = max(0, _PTC_MAX_OUTPUT_CHARS - _stdout_proxy.accepted_chars)
+        remaining_output_chars = max(0, _PTC_MAX_SPOOL_CHARS - _stdout_proxy.accepted_chars)
         _emit_protocol({
             "type": "complete",
             "output": final_output[:remaining_output_chars],
@@ -364,7 +396,7 @@ async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
             {
                 "type": "error",
                 "message": str(error),
-                "traceback": _ptc_traceback.format_exc(),
+                "traceback": _traceback_with_help(error),
             }
         )
         _ptc_sys.exit(1)

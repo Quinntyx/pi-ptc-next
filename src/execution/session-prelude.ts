@@ -14,7 +14,7 @@ export interface SessionPreludeOptions {
 /**
  * Builds the persistent interpreter program: rpc bridge + tool wrappers +
  * runtime helpers + (conditional) pi_subagents autoimport + the session exec
- * loop. One interpreter serves many `python_exec` chunks.
+ * loop. One interpreter serves many `exec_cell` cells.
  */
 export function buildSessionPrelude(options: SessionPreludeOptions): string {
   const {

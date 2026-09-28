@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { renderSubagentPanel } = require("../dist/execution/subagent-panel.js");
+const { renderSubagentNotification, renderSubagentPanel } = require("../dist/execution/subagent-panel.js");
 
 test("subagent fan panel renders groups, awaited arrow, and status lines", () => {
   const noopTheme = { fg: (_c, s) => s };
@@ -18,9 +18,9 @@ test("subagent fan panel renders groups, awaited arrow, and status lines", () =>
   const lines = renderSubagentPanel(snapshot, noopTheme);
   const plain = lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
   assert.ok(plain.some((l) => l.startsWith("    ● researching")), plain.join("\n"));
-  assert.ok(plain.some((l) => l.startsWith("  ▶ ├ ● docs-sweeper"))); // arrow in the gutter, tree glyph at col 4
+  assert.ok(plain.some((l) => l.startsWith("  ▶ ") && l.includes("● docs-sweeper"))); // arrow in the gutter; running rows sort by start
   assert.ok(plain.some((l) => l.includes("├ ● test-digger") && l.includes("ctx 230k/1m (23%)")));
-  assert.ok(plain.some((l) => l.includes("╰ testing · 12s · 3 tool calls · thinking 6.2s")));
+  assert.ok(plain.some((l) => l.includes("╰ testing · 12.0s · 3 tool calls · thinking 6.2s")));
   assert.ok(plain.filter((l) => l === "    │").length >= 2); // rail continuation lines
   assert.ok(!plain.some((l) => l.includes("╰ synthesizing · ") && l.includes("tool call")));
 });
@@ -125,4 +125,75 @@ test("a stage whose agents settled in an earlier cell shows its tally, styled id
   assert.ok(plain.some((l) => l.trim().startsWith("✓ build ·")), text);
   assert.ok(text.includes("╰ 4/4 done (earlier cell)"), text);
   assert.ok(!text.includes("[2 slots]"));
+});
+
+test("queued rows are capped, active rows lead, and completed rows precede overflow", () => {
+  const now = Date.now();
+  const noopTheme = { fg: (_c, s) => s };
+  const agents = [
+    { id: "done", name: "finished", group: "work", status: "closed", startedAt: now - 20_000, elapsedMs: 16_000 },
+    ...Array.from({ length: 5 }, (_, i) => ({ id: `q${i}`, name: `queued-${i}`, group: "work", status: "queued", startedAt: now + i, elapsedMs: 0 })),
+    { id: "run", name: "executing", group: "work", status: "running", startedAt: now - 5_000, elapsedMs: 5_000 },
+  ];
+  const snapshot = { agents, groups: { work: now - 20_000 }, timestamp: now };
+  const plain = renderSubagentPanel(snapshot, noopTheme).join("\n");
+
+  assert.equal((plain.match(/queued-\d/g) || []).length, 2, plain);
+  assert.ok(plain.includes("… 3 more queued"), plain);
+  assert.ok(plain.indexOf("executing") < plain.indexOf("queued-0"), plain);
+  assert.ok(plain.indexOf("queued-1") < plain.indexOf("finished"), plain);
+  assert.ok(plain.indexOf("finished") < plain.indexOf("3 more queued"), plain);
+  assert.ok(plain.includes("finished · 16.0s"), plain);
+
+  const notification = renderSubagentNotification(snapshot, noopTheme);
+  assert.ok(notification);
+  assert.ok(!notification.includes("queued-0"), notification);
+  assert.ok(notification.includes("⎿ … 5 more queued"), notification);
+  assert.ok(notification.includes("✓ finished"), notification);
+});
+
+test("idle agents and stages freeze rather than displaying wall-clock age", () => {
+  const now = Date.now();
+  const noopTheme = { fg: (_c, s) => s };
+  const snapshot = {
+    agents: [
+      { id: "idle", name: "retained", group: "review", status: "running", idle: true, startedAt: now - 300_000, elapsedMs: 12_500, busyMs: 12_500 },
+    ],
+    groups: { review: now - 300_000 },
+    pools: [{
+      id: "p", name: "wf", status: "open", concurrency: 2, running: 0, queued: 0, results: 0, startedAt: now - 300_000,
+      stages: [
+        { id: "review", name: "review", slots: 1, queued: 0, running: 0, submitted: 1, settled: 0, failed: 0, cancelled: 0, startedAt: now - 300_000, busyMs: 12_500, activeSince: null },
+        { id: "later", name: "later", slots: 1, queued: 0, running: 0, submitted: 0, settled: 0, failed: 0, cancelled: 0, startedAt: now - 299_000, busyMs: 0, activeSince: null },
+      ],
+    }],
+    timestamp: now,
+  };
+  const plain = renderSubagentPanel(snapshot, noopTheme).join("\n");
+  const idleRow = plain.split("\n").find((line) => line.includes("retained"));
+
+  assert.ok(plain.includes("● review · 12.5s"), plain);
+  assert.ok(plain.includes("✓ later · 0.0s"), plain);
+  assert.ok(plain.includes("idle · waiting for orchestrator"), plain);
+  assert.ok(idleRow && !idleRow.includes("12.5s"), plain);
+  assert.ok(plain.includes("1 idle") && !plain.includes("1 running"), plain);
+});
+
+test("notification and live metadata use dim styling and zero context limits are safe", () => {
+  const now = Date.now();
+  const theme = { fg: (color, text) => `<${color}>${text}</${color}>` };
+  const snapshot = {
+    agents: [{ id: "a", name: "worker", group: "stage", status: "closed", startedAt: now - 16_000, elapsedMs: 16_000, toolCalls: 2, ctx: { tokens: 10, limit: 0 } }],
+    groups: { stage: now - 16_000 },
+    timestamp: now,
+  };
+  const panel = renderSubagentPanel(snapshot, theme).join("\n");
+  const notification = renderSubagentNotification(snapshot, theme);
+
+  assert.ok(panel.includes("<text>worker</text>"), panel);
+  assert.ok(panel.includes("<dim>· 16.0s</dim>"), panel);
+  assert.ok(panel.includes("(0%)") && !panel.includes("Infinity"), panel);
+  assert.ok(panel.includes("✓ 1 done"), panel);
+  assert.ok(notification.includes("<text>worker</text>"), notification);
+  assert.ok(notification.includes("<dim>· 16.0s · 2 tool calls · ctx 0k/0k (0%)</dim>"), notification);
 });

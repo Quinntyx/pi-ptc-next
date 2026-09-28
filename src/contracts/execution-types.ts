@@ -49,8 +49,8 @@ export type RpcMessage =
   | { type: "complete"; output: string; images?: PtcImageArtifact[]; total_output_chars?: number }
   | { type: "error"; message: string; traceback?: string }
   | { type: "update"; message: string }
-  // Persistent-session frames (python_exec against a provisioned interpreter).
-  | { type: "exec_done"; id: string; output: string; images?: PtcImageArtifact[]; total_output_chars?: number }
+  // Persistent-kernel frames (exec_cell against a provisioned interpreter).
+  | { type: "exec_done"; id: string; output: string; echo?: string; kernel_text?: string; subagents_text?: string; images?: PtcImageArtifact[]; total_output_chars?: number; cell?: number }
   | { type: "exec_error"; id: string; message: string; traceback?: string; interrupted?: boolean; line?: number; source?: string }
   | { type: "session_ready" }
   | { type: "subagent_state"; snapshot: SubagentRuntimeSnapshot }
@@ -60,11 +60,15 @@ export interface SubagentAgentRow {
   id: string;
   name: string;
   group?: string | null;
-  /** Exec id of the python_exec chunk this agent was spawned in. */
+  /** Exec id of the exec_cell cell this agent was spawned in. */
   execScope?: string | null;
   status: string;
+  /** True when the retained pi session is between turns, not executing. */
+  idle?: boolean;
   startedAt?: number;
   elapsedMs?: number;
+  /** Accumulated executing time, excluding observed between-turn idle periods. */
+  busyMs?: number;
   socketPath?: string | null;
   windowId?: string | null;
   toolCalls?: number | null;
@@ -92,6 +96,10 @@ export interface SubagentPoolStageState {
   failed: number;
   cancelled: number;
   startedAt: number;
+  /** Accumulated time with at least one task running in this stage. */
+  busyMs?: number;
+  /** Epoch ms at which the current non-empty running period began. */
+  activeSince?: number | null;
 }
 
 export interface SubagentPoolState {
@@ -122,6 +130,36 @@ export interface ScriptExportResult {
   path: string;
   cells: number;
   wrappedAsync: boolean;
+}
+
+/** Options for executing one cell in a persistent kernel. */
+export interface SessionExecOptions {
+  cwd: string;
+  ctx?: ExtensionContext;
+  signal?: AbortSignal;
+  onUpdate?: ToolUpdateCallback;
+  parentToolCallId?: string;
+  /** Live notebook artifact the executed cell is appended to. */
+  notebookPath?: string;
+  /** File mode: execute this file's contents inside the kernel (%run semantics). */
+  file?: string;
+}
+
+/** Public status row for one persistent kernel. */
+export interface SessionSummary {
+  id: string;
+  createdAt: number;
+  lastUsedAt: number;
+  chunks: number;
+  running: boolean;
+  notebookPath: string | undefined;
+}
+
+/** Host callbacks emitted by the persistent-kernel manager. */
+export interface PythonSessionManagerHooks {
+  onSubagentSnapshot?: (sessionId: string, execId: string, snapshot: SubagentRuntimeSnapshot) => void;
+  /** Report for a cell interrupted after pi had already aborted the tool call. */
+  onInterrupted?: (sessionId: string, text: string) => void;
 }
 
 interface ExecutionMetrics {
@@ -155,6 +193,10 @@ export interface ExecutionDetails extends ExecutionMetrics {
   execId?: string;
   subagentSnapshot?: SubagentRuntimeSnapshot;
   backgrounded?: boolean;
+  /** 1-based notebook execution count for this completed cell. */
+  cellIdx?: number;
+  /** Result text uses the sectioned (output/return/kernel/subagents) format. */
+  sectioned?: boolean;
 }
 
 export interface CodeExecutionResult {

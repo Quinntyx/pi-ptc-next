@@ -4,11 +4,18 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { PythonSessionManager, UnknownSessionError } = require("../dist/python-session-manager.js");
-const { loadSettingsFromEnv } = require("../dist/utils.js");
+const { loadSettingsFromEnv, parseSectionedOutput } = require("../dist/utils.js");
 
-// Only run the real-interpreter round trip when local subprocess mode is on
-// (Docker sandboxing would need a container; CI without PTC envs skips).
-const RUN_REAL = process.env.PTC_ALLOW_UNSANDBOXED_SUBPROCESS === "true";
+function parseSection(text: string, name: string): string {
+  const sections = parseSectionedOutput(text);
+  assert.ok(sections, `expected sectioned output, got: ${text.slice(0, 200)}`);
+  const found = sections.find((s: { name: string }) => s.name === name);
+  assert.ok(found, `expected a '${name}' section in: ${text.slice(0, 200)}`);
+  return found.body;
+}
+
+// Only run the real-interpreter round trip when explicitly requested.
+const RUN_REAL = process.env.PTC_TEST_REAL_RUNTIME === "true";
 
 function makeManager(hooks = {}, settingsOverrides = {}) {
   const settings = {
@@ -61,10 +68,10 @@ test("persistent session: definition persists across chunks and returns work", {
     const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
 
     const first = await manager.execForeground(id, "def double(x):\n    return x * 2\nreturn 'defined'", {});
-    assert.match(first.output, /^defined/);
+    assert.match(first.output, /^return \(Out\[1\]\):/);
 
     const second = await manager.execForeground(id, "result = [d for d in [double(1), double(2), double(3)]]\nreturn result", {});
-    assert.deepEqual(JSON.parse(second.output.split("\n\n[kernel]")[0]), [2, 4, 6]);
+    assert.deepEqual(JSON.parse(parseSection(second.output, "return")), [2, 4, 6]);
   } finally {
     await manager.disposeAll();
   }
@@ -80,10 +87,10 @@ test("persistent session: top-level await chunk works and later chunks see its l
       "await asyncio.sleep(0.01)\nvalue = 'awaited'\nreturn value",
       {}
     );
-    assert.match(awaited.output, /^awaited/);
+    assert.match(awaited.output, /^return \(Out\[1\]\):\n  awaited/);
 
     const uses = await manager.execForeground(id, "return value", {});
-    assert.match(uses.output, /^awaited/);
+    assert.match(uses.output, /^return \(Out\[2\]\):\n  awaited/);
   } finally {
     await manager.disposeAll();
   }
@@ -100,7 +107,7 @@ test("persistent session: exec errors do not kill the session", { skip: !RUN_REA
     );
 
     const recovered = await manager.execForeground(id, "x = 1\nreturn x", {});
-    assert.match(recovered.output, /^1\n/);
+    assert.match(recovered.output, /^return \(Out\[2\]\):\n  1\nkernel:/);
   } finally {
     await manager.disposeAll();
   }
@@ -271,7 +278,7 @@ test("persistent session: subagent activity re-arms the idle timeout", { skip: !
       }
     );
 
-    assert.match(result.output, /^survived/);
+    assert.match(result.output, /^return \(Out\[1\]\):\n  survived/);
     assert.equal(manager.list().length, 1, "session should still be live");
     assert.ok(updates.length > 0);
   } finally {
@@ -297,14 +304,14 @@ test("persistent session: idle timeout interrupts the chunk and keeps the sessio
     // Ctrl-C semantics: the interpreter stays interactive with its state intact.
     assert.equal(manager.list().length, 1, "session should survive the interrupt");
     const after = await manager.execForeground(id, "return kept", { cwd: process.cwd() });
-    assert.match(after.output, /^survived/);
+    assert.match(after.output, /^return \(Out\[3\]\):\n  survived/);
   } finally {
     await manager.disposeAll();
   }
 });
 
-test("persistent session: parallel python_exec calls are serialized and both return", { skip: !RUN_REAL }, async () => {
-  // pi dispatches several python_exec calls from one assistant message in parallel;
+test("persistent session: parallel exec_cell calls are serialized and both return", { skip: !RUN_REAL }, async () => {
+  // pi dispatches several exec_cell calls from one assistant message in parallel;
   // racing them used to orphan one promise (the transcript wedged forever).
   const manager = makeManager({}, { executionTimeoutMs: 20_000 });
   try {
@@ -321,8 +328,8 @@ test("persistent session: parallel python_exec calls are serialized and both ret
     });
     const [a, b] = await Promise.all([first, second]);
 
-    assert.match(a.output, /^first/);
-    assert.match(b.output, /^second/);
+    assert.match(a.output, /^return \(Out\[\d+\]\):\n  first/);
+    assert.match(b.output, /^return \(Out\[\d+\]\):\n  second/);
     assert.ok(
       queuedNotices.some((text) => text.includes("Queued")),
       `a chunk waiting behind another should announce that: ${JSON.stringify(queuedNotices)}`
@@ -330,7 +337,7 @@ test("persistent session: parallel python_exec calls are serialized and both ret
 
     // The session stays usable afterwards.
     const third = await manager.execForeground(id, "return 'third'", { cwd: process.cwd() });
-    assert.match(third.output, /^third/);
+    assert.match(third.output, /^return \(Out\[\d+\]\):\n  third/);
   } finally {
     await manager.disposeAll();
   }
@@ -359,7 +366,7 @@ test("persistent session: aborting interrupts the chunk but keeps the session us
     // The session keeps running with its namespace intact (Ctrl-C semantics).
     assert.equal(manager.list().length, 1, "aborted session should survive");
     const after = await manager.execForeground(id, "return before + 1", { cwd: process.cwd() });
-    assert.match(after.output, /^42/);
+    assert.match(after.output, /^return \(Out\[\d+\]\):\n  42/);
   } finally {
     await manager.disposeAll();
   }
@@ -403,7 +410,7 @@ test("persistent session: an unserializable result is an error, not a session de
 
     assert.equal(manager.list().length, 1, "session must survive an unserializable result");
     const after = await manager.execForeground(id, "return kept", { cwd: process.cwd() });
-    assert.match(after.output, /^still-here/);
+    assert.match(after.output, /^return \(Out\[\d+\]\):\n  still-here/);
   } finally {
     await manager.disposeAll();
   }
@@ -453,6 +460,493 @@ function fakeCtx() {
   return { cwd: process.cwd(), hasUI: false };
 }
 
+function createFakeProcess(onFrame) {
+  const { EventEmitter } = require("node:events");
+  const { PassThrough } = require("node:stream");
+  const proc = new EventEmitter();
+  proc.stdout = new PassThrough();
+  proc.stderr = new PassThrough();
+  proc.exitCode = null;
+  proc.signalCode = null;
+  proc.pid = Math.floor(Math.random() * 10_000) + 1;
+  proc.emitFrame = (frame) => proc.stdout.write(`${JSON.stringify(frame)}\n`);
+  proc.crash = (code = 1) => {
+    if (proc.exitCode !== null || proc.signalCode !== null) return;
+    proc.exitCode = code;
+    proc.stdout.end();
+    proc.stderr.end();
+    proc.emit("exit", code, null);
+  };
+  proc.stdin = {
+    destroyed: false,
+    writableEnded: false,
+    write(text) {
+      const frame = JSON.parse(String(text).trim());
+      onFrame(frame, proc);
+      return true;
+    },
+    end() {
+      this.writableEnded = true;
+    },
+  };
+  proc.kill = (signal = "SIGTERM") => {
+    if (proc.exitCode !== null || proc.signalCode !== null) return false;
+    proc.signalCode = signal;
+    proc.stdout.end();
+    proc.stderr.end();
+    queueMicrotask(() => proc.emit("exit", null, signal));
+    return true;
+  };
+  return proc;
+}
+
+function makeFakeManager({
+  onFrame,
+  onSpawn,
+  settingsOverrides = {},
+  startup = "ready",
+  optionsApi = false,
+} = {}) {
+  const processes = [];
+  const terminations = [];
+  const defaultFrameHandler = (frame, proc) => {
+    if (frame.type === "exec") {
+      setImmediate(() => proc.emitFrame({ type: "exec_done", id: frame.id, output: "ok", total_output_chars: 2 }));
+    } else if (frame.type === "inspect") {
+      setImmediate(() => proc.emitFrame({
+        type: "kernel_inspected",
+        id: frame.id,
+        digest: { cells: 1, imports: [], defs: [], classes: [], vars: [] },
+      }));
+    } else if (frame.type === "export_script") {
+      setImmediate(() => proc.emitFrame({
+        type: "script_exported",
+        id: frame.id,
+        path: frame.path,
+        cells: frame.cells.length,
+        wrapped_async: false,
+      }));
+    }
+  };
+  const spawnProcess = (code, cwd, env) => {
+    onSpawn?.({ code, cwd, env });
+    const proc = createFakeProcess(onFrame ?? defaultFrameHandler);
+    processes.push(proc);
+    setImmediate(() => {
+      if (startup === "ready") proc.emitFrame({ type: "session_ready" });
+      else if (startup === "exit") proc.crash(1);
+    });
+    return proc;
+  };
+  const sandboxManager = {
+    spawn: optionsApi
+      ? function spawn(options) {
+          return spawnProcess(options.code, options.cwd, options.env);
+        }
+      : function spawn(code, cwd) {
+          return spawnProcess(code, cwd, { ...process.env });
+        },
+    terminate(proc, signal) {
+      terminations.push(signal);
+      return proc.kill(signal);
+    },
+    getRuntimeWorkspaceRoot(cwd) {
+      return cwd;
+    },
+    async cleanup() {},
+  };
+  const toolRegistry = {
+    createCallableToolRuntime() {
+      return { tools: [], runTool: async () => ({ content: [] }) };
+    },
+  };
+  const settings = {
+    ...loadSettingsFromEnv(),
+    executionTimeoutMs: 5_000,
+    maxPythonSessions: 1,
+    ...settingsOverrides,
+  };
+  const manager = new PythonSessionManager(
+    sandboxManager,
+    toolRegistry,
+    settings,
+    path.resolve(__dirname, "..")
+  );
+  return { manager, processes, terminations };
+}
+
+async function nextTurn() {
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+// Unit-level protocol/manager regressions run without opting into a real subprocess.
+test("session manager: a crashed interpreter is evicted and no longer consumes capacity", async () => {
+  const { manager, processes } = makeFakeManager();
+  const first = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+  assert.equal(manager.list().length, 1);
+
+  processes[0].crash(7);
+  await nextTurn();
+  assert.equal(manager.get(first.id), false);
+  assert.equal(manager.list().length, 0);
+
+  const second = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+  assert.notEqual(second.id, first.id);
+  await manager.disposeAll();
+});
+
+test("session manager: configured session limit is parsed but no longer enforced", async () => {
+  const { manager } = makeFakeManager({ settingsOverrides: { maxPythonSessions: 1 } });
+  try {
+    await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    assert.equal(manager.list().length, 2);
+  } finally {
+    await manager.disposeAll();
+  }
+});
+
+test("readCellOutput reads durable notebook cells by execution number with offset/limit", async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-output-"));
+  const notebookPath = path.join(tempDir, "record.ipynb");
+  const fullOutput = "first\nsecond\nthird\nfourth";
+  fs.writeFileSync(notebookPath, JSON.stringify({
+    cells: [
+      { cell_type: "code", execution_count: 9, metadata: { ptc_full_output: "cell nine" }, outputs: [] },
+      { cell_type: "code", execution_count: 2, metadata: { ptc_full_output: fullOutput }, outputs: [] },
+    ],
+    metadata: {},
+    nbformat: 4,
+    nbformat_minor: 5,
+  }));
+  const { manager } = makeFakeManager();
+  try {
+    await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+    const slice = await manager.readCellOutput(2, { offset: 2, limit: 2 });
+    assert.equal(slice.cellIdx, 2);
+    assert.equal(slice.notebookPath, notebookPath);
+    assert.equal(slice.text, "second\nthird\n\n[1 more lines in cell output. Use offset=4 to continue.]");
+    await assert.rejects(manager.readCellOutput(1), /cell 1 is not present/);
+
+    const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+    notebook.cells[1].metadata.ptc_full_output = "z".repeat(60_000);
+    fs.writeFileSync(notebookPath, JSON.stringify(notebook));
+    const longLine = await manager.readCellOutput(2);
+    assert.match(longLine.text, /\.\.\. \[truncated\]$/);
+  } finally {
+    await manager.disposeAll();
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
+test("session manager: bare source names resolve from the configured library directory", async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-library-resolve-"));
+  const libraryDir = path.join(tempDir, "library");
+  const sourcePath = path.join(libraryDir, "tmux-orchestration.ipynb");
+  const notebookPath = path.join(tempDir, "working.ipynb");
+  fs.mkdirSync(libraryDir);
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Workflow\n"] }],
+    metadata: { library: true },
+    nbformat: 4,
+    nbformat_minor: 5,
+  }));
+  const previousLibraryDir = process.env.PTC_LIBRARY_DIR;
+  process.env.PTC_LIBRARY_DIR = libraryDir;
+  const { manager } = makeFakeManager();
+  try {
+    const result = await manager.provision({
+      cwd: tempDir,
+      ctx: fakeCtx(),
+      notebookPath,
+      source: "tmux-orchestration",
+    });
+    assert.equal(result.sourcedFrom, sourcePath);
+    assert.deepEqual(JSON.parse(fs.readFileSync(notebookPath, "utf8")), JSON.parse(fs.readFileSync(sourcePath, "utf8")));
+  } finally {
+    await manager.disposeAll();
+    if (previousLibraryDir === undefined) delete process.env.PTC_LIBRARY_DIR;
+    else process.env.PTC_LIBRARY_DIR = previousLibraryDir;
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
+test("promoteToSkillNotebook copies the complete notebook, sanitizes names, and refuses overwrite", async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-promote-"));
+  const libraryDir = path.join(tempDir, "library");
+  const notebookPath = path.join(tempDir, "session.ipynb");
+  const notebook = {
+    cells: [
+      { cell_type: "markdown", metadata: {}, source: ["# Why this works\n"] },
+      {
+        cell_type: "code",
+        execution_count: 1,
+        metadata: { ptc_full_output: "Out[1]: 42" },
+        outputs: [{ output_type: "execute_result", execution_count: 1, data: { "text/plain": ["42"] }, metadata: {} }],
+        source: ["6 * 7\n"],
+      },
+    ],
+    metadata: { custom: "preserved" },
+    nbformat: 4,
+    nbformat_minor: 5,
+  };
+  fs.writeFileSync(notebookPath, JSON.stringify(notebook, null, 2));
+  const { manager } = makeFakeManager({ settingsOverrides: { libraryDir } });
+  try {
+    await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+    const promoted = await manager.promoteToSkillNotebook({ name: "../My Fancy_SKILL.ipynb", cwd: tempDir });
+    assert.equal(promoted.name, "my-fancy-skill");
+    assert.equal(promoted.path, path.join(libraryDir, "my-fancy-skill.ipynb"));
+    assert.equal(fs.readFileSync(promoted.path, "utf8"), fs.readFileSync(notebookPath, "utf8"));
+    assert.deepEqual(JSON.parse(fs.readFileSync(promoted.path, "utf8")).cells, notebook.cells);
+
+    await assert.rejects(
+      manager.promoteToSkillNotebook({ name: "My Fancy Skill", cwd: tempDir }),
+      /already exists.*overwrite: true/
+    );
+    const overwritten = await manager.promoteToSkillNotebook({
+      name: "My Fancy Skill",
+      cwd: tempDir,
+      overwrite: true,
+    });
+    assert.equal(overwritten.overwritten, true);
+  } finally {
+    await manager.disposeAll();
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
+test("session manager: startup failure terminates an interpreter that never became ready", async () => {
+  const { manager, terminations } = makeFakeManager({ startup: "exit" });
+  await assert.rejects(
+    manager.provision({ cwd: process.cwd(), ctx: fakeCtx() }),
+    /exited|failed/i
+  );
+  assert.ok(terminations.includes("SIGTERM"));
+  assert.equal(manager.list().length, 0);
+});
+
+test("session protocol: a failed exec send does not wedge the next foreground exec", async () => {
+  let failNextExec = true;
+  const { manager } = makeFakeManager({
+    onFrame(frame, proc) {
+      if (frame.type !== "exec") return;
+      if (failNextExec) {
+        failNextExec = false;
+        throw new Error("synthetic stdin failure");
+      }
+      setImmediate(() => proc.emitFrame({ type: "exec_done", id: frame.id, output: "recovered", total_output_chars: 9 }));
+    },
+  });
+  const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+  await assert.rejects(manager.execForeground(id, "return 1", {}), /synthetic stdin failure/);
+  assert.equal(manager.list()[0].running, false);
+
+  const result = await manager.execForeground(id, "return 2", {});
+  assert.equal(result.output, "recovered");
+  assert.equal(manager.list()[0].running, false);
+  await manager.disposeAll();
+});
+
+test("session protocol: process exit rejects pending inspect and export calls", async () => {
+  {
+    const { manager, processes } = makeFakeManager({ onFrame() {} });
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const inspecting = manager.inspectKernel(id, { timeoutMs: 10_000 });
+    processes[0].crash(2);
+    await assert.rejects(inspecting, /exited before finishing|failed/i);
+  }
+
+  {
+    let holdExport = false;
+    const { manager, processes } = makeFakeManager({
+      onFrame(frame, proc) {
+        if (frame.type === "exec") {
+          setImmediate(() => proc.emitFrame({ type: "exec_done", id: frame.id, output: "ok", total_output_chars: 2 }));
+        } else if (frame.type === "export_script" && !holdExport) {
+          holdExport = true;
+        }
+      },
+    });
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    await manager.execForeground(id, "value = 1", {});
+    const exporting = manager.toScript(id, { cwd: process.cwd(), name: "held-export" });
+    await nextTurn();
+    processes[0].crash(3);
+    await assert.rejects(exporting, /exited before finishing|failed/i);
+  }
+});
+
+test("session manager: spawn receives profile in explicit env without leaking process.env", async () => {
+  const original = process.env.PI_SUBAGENTS_PROFILE;
+  process.env.PI_SUBAGENTS_PROFILE = "host-profile";
+  let spawnedEnv;
+  const { manager } = makeFakeManager({
+    optionsApi: true,
+    settingsOverrides: { subagentsProfile: "session-profile" },
+    onSpawn({ env }) {
+      spawnedEnv = env;
+    },
+  });
+  try {
+    await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    assert.equal(spawnedEnv.PI_SUBAGENTS_PROFILE, "session-profile");
+    assert.equal(process.env.PI_SUBAGENTS_PROFILE, "host-profile");
+  } finally {
+    await manager.disposeAll();
+    if (original === undefined) delete process.env.PI_SUBAGENTS_PROFILE;
+    else process.env.PI_SUBAGENTS_PROFILE = original;
+  }
+});
+
+test("session manager: background execution methods are removed", () => {
+  const { manager } = makeFakeManager();
+  assert.equal(manager.execBackground, undefined);
+  assert.equal(manager.waitForExec, undefined);
+  assert.equal(manager.pendingBackground, undefined);
+  assert.equal(manager.markBackgrounded, undefined);
+});
+
+test("session manager: script dedup stays cwd-relative and preserves extensions", async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-dedup-"));
+  const exportDir = path.join(tempDir, "exports");
+  fs.mkdirSync(exportDir);
+  fs.writeFileSync(path.join(exportDir, "report.txt"), "existing");
+  fs.writeFileSync(path.join(exportDir, "report-2.txt"), "existing");
+  fs.writeFileSync(path.join(exportDir, "script.py"), "existing");
+  fs.writeFileSync(path.join(exportDir, "script-2.py"), "existing");
+  const { manager } = makeFakeManager();
+  try {
+    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    await manager.execForeground(id, "value = 1", {});
+
+    const textResult = await manager.toScript(id, { cwd: tempDir, path: "exports/report.txt" });
+    assert.equal(textResult.path, path.join(exportDir, "report-3.txt"));
+    const pythonResult = await manager.toScript(id, { cwd: tempDir, path: "exports/script.py" });
+    assert.equal(pythonResult.path, path.join(exportDir, "script-3.py"));
+  } finally {
+    await manager.disposeAll();
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
+test("kernel: sourced notebook is copied, executes in order, preserves markdown, and continues after prefix cells", { skip: !RUN_REAL }, async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-source-nb-"));
+  const sourcePath = path.join(tempDir, "library.ipynb");
+  const notebookPath = path.join(tempDir, "working.ipynb");
+  const sourceNotebook = {
+    cells: [
+      { cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: ["seed = 20\n"] },
+      { cell_type: "markdown", metadata: { role: "guidance" }, source: ["## Double the seed\n", "Keep this explanation.\n"] },
+      { cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: ["doubled = seed * 2\n", "doubled\n"] },
+    ],
+    metadata: { custom: "library-metadata" },
+    nbformat: 4,
+    nbformat_minor: 5,
+  };
+  fs.writeFileSync(sourcePath, JSON.stringify(sourceNotebook, null, 2));
+  const original = fs.readFileSync(sourcePath, "utf8");
+  const manager = makeManager();
+  try {
+    const provisioned = await manager.provision({
+      cwd: tempDir,
+      ctx: fakeCtx(),
+      notebookPath,
+      source: sourcePath,
+    });
+    assert.equal(provisioned.sourcedFrom, sourcePath);
+    assert.equal(provisioned.sourceError, undefined);
+    assert.equal(fs.readFileSync(sourcePath, "utf8"), original, "the library source must never change");
+
+    const copied = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+    assert.equal(copied.cells.length, 3, "source cells are updated in place, not duplicated");
+    assert.equal(copied.cells[1].cell_type, "markdown");
+    assert.deepEqual(copied.cells[1].source, sourceNotebook.cells[1].source);
+    assert.equal(copied.metadata.custom, "library-metadata");
+    assert.equal(copied.cells[0].execution_count, 1);
+    assert.equal(copied.cells[2].execution_count, 3);
+    assert.match(copied.cells[2].metadata.ptc_full_output, /Out\[3\]: 40/);
+
+    const next = await manager.execForeground(provisioned.id, "doubled + 2", {});
+    assert.equal(next.details.cellIdx, 4);
+    assert.match(next.output, /Out\[4\]: 42/);
+    assert.equal(manager.list()[0].chunks, 4);
+  } finally {
+    await manager.disposeAll();
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
+test("kernel: .py source is one recorded virtual prefix cell", { skip: !RUN_REAL }, async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-source-py-"));
+  const sourcePath = path.join(tempDir, "library.py");
+  const notebookPath = path.join(tempDir, "working.ipynb");
+  fs.writeFileSync(sourcePath, "seed = 41\nseed\n");
+  const original = fs.readFileSync(sourcePath, "utf8");
+  const manager = makeManager();
+  try {
+    const provisioned = await manager.provision({
+      cwd: tempDir,
+      ctx: fakeCtx(),
+      notebookPath,
+      source: sourcePath,
+    });
+    assert.equal(provisioned.sourceError, undefined);
+    assert.equal(fs.readFileSync(sourcePath, "utf8"), original);
+    const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+    assert.equal(notebook.cells.length, 1);
+    assert.equal(notebook.cells[0].execution_count, 1);
+    assert.equal(notebook.cells[0].metadata.ptc_file, sourcePath);
+    assert.match(notebook.cells[0].metadata.ptc_full_output, /Out\[1\]: 41/);
+
+    const next = await manager.execForeground(provisioned.id, "seed + 1", {});
+    assert.equal(next.details.cellIdx, 2);
+    assert.match(next.output, /Out\[2\]: 42/);
+  } finally {
+    await manager.disposeAll();
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
+test("kernel: sourcing errors mark the failed prefix cell and leave the kernel usable", { skip: !RUN_REAL }, async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-source-error-"));
+  const sourcePath = path.join(tempDir, "broken.ipynb");
+  const notebookPath = path.join(tempDir, "working.ipynb");
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    cells: [
+      { cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: ["kept = 7\n"] },
+      { cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: ["raise ValueError('source boom')\n"] },
+      { cell_type: "markdown", metadata: {}, source: ["Still copied\n"] },
+    ],
+    metadata: {},
+    nbformat: 4,
+    nbformat_minor: 5,
+  }));
+  const manager = makeManager();
+  try {
+    const provisioned = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath, source: sourcePath });
+    assert.equal(provisioned.sourceError.cellIdx, 2);
+    assert.match(provisioned.sourceError.message, /source boom/);
+    const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+    assert.equal(notebook.cells[1].outputs[0].output_type, "error");
+    assert.equal(notebook.cells[2].cell_type, "markdown");
+
+    const next = await manager.execForeground(provisioned.id, "kept + 1", {});
+    assert.equal(next.details.cellIdx, 4);
+    assert.match(next.output, /Out\[4\]: 8/);
+  } finally {
+    await manager.disposeAll();
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
 test("kernel: trailing expression echoes, digest footer, magic guard, notebook", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	try {
@@ -461,12 +955,12 @@ test("kernel: trailing expression echoes, digest footer, magic guard, notebook",
 		// Auto-echo: trailing expression is displayed without print/return.
 		const echoed = await manager.execForeground(id, "21 * 2", {});
 		assert.match(echoed.output, /Out\[\d+\]: 42/);
-		assert.match(echoed.output, /\n\n\[kernel\] cell 1/);
+		assert.match(echoed.output, /\nkernel:\n  cell 1/);
 
 		// None results echo nothing; digest still present.
 		const silent = await manager.execForeground(id, "x = 5", {});
 		assert.doesNotMatch(silent.output, /Out\[/);
-		assert.match(silent.output, /\[kernel\] cell 2 · \+x/);
+		assert.match(silent.output, /kernel:\n  cell 2 · \+x/);
 
 		// Magic guard: rejected before execution, counter not advanced.
 		await assert.rejects(
@@ -477,12 +971,17 @@ test("kernel: trailing expression echoes, digest footer, magic guard, notebook",
 			},
 		);
 		const afterMagic = await manager.execForeground(id, "pass", {});
-		assert.match(afterMagic.output, /\[kernel\] cell 3\b/, "rejected cells must not advance the counter");
+		assert.match(afterMagic.output, /kernel:\n  cell 3\b/, "rejected cells must not advance the counter");
 
 		// ModuleNotFoundError carries the provision_dependency hint.
 		await assert.rejects(
 			manager.execForeground(id, "import definitely_not_a_real_module_xyz", {}),
-			(error: unknown) => /provision_dependency/.test(error instanceof Error ? error.message : String(error)),
+			(error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				return message.endsWith(
+					"help: install it with provision_dependency('definitely_not_a_real_module_xyz') then re-run"
+				) && (message.match(/^help:/gm) || []).length === 1;
+			},
 		);
 	} finally {
 		await manager.disposeAll();
@@ -516,10 +1015,70 @@ test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async ()
 		assert.ok(kinds.includes("stream"), "stdout captured");
 		assert.ok(kinds.includes("execute_result"), "echo captured as execute_result");
 		assert.match(ok.outputs.find((o: { output_type: string }) => o.output_type === "stream").text.join(""), /hello from cell/);
+		assert.match(ok.metadata.ptc_full_output, /hello from cell/);
+		assert.match(ok.metadata.ptc_full_output, /Out\[1\]: 2/);
+		assert.doesNotMatch(ok.metadata.ptc_full_output, /\[kernel\]/, "kernel footer is host-owned, not part of the durable record");
 		assert.equal(failed.outputs[0].output_type, "error");
 		assert.equal(failed.outputs[0].ename, "ValueError");
 	} finally {
 		await manager.disposeAll();
+	}
+});
+
+test("kernel: output above the retired 100k cap remains complete in host result and notebook", { skip: !RUN_REAL }, async () => {
+	const { execFileSync } = require("node:child_process");
+	const manager = makeManager();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-nb-full-output-"));
+	const notebookPath = path.join(tempDir, "full.ipynb");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const result = await manager.execForeground(id, "print('x' * 150000, end='')", { notebookPath });
+		assert.ok(result.output.length > 150_000, "host result must retain output beyond the old 100k cap");
+		const sections = parseSectionedOutput(result.output);
+		assert.ok(sections, "sectioned result");
+		assert.equal(sections.find((s: { name: string }) => s.name === "output")?.body, "x".repeat(150_000));
+		assert.doesNotMatch(result.output, /Output truncated/);
+
+		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+		assert.equal(notebook.cells[0].metadata.ptc_full_output, "x".repeat(150_000), "durable record stores the raw cell content, not the sectioned view");
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: rebinding an existing notebook preserves cells and continues numbering", { skip: !RUN_REAL }, async () => {
+	const { execFileSync } = require("node:child_process");
+	const manager = makeManager();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-nb-resume-"));
+	const notebookPath = path.join(tempDir, "resume.ipynb");
+	fs.writeFileSync(notebookPath, JSON.stringify({
+		cells: [{
+			cell_type: "code",
+			execution_count: 4,
+			metadata: { ptc_full_output: "old durable output" },
+			outputs: [],
+			source: ["old = 1\n"],
+		}],
+		metadata: {},
+		nbformat: 4,
+		nbformat_minor: 5,
+	}));
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const result = await manager.execForeground(id, "'new output'", { notebookPath });
+		assert.equal(result.details.cellIdx, 5);
+		assert.match(result.output, /Out\[5\]: new output/);
+
+		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+		assert.equal(notebook.cells.length, 2);
+		assert.equal(notebook.cells[0].metadata.ptc_full_output, "old durable output");
+		assert.equal(notebook.cells[1].execution_count, 5);
+		const durable = await manager.readCellOutput(5);
+		assert.match(durable.text, /Out\[5\]: new output/);
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
 	}
 });
 
@@ -539,7 +1098,7 @@ test("kernel: file mode executes a file inside the kernel with real-path traceba
 		);
 		// definitions from the file persist in the kernel namespace
 		const after = await manager.execForeground(id, "return value", {});
-		assert.match(after.output, /^from-file/);
+		assert.match(after.output, /^return \(Out\[\d+\]\):\n  from-file/);
 	} finally {
 		await manager.disposeAll();
 	}

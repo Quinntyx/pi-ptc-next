@@ -13,9 +13,13 @@ import type {
   ExecutionDetails as InternalExecutionDetails,
   ExecutionOptions as InternalExecutionOptions,
   NormalizedToolResult as InternalNormalizedToolResult,
+  PythonSessionManagerHooks as InternalPythonSessionManagerHooks,
   RpcErrorPayload as InternalRpcErrorPayload,
   RpcMessage as InternalRpcMessage,
   SandboxManager as InternalSandboxManager,
+  ScriptExportResult as InternalScriptExportResult,
+  SessionExecOptions as InternalSessionExecOptions,
+  SessionSummary as InternalSessionSummary,
 } from "./contracts/execution-types";
 import type { PtcSettings as InternalPtcSettings } from "./contracts/settings";
 
@@ -32,8 +36,12 @@ export type CodeExecutionResult = InternalCodeExecutionResult;
 export type ExecutionDetails = InternalExecutionDetails;
 export type ExecutionOptions = InternalExecutionOptions;
 export type NormalizedToolResult = InternalNormalizedToolResult;
+export type PythonSessionManagerHooks = InternalPythonSessionManagerHooks;
 export type RpcErrorPayload = InternalRpcErrorPayload;
 export type RpcMessage = InternalRpcMessage;
 export type SandboxManager = InternalSandboxManager;
+export type ScriptExportResult = InternalScriptExportResult;
+export type SessionExecOptions = InternalSessionExecOptions;
+export type SessionSummary = InternalSessionSummary;
 
 export type PtcSettings = InternalPtcSettings;

@@ -41,6 +41,7 @@ test("builtin contracts preserve read-only classification and return types", () 
   });
   assert.deepEqual(classifyBuiltinTool("bash"), { isReadOnly: false });
   assert.deepEqual(classifyBuiltinTool("bash", { readOnly: true }), { isReadOnly: true });
+  assert.equal(getPythonReturnType(createTool({ name: "grep" })), "GrepResult");
   assert.equal(getPythonReturnType(createTool({ name: "custom" })), "Any");
 });
 

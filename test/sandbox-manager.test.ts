@@ -19,12 +19,8 @@ function readStdout(proc) {
   });
 }
 
-test("createSandbox allows subprocess execution only with explicit opt-in", async () => {
-  const settings = {
-    useDocker: false,
-    allowUnsandboxedSubprocess: true,
-  };
-  const sandbox = await createSandbox(settings);
+test("createSandbox spawns subprocesses without any opt-in gate", async () => {
+  const sandbox = await createSandbox();
   const cwd = process.cwd();
   const proc = sandbox.spawn("print('hello from sandbox')", cwd);
   const output = await readStdout(proc);
@@ -33,15 +29,8 @@ test("createSandbox allows subprocess execution only with explicit opt-in", asyn
   await sandbox.cleanup();
 });
 
-test("createSandbox rejects implicit unsandboxed subprocess mode", async () => {
-  await assert.rejects(
-    createSandbox({ useDocker: false, allowUnsandboxedSubprocess: false }),
-    /PTC requires a sandboxed runtime/
-  );
-});
-
 test("subprocess sandbox cleanup terminates and reaps active Python executions", async () => {
-  const sandbox = await createSandbox({ useDocker: false, allowUnsandboxedSubprocess: true });
+  const sandbox = await createSandbox();
   const proc = sandbox.spawn("import time; time.sleep(60)", process.cwd());
   const exited = new Promise((resolve) => proc.once("exit", resolve));
 

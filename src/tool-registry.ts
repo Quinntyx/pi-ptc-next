@@ -12,10 +12,15 @@ import type { TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { classifyBuiltinTool, validatePythonHelperNames } from "./tools/python-tool-contract";
 import type { PtcSettings } from "./contracts/settings";
-import type { CallerMetadata, ExecuteToolContext, PtcToolDefinition, PtcToolOptions, ToolInfo } from "./contracts/tool-types";
+import type { CallerMetadata, ExecuteToolContext, PtcCaller, PtcToolDefinition, PtcToolOptions, ToolInfo } from "./contracts/tool-types";
+import { getExplicitCallers, PTC_TOOL_NAMES as BASE_PTC_TOOL_NAMES } from "./contracts/tool-types";
 import { logWarning } from "./utils";
 
-const PTC_OWNED_TOOLS = new Set(["provision_python_session", "python_exec", "python_session_to_script"]);
+// Kept here as the effective registry denylist so host-only PTC tools cannot be
+// exposed recursively inside exec_cell, even before the public contracts grow.
+export const PTC_TOOL_NAMES = [...BASE_PTC_TOOL_NAMES, "read_cell_output"] as const;
+
+const PTC_OWNED_TOOLS: ReadonlySet<string> = new Set(PTC_TOOL_NAMES);
 
 function isPtcOwnedTool(name: string): boolean {
   return PTC_OWNED_TOOLS.has(name);
@@ -25,13 +30,15 @@ function classifyTool(name: string, ptc?: PtcToolOptions): { isReadOnly: boolean
   return classifyBuiltinTool(name, ptc);
 }
 
-function getConfiguredCallers(tool: ToolInfo): Set<"direct" | "code_execution"> {
-  const configured = tool.ptc?.callers;
-  if (configured && configured.length > 0) {
-    return new Set(configured);
+function getConfiguredCallers(tool: ToolInfo): Set<PtcCaller> {
+  // An explicit `ptc.callers` array is authoritative — including an empty array,
+  // which means no callers at all (see getExplicitCallers in contracts/tool-types).
+  const resolved = getExplicitCallers(tool.ptc);
+  if (resolved.explicit) {
+    return new Set(resolved.callers);
   }
 
-  if (tool.name === "code_execution" || isPtcOwnedTool(tool.name)) {
+  if (isPtcOwnedTool(tool.name)) {
     return new Set(["direct"]);
   }
 
@@ -105,8 +112,14 @@ export class ToolRegistry {
   }
 
   removeTool(name: string): boolean {
-    this.extensionOwnedToolNames.add(name);
-    return this.customTools.delete(name);
+    // Only claim the name as extension-owned when a custom tool was actually
+    // removed; otherwise a no-op removeTool("bash") would permanently hide the
+    // builtin from buildToolMap (review item L5).
+    const removed = this.customTools.delete(name);
+    if (removed) {
+      this.extensionOwnedToolNames.add(name);
+    }
+    return removed;
   }
 
   private createBuiltinTools(cwd: string): Map<string, ToolInfo> {
@@ -146,7 +159,7 @@ export class ToolRegistry {
       builtins.set("glob", {
         ...findTool,
         name: "glob",
-        description: "Find files by glob pattern. Alias of find(). Returns a list of matching relative paths in python_exec.",
+        description: "Find files by glob pattern. Alias of find(). Returns a list of matching relative paths in exec_cell.",
         source: "alias",
         isReadOnly: true,
       });
@@ -174,11 +187,13 @@ export class ToolRegistry {
 
       const existing = allTools.get(piTool.name);
       if (existing) {
-        allTools.set(piTool.name, {
-          ...existing,
-          description: piTool.description,
-          parameters: piTool.parameters,
-        });
+        // Prefer the clean custom-tool schema/params: pi's copy is wrapped by the
+        // activity-label integration and gains an `activity` parameter the tool
+        // author never declared (review item L4). pi's ToolInfo carries no
+        // additional label information, so only fill in a missing description.
+        if (!existing.description && piTool.description) {
+          allTools.set(piTool.name, { ...existing, description: piTool.description });
+        }
         continue;
       }
 
@@ -209,7 +224,7 @@ export class ToolRegistry {
     const trustedReadOnlyTools = new Set(settings.trustedReadOnlyTools || []);
 
     const callableTools = allTools.filter((tool) => {
-      if (tool.name === "code_execution" || isPtcOwnedTool(tool.name)) {
+      if (isPtcOwnedTool(tool.name)) {
         return false;
       }
       if (blockedSet.has(tool.name)) {
@@ -248,7 +263,7 @@ export class ToolRegistry {
   getAutoRoutableToolNames(cwd: string, settings: PtcSettings): string[] {
     const callableNames = new Set(this.getCallableTools(cwd, settings).map((tool) => tool.name));
     return this.getAllTools(cwd)
-      .filter((tool) => tool.name !== "code_execution" && !isPtcOwnedTool(tool.name))
+      .filter((tool) => !isPtcOwnedTool(tool.name))
       .filter((tool) => toolAllowsDirectCaller(tool))
       .filter((tool) => callableNames.has(tool.name))
       .map((tool) => tool.name);

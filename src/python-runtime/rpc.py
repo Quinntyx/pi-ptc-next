@@ -1,9 +1,28 @@
 import asyncio
 import json
 import sys
+import threading
 from typing import Any, Dict, Optional
 
 _ptc_rpc_asyncio = asyncio
+
+# Startup guard: the runtime relies on PEP 604 unions in *evaluated* annotations
+# (``int | None`` at def-time raises TypeError on <=3.9) and on
+# ``ast.FunctionDef.type_params`` (Python 3.12+). Fail fast with a clear message
+# instead of an opaque TypeError deep in the prelude — SubprocessSandbox can
+# fall back to a bare `python3` that is older than the tool's configured one.
+if sys.version_info < (3, 10):
+    raise RuntimeError(
+        f"PTC Python runtime requires Python 3.10+ (found {sys.version.split()[0]}). "
+        "The runtime uses PEP 604 unions in evaluated annotations and AST "
+        "type_params; older interpreters fail at definition time. Point "
+        "PTC_PYTHON / the sandbox at a Python >= 3.10 interpreter."
+    )
+
+# L9 trip-wire: a single malformed stdin line is skipped and logged, but a
+# stream that produces this many consecutive bad frames is genuinely broken
+# (e.g. a binary blob piped into the protocol) and must not be spun on forever.
+_MAX_CONSECUTIVE_MALFORMED_FRAMES = 100
 
 
 class ToolCallError(Exception):
@@ -19,10 +38,46 @@ class RpcProtocolError(Exception):
     pass
 
 
+async def _connect_stdin_reader(reader: asyncio.StreamReader, stdin: Any = None) -> None:
+    """Attach `reader` to stdin, tolerating event loops without pipe support.
+
+    `loop.connect_read_pipe(sys.stdin)` raises NotImplementedError on Windows
+    ProactorEventLoop (the default since 3.8). Fall back to a daemon thread that
+    blocks on `stdin.buffer.readline()` and feeds the same StreamReader via
+    `call_soon_threadsafe`, so the protocol loop above is identical everywhere.
+    """
+    if stdin is None:
+        stdin = sys.stdin
+    loop = asyncio.get_running_loop()
+    try:
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await loop.connect_read_pipe(lambda: protocol, stdin)
+        return
+    except NotImplementedError:
+        pass  # Windows ProactorEventLoop: use the threaded reader below
+
+    def _pump() -> None:
+        try:
+            while True:
+                line = stdin.buffer.readline() if hasattr(stdin, "buffer") else stdin.readline()
+                loop.call_soon_threadsafe(reader.feed_data, line)
+                if not line:
+                    break  # EOF
+        except Exception as error:  # broken/closed stdin
+            loop.call_soon_threadsafe(reader.feed_error, error)
+        finally:
+            loop.call_soon_threadsafe(reader.feed_eof)
+
+    threading.Thread(target=_pump, name="ptc-stdin-reader", daemon=True).start()
+
+
 class RpcClient:
 
-    def __init__(self):
+    def __init__(self, default_call_timeout: float = 300.0):
         self.call_id = 0
+        # Per-call timeout for tool calls (seconds). Host alignment is handled
+        # elsewhere; 300s remains the default so behavior is unchanged.
+        self.default_call_timeout = default_call_timeout
         self.pending_calls: Dict[str, asyncio.Future[Any]] = {}
         self.reader_task: Optional[asyncio.Task[Any]] = None
         # Persistent-session mode: the host sends {"type":"exec",...} frames on
@@ -45,11 +100,10 @@ class RpcClient:
         self.pending_calls.clear()
 
     async def _stdin_reader(self) -> None:
+        malformed_streak = 0
         try:
-            loop = asyncio.get_event_loop()
             reader = asyncio.StreamReader()
-            protocol = asyncio.StreamReaderProtocol(reader)
-            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+            await _connect_stdin_reader(reader)
 
             while True:
                 line = await reader.readline()
@@ -59,11 +113,43 @@ class RpcClient:
 
                 try:
                     response = json.loads(line.decode().strip())
+                    malformed_streak = 0
                     self._handle_response(response)
                 except json.JSONDecodeError as error:
-                    raise RpcProtocolError(f"JSON decode error: {error}") from error
+                    # L9: one malformed frame must not kill the whole persistent
+                    # session. Skip the line, log it, and only disconnect when
+                    # the stream is consistently garbage (trip-wire above).
+                    malformed_streak += 1
+                    print(
+                        f"skipping malformed RPC frame ({malformed_streak} consecutive): "
+                        f"JSON decode error: {error}",
+                        file=sys.stderr,
+                    )
+                    if malformed_streak >= _MAX_CONSECUTIVE_MALFORMED_FRAMES:
+                        self._fail_pending_calls(
+                            RpcProtocolError(
+                                f"RPC stream produced {malformed_streak} consecutive malformed frames; giving up"
+                            )
+                        )
+                        print("stdin reader: too many consecutive malformed frames; disconnecting", file=sys.stderr)
+                        break
                 except Exception as error:
-                    raise RpcProtocolError(f"Error handling response: {error}") from error
+                    # A bad frame must not tear down the session either; but a
+                    # handler that throws repeatedly is the same broken-stream
+                    # case, so it feeds the same trip-wire.
+                    malformed_streak += 1
+                    print(
+                        f"skipping undecodable RPC frame ({malformed_streak} consecutive): {error}",
+                        file=sys.stderr,
+                    )
+                    if malformed_streak >= _MAX_CONSECUTIVE_MALFORMED_FRAMES:
+                        self._fail_pending_calls(
+                            RpcProtocolError(
+                                f"RPC stream produced {malformed_streak} consecutive undecodable frames; giving up"
+                            )
+                        )
+                        print("stdin reader: too many consecutive malformed frames; disconnecting", file=sys.stderr)
+                        break
         except asyncio.CancelledError:
             pass
         except Exception as error:
@@ -91,7 +177,7 @@ class RpcClient:
                     future.set_result(response.get("value"))
             del self.pending_calls[call_id]
 
-    async def call(self, tool: str, params: Dict[str, Any]) -> Any:
+    async def call(self, tool: str, params: Dict[str, Any], timeout: float | None = None) -> Any:
         self.call_id += 1
         call_id = f"call_{self.call_id}"
         request = {
@@ -112,7 +198,8 @@ class RpcClient:
                 print(json.dumps(request), flush=True)
 
             try:
-                return await asyncio.wait_for(future, timeout=300.0)
+                effective_timeout = self.default_call_timeout if timeout is None else timeout
+                return await asyncio.wait_for(future, timeout=effective_timeout)
             except asyncio.TimeoutError as error:
                 raise Exception(f"Tool call '{tool}' timed out") from error
         finally:
@@ -132,5 +219,5 @@ class RpcClient:
 _rpc = RpcClient()
 
 
-async def _rpc_call(tool: str, params: Dict[str, Any]) -> Any:
-    return await _rpc.call(tool, params)
+async def _rpc_call(tool: str, params: Dict[str, Any], timeout: float | None = None) -> Any:
+    return await _rpc.call(tool, params, timeout=timeout)

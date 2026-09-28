@@ -1,21 +1,27 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { CodeExecutor } = require("../dist/code-executor.js");
+const path = require("node:path");
+const { PythonSessionManager } = require("../dist/python-session-manager.js");
 const { createSandbox } = require("../dist/sandbox-manager.js");
+const { loadSettingsFromEnv, parseSectionedOutput } = require("../dist/utils.js");
+
+function parseSection(text, name) {
+  const sections = parseSectionedOutput(text);
+  assert.ok(sections, `expected sectioned output, got: ${text.slice(0, 200)}`);
+  const found = sections.find((s) => s.name === name);
+  assert.ok(found, `expected a '${name}' section in: ${text.slice(0, 200)}`);
+  return found.body;
+}
 
 function settings(overrides = {}) {
   return {
+    ...loadSettingsFromEnv(),
     executionTimeoutMs: 10_000,
-    maxOutputChars: 10_000,
-    allowMutations: false,
-    allowBash: false,
+    outputPreviewChars: 12_000,
+    maxSpoolChars: 10_000_000,
     maxParallelToolCalls: 4,
-    useDocker: false,
-    allowUnsandboxedSubprocess: true,
-    debugLogging: false,
+    maxPythonSessions: 4,
     autoRoute: false,
-    callableTools: undefined,
-    blockedTools: undefined,
     ...overrides,
   };
 }
@@ -23,13 +29,14 @@ function settings(overrides = {}) {
 function toolRegistry() {
   return {
     createCallableToolRuntime() {
-      return { tools: [], runTool: async () => null };
+      return { tools: [], runTool: async () => ({ content: [] }) };
     },
   };
 }
 
-test("tight loops rate-limit progress frames and return only after Python is reaped", async () => {
-  const realSandbox = await createSandbox(settings());
+async function makeManager(overrides = {}) {
+  const config = settings(overrides);
+  const realSandbox = await createSandbox();
   let proc;
   const sandbox = {
     spawn(code, cwd) {
@@ -39,6 +46,9 @@ test("tight loops rate-limit progress frames and return only after Python is rea
     terminate(child, signal) {
       return realSandbox.terminate(child, signal);
     },
+    resolvePythonExecutable() {
+      return realSandbox.resolvePythonExecutable();
+    },
     getRuntimeWorkspaceRoot(cwd) {
       return realSandbox.getRuntimeWorkspaceRoot(cwd);
     },
@@ -46,87 +56,85 @@ test("tight loops rate-limit progress frames and return only after Python is rea
       await realSandbox.cleanup();
     },
   };
-  const executor = new CodeExecutor(sandbox, toolRegistry(), settings(), process.cwd());
+  const manager = new PythonSessionManager(
+    sandbox,
+    toolRegistry(),
+    config,
+    path.resolve(__dirname, ".."),
+  );
+  return { manager, sandbox, process: () => proc };
+}
+
+function fakeCtx() {
+  return { cwd: process.cwd(), hasUI: false };
+}
+
+async function dispose(manager, sandbox) {
+  await manager.disposeAll();
+  await sandbox.cleanup();
+}
+
+test("tight loops rate-limit progress frames and the kernel is reaped on disposal", async () => {
+  const { manager, sandbox, process: spawnedProcess } = await makeManager();
   let progressUpdates = 0;
 
   try {
-    const result = await executor.execute(
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const proc = spawnedProcess();
+    const result = await manager.execForeground(
+      id,
       "total = 0\nfor i in range(200000):\n    total += i\nreturn total",
       {
         cwd: process.cwd(),
-        ctx: { cwd: process.cwd() },
         onUpdate: () => { progressUpdates += 1; },
-      }
+      },
     );
 
-    assert.equal(result.output, "19999900000");
+    assert.equal(parseSection(result.output, "return"), "19999900000");
     assert.ok(progressUpdates < 100, `expected throttled progress, received ${progressUpdates} updates`);
-    assert.equal(proc.exitCode, 0);
-    assert.equal(proc.signalCode, null);
+    assert.equal(proc.exitCode, null, "persistent kernel should remain alive after a cell");
+
+    await dispose(manager, sandbox);
+    assert.ok(proc.exitCode !== null || proc.signalCode !== null, "kernel process should be reaped");
   } finally {
-    await sandbox.cleanup();
+    await dispose(manager, sandbox);
   }
 });
 
-test("a timed-out real Python loop is terminated and reaped before rejection returns", async () => {
-  const realSandbox = await createSandbox(settings());
-  let proc;
-  const sandbox = {
-    spawn(code, cwd) {
-      proc = realSandbox.spawn(code, cwd);
-      return proc;
-    },
-    terminate(child, signal) {
-      return realSandbox.terminate(child, signal);
-    },
-    getRuntimeWorkspaceRoot(cwd) {
-      return realSandbox.getRuntimeWorkspaceRoot(cwd);
-    },
-    async cleanup() {
-      await realSandbox.cleanup();
-    },
-  };
-  const executor = new CodeExecutor(
-    sandbox,
-    toolRegistry(),
-    settings({ executionTimeoutMs: 100 }),
-    process.cwd()
-  );
+test("an idle timeout interrupts the cell without killing the persistent kernel", async () => {
+  const { manager, sandbox, process: spawnedProcess } = await makeManager({ executionTimeoutMs: 200 });
 
   try {
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const proc = spawnedProcess();
     await assert.rejects(
-      executor.execute("while True:\n    pass", {
-        cwd: process.cwd(),
-        ctx: { cwd: process.cwd() },
-      }),
-      /timed out/
+      manager.execForeground(id, "import time\ntime.sleep(30)", { cwd: process.cwd() }),
+      /idle for|timed out|interrupted/i,
     );
 
-    assert.notEqual(proc.signalCode, null);
     assert.equal(proc.exitCode, null);
+    assert.equal(proc.signalCode, null);
+    const recovered = await manager.execForeground(id, "return 'still alive'", { cwd: process.cwd() });
+    assert.match(recovered.output, /^return \(Out\[2\]\):\n  still alive/);
   } finally {
-    await sandbox.cleanup();
+    await dispose(manager, sandbox);
   }
 });
 
-test("Python caps printed output before it can flood the RPC pipe", async () => {
-  const sandbox = await createSandbox(settings());
-  const executor = new CodeExecutor(
-    sandbox,
-    toolRegistry(),
-    settings({ maxOutputChars: 1_000 }),
-    process.cwd()
-  );
+test("Python's emergency spool valve caps output once before it reaches the host", async () => {
+  const { manager, sandbox } = await makeManager({ maxSpoolChars: 1_000 });
 
   try {
-    const result = await executor.execute(
+    const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+    const result = await manager.execForeground(
+      id,
       "print('x' * 500000, end='')",
-      { cwd: process.cwd(), ctx: { cwd: process.cwd() } }
+      { cwd: process.cwd() },
     );
 
-    assert.equal(result.output.slice(0, 1_000), "x".repeat(1_000));
-    assert.match(result.output, /showing first 1000 characters of 500000/);
+    assert.equal(parseSection(result.output, "output"), "x".repeat(1_000));
+    assert.doesNotMatch(result.output, /Output truncated/);
   } finally {
-    await sandbox.cleanup();
+    await dispose(manager, sandbox);
   }
 });

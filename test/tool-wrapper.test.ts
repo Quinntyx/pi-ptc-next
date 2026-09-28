@@ -56,6 +56,8 @@ test("generateToolWrappers emits concise wrappers with typed result models", () 
   assert.match(code, /from typing import Optional, List, Dict, Any, TypedDict, Union/);
   assert.match(code, /class BashResult\(TypedDict\):/);
   assert.match(code, /class GrepMatch\(TypedDict\):/);
+  assert.match(code, /class GrepResult\(TypedDict\):/);
+  assert.match(code, /matchLimitReached: Optional\[int\]/);
   assert.match(code, /async def read\(/);
   assert.match(code, /path: str/);
   assert.doesNotMatch(code, /file_path/);

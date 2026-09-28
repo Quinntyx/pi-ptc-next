@@ -23,7 +23,7 @@ const BUILTIN_TOOL_CONTRACTS: Record<string, BuiltinToolContract> = {
   },
   grep: {
     isReadOnly: true,
-    pythonReturnType: "List[GrepMatch]",
+    pythonReturnType: "GrepResult",
   },
   ls: {
     isReadOnly: true,
@@ -56,6 +56,9 @@ const RESERVED_PYTHON_HELPER_NAMES = new Set([
   "edit",
   "write",
 ]);
+
+/** Names of the known builtin tools (used to reject custom-tool name collisions). */
+export const BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set(Object.keys(BUILTIN_TOOL_CONTRACTS));
 
 export interface PythonParamMetadata {
   name: string;

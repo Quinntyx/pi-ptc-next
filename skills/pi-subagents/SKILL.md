@@ -29,8 +29,9 @@ metadata:
   completion order, and terminate (cyclic workflows gated by a round limit).
 - Aggregated findings returned to the caller; the kernel's notebook file on
   disk records every executed cell with its outputs.
-- Every spawned pi window destroyed via `pool.close()` (or `finish()`) before
-  the cell ends, unless results are deliberately kept for follow-ups. End
+- Every spawned pi window destroyed via `pool.close()` (or `finish()`), or by
+  a `with` statement exiting cleanly, before the cell ends — unless results
+  are deliberately kept for follow-ups. End
   workflows with `pool.close()` as the cell's last line — its echoed
   PoolSummary is the workflow report.
 - No orphaned tmux windows, no unclosed pools, no silently ignored failures
@@ -75,7 +76,7 @@ the next cell resumes with `pool.pop()`.
   file, and never combine `file=` with `confirm=true` — the user would be
   approving content they cannot see.
 - Long-running orchestrated workflows are the canonical `confirm=true` case:
-  put the entire declared workflow — all phases, prompts, pools, concurrency,
+  put the entire declared workflow — all stages, prompts, pools, concurrency,
   and termination conditions — into one cell, get a single up-front approval,
   then let it run autonomously to completion. Do not split a workflow into
   multiple confirmed cells and do not prompt mid-run: the user should be able
@@ -86,6 +87,65 @@ the next cell resumes with `pool.pop()`.
 - This section is the customization point for orchestration approval
   behavior: edit this skill to change how workflows request approval instead
   of modifying ptc tool descriptions.
+
+# Convenience: the `with` statement
+
+For simple workflows (roughly ≤2 linear stages, no cyclic requeuing), a `with`
+statement is the cleanest lifecycle:
+
+```python
+with subagents.AgentPool(concurrency=4, name="fanout") as pool:
+    stage = pool.stage("work", slots=4)
+    stage.submit_all(tasks)
+    while (result := await pool.pop(timeout=600)) is not None:
+        handle(result)
+# clean exit here ran pool.close() for you — report available as pool.last_summary
+```
+
+Semantics:
+- **Clean exit** → the pool closes automatically (windows destroyed, report in
+  `pool.last_summary`).
+- **Exception inside the block** → the pool is deliberately left fully alive
+  (windows, queued results, scheduler intact) so you can inspect state or
+  continue the run from a follow-up cell; the exception propagates normally.
+  Close explicitly once you're actually done.
+
+Prefer explicit `await`-style `pool.close()` for complex orchestration —
+multi-stage fan-outs, review/fix cycles, anything where you keep settled
+sessions for follow-ups — because leaving the tmux windows in place is
+valuable for inspecting and auditing a run. Simple test fixtures and one-shot
+fan-outs should use `with` (it is also why the pi-subagents test suite
+converts to `with`: a clean block exit can never leak a window).
+
+# Feeding results forward: never paste raw JSON into the next prompt
+
+When a subagent returns a schema-obeying JSON object, the orchestrating code owns
+the translation layer. Extract the fields you need in Python, then compose the
+next agent's prompt in **common language** — complete sentences a user could read
+in the subagent's tmux window and understand. Never f-string a raw JSON blob
+(`result.body`), a whole schema response, or machine-formatted dumps into a
+follow-up prompt.
+
+Why:
+- Subagent prompts are user-observable (live tmux windows) — raw JSON is unreadable.
+- JSON braces, escaping, and keys waste tokens and confuse the next agent.
+- The orchestrator is the only place with enough context to summarize, dedupe,
+  and route; do that job in code, not in the next agent's head.
+
+```python
+# BAD: leaks machine output into a user-visible prompt
+review.submit(subagents.Task(f"Review:\n{result.body}"), parent=result)
+
+# GOOD: parse in Python, restate in prose
+verdict = result.unwrap()                    # schema-obeying dict
+problems = "\n".join(f"- {p['file']}: {p['issue']}" for p in verdict["issues"])
+review.submit(subagents.Task(
+    f"The build agent finished and reported these problems:\n{problems}\n"
+    f"Fix each one in the working tree."), parent=result)
+```
+
+Keep the full structured object in Python (notebook variables) for routing and
+aggregation; only compact, human-readable text crosses the prompt boundary.
 
 # API
 

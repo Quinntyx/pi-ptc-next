@@ -2,6 +2,7 @@ import readline from "readline";
 import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import { homedir } from "os";
 import type { ChildProcess } from "child_process";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -11,53 +12,54 @@ import {
   PtcTimeoutError,
 } from "./execution/execution-errors";
 import { normalizeToolResult } from "./tool-adapters";
+import { sectionize } from "./utils";
 import { buildSessionPrelude } from "./execution/session-prelude";
 import { loadPythonRuntimeSources } from "./execution/runtime-assets";
 import type {
   CodeExecutionResult,
   KernelDigest,
   ExecutionDetails,
+  PythonSessionManagerHooks,
   SandboxManager,
   ScriptExportResult,
+  SessionExecOptions,
+  SessionSummary,
   SubagentRuntimeSnapshot,
 } from "./contracts/execution-types";
 import type { PtcSettings } from "./contracts/settings";
 import type { ToolUpdateCallback } from "./contracts/tool-types";
 import type { ToolRegistry } from "./tool-registry";
 import { generateToolWrappers } from "./tools/tool-wrapper";
-import { debugLog, estimateTokensFromChars, validateUserCode } from "./utils";
+import {
+  appendPythonErrorHelp,
+  debugLog,
+  estimateTokensFromChars,
+  sliceCellOutput,
+  validateUserCode,
+} from "./utils";
 
-export type { ScriptExportResult } from "./contracts/execution-types";
-
-export interface SessionExecOptions {
-  cwd: string;
-  ctx?: ExtensionContext;
-  signal?: AbortSignal;
-  onUpdate?: ToolUpdateCallback;
-  parentToolCallId?: string;
-  /** Live notebook artifact the executed cell is appended to. */
-  notebookPath?: string;
-  /** File mode: execute this file's contents inside the kernel (%run semantics). */
-  file?: string;
-}
-
-export interface SessionSummary {
-  id: string;
-  createdAt: number;
-  lastUsedAt: number;
-  chunks: number;
-  hasPendingBackground: boolean;
-  running: boolean;
-  notebookPath: string | undefined;
-}
-
-export interface BackgroundCompletion {
-  sessionId: string;
-  execId: string;
-  result: CodeExecutionResult;
-}
+export type {
+  PythonSessionManagerHooks,
+  ScriptExportResult,
+  SessionExecOptions,
+  SessionSummary,
+} from "./contracts/execution-types";
 
 export class PythonSessionError extends Error {}
+
+export interface SourceExecutionError {
+  cellIdx: number;
+  message: string;
+  traceback?: string;
+}
+
+export interface SkillNotebookPromotionResult {
+  name: string;
+  path: string;
+  notebookPath: string;
+  overwritten: boolean;
+}
+
 export class UnknownSessionError extends PythonSessionError {
   constructor(public requestedId: string, availableIds: string[]) {
     super(
@@ -75,7 +77,6 @@ type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Prom
 // ---------------------------------------------------------------------------
 
 interface PersistentProtocolOptions {
-  maxOutputChars: number;
   terminateProcess: (signal: NodeJS.Signals) => boolean;
   /** Send a signal to the interpreter (SIGINT mirrors Ctrl-C). */
   sendSignal: (signal: NodeJS.Signals) => void;
@@ -96,7 +97,6 @@ type InterruptKind = "abort" | "timeout";
 
 class PersistentSessionProtocol {
   private stdout = "";
-  private stdoutCharsSeen = 0;
   private stderr = "";
   private stderrCharsSeen = 0;
   private currentLine?: number;
@@ -107,6 +107,8 @@ class PersistentSessionProtocol {
   private execStartedAt = Date.now();
   private notebookPath: string | undefined = undefined;
   private cellFile: string | undefined = undefined;
+  private sourceCellIndex: number | undefined = undefined;
+  private initialCellCount: number | undefined = undefined;
   // Final subagent snapshot of the running exec; stamped onto exec_done so the
   // completed tool render keeps the subagent panel (live updates carry it, the
   // final frame used to drop it).
@@ -114,10 +116,8 @@ class PersistentSessionProtocol {
   private execResolve?: (result: CodeExecutionResult) => void;
   private execReject?: (error: Error) => void;
   private execTimeout?: NodeJS.Timeout;
-  private backgrounded = false;
   private updateHandler?: ToolUpdateCallback;
   private execTimeoutMs?: number;
-  private currentExecPromiseField: Promise<CodeExecutionResult> | null = null;
   private nestedToolCalls = 0;
   private nestedToolNames: string[] = [];
   private nestedResultChars = 0;
@@ -126,7 +126,6 @@ class PersistentSessionProtocol {
   private readonly reader: readline.Interface;
   private readyResolve?: () => void;
   private readyReject?: (error: Error) => void;
-  private execRejectRef?: (error: Error) => void;
   private scriptExportId = "";
   private scriptExportResolve?: (result: ScriptExportResult) => void;
   private inspectId = "";
@@ -158,6 +157,11 @@ class PersistentSessionProtocol {
     proc.once("exit", () => {
       this.failAllPending(
         new PtcProtocolError(`python session interpreter exited before finishing exec ${this.execId}.${this.stderrTail()}`)
+      );
+    });
+    proc.once("error", (error) => {
+      this.failAllPending(
+        new PtcProtocolError(`python session interpreter failed: ${error.message}.${this.stderrTail()}`)
       );
     });
   }
@@ -202,12 +206,32 @@ class PersistentSessionProtocol {
   }
 
   private failAllPending(error: Error): void {
+    const rejectReady = this.readyReject;
+    const rejectExec = this.execReject;
+    const rejectInspect = this.inspectReject;
+    const rejectExport = this.scriptExportReject;
+
+    this.readyResolve = undefined;
+    this.readyReject = undefined;
     this.execResolve = undefined;
-    if (this.execTimeout) {
-      clearTimeout(this.execTimeout);
-      this.execTimeout = undefined;
+    this.execReject = undefined;
+    this.inspectId = "";
+    this.inspectResolve = undefined;
+    this.inspectReject = undefined;
+    this.scriptExportId = "";
+    this.scriptExportResolve = undefined;
+    this.scriptExportReject = undefined;
+    this.clearExecTimeout();
+    if (this.interruptGraceTimer) {
+      clearTimeout(this.interruptGraceTimer);
+      this.interruptGraceTimer = undefined;
     }
-    this.execRejectRef?.(error);
+    this.pendingInterrupt = undefined;
+
+    rejectReady?.(error);
+    rejectExec?.(error);
+    rejectInspect?.(error);
+    rejectExport?.(error);
   }
 
   private buildDetails(overrides?: Partial<ExecutionDetails>): ExecutionDetails {
@@ -318,12 +342,27 @@ class PersistentSessionProtocol {
           return;
         }
         const finalOutput = msg.output as string;
-        const observedChars = this.stdoutCharsSeen + finalOutput.length;
-        const totalChars = Math.max(observedChars, (msg.total_output_chars as number) ?? observedChars);
+        const cellIdx = typeof msg.cell === "number" && Number.isInteger(msg.cell) && msg.cell > 0
+          ? msg.cell
+          : undefined;
+        const echo = typeof msg.echo === "string" ? msg.echo : undefined;
+        const kernelText = typeof msg.kernel_text === "string" ? msg.kernel_text : undefined;
+        const subagentsText = typeof msg.subagents_text === "string" ? msg.subagents_text : undefined;
+        const sectioned = echo !== undefined || kernelText !== undefined || subagentsText !== undefined;
         this.finish({
-          output: this.buildFinalOutput(finalOutput, totalChars),
+          output: this.buildFinalOutput(finalOutput, {
+            echo,
+            kernelText,
+            subagentsText,
+            cellIdx,
+          }),
           images: (msg.images as never[] | undefined) ?? undefined,
-          details: this.buildDetails({ execId: this.execId, subagentSnapshot: this.lastSubagentSnapshot }),
+          details: this.buildDetails({
+            execId: this.execId,
+            cellIdx,
+            sectioned,
+            subagentSnapshot: this.lastSubagentSnapshot,
+          }),
         });
         return;
       }
@@ -348,7 +387,7 @@ class PersistentSessionProtocol {
           }
           return;
         }
-        this.finish(new PtcPythonError(rawMessage, traceback));
+        this.finish(new PtcPythonError(rawMessage, appendPythonErrorHelp(traceback, rawMessage)));
         return;
       }
 
@@ -395,7 +434,7 @@ class PersistentSessionProtocol {
   /**
    * Route partial updates to the active tool call. The update handler is set per
    * exec (not at construction) because the tool call that streams the renders is
-   * only known when the caller invokes python_exec.
+   * only known when the caller invokes exec_cell.
    */
   setUpdateHandler(handler: ToolUpdateCallback | undefined): void {
     this.updateHandler = handler;
@@ -491,9 +530,6 @@ class PersistentSessionProtocol {
   }
 
   private emitUpdate(extra?: Partial<ExecutionDetails>): void {
-    if (this.backgrounded) {
-      return; // no active tool call to stream updates into
-    }
     this.updateHandler?.({
       content: [{ type: "text", text: this.describeProgress() }],
       details: this.buildDetails(extra),
@@ -510,25 +546,44 @@ class PersistentSessionProtocol {
     return "Executing";
   }
 
-  private buildFinalOutput(finalText: string, totalChars: number): string {
-    const remaining = this.options.maxOutputChars - this.stdout.length;
-    const retainedFinal = remaining > 0 ? finalText.slice(0, Math.max(0, remaining)) : "";
-    const retained = this.stdoutCharsSeen > 0 ? `${this.stdout}${retainedFinal}`.trim() : retainedFinal;
-    if (totalChars <= this.options.maxOutputChars) {
-      return retained;
+  /**
+   * Compose the model-visible result. New-format runtimes send the segments
+   * separately (`echo`, `kernel_text`, `subagents_text`); the host owns the
+   * structure: markers at column 0, every cell-produced line indented two
+   * spaces, so provenance is positional rather than prefix-trust. A runtime
+   * without the structured fields (stale interpreter) falls back to the legacy
+   * stdout+text concatenation.
+   */
+  private buildFinalOutput(
+    finalText: string,
+    sections?: { echo?: string; kernelText?: string; subagentsText?: string; cellIdx?: number }
+  ): string {
+    if (!sections || (sections.echo === undefined && sections.kernelText === undefined && sections.subagentsText === undefined)) {
+      return this.stdout ? `${this.stdout}${finalText}`.trim() : finalText;
     }
-    return `${retained}\n\n[Output truncated - showing first ${this.options.maxOutputChars} characters of ${totalChars}]`;
+    const parts: string[] = [];
+    if (this.stdout.trim()) parts.push(sectionize("output", this.stdout));
+    // The value segment replicates the legacy composition (result text, then
+    // the Out[n] echo) under one section; the header carries the Out[n] label.
+    const valueParts: string[] = [];
+    if (finalText.trim()) valueParts.push(finalText);
+    if (sections.echo !== undefined) {
+      valueParts.push(sections.cellIdx !== undefined ? `Out[${sections.cellIdx}]: ${sections.echo}` : `Out[?]: ${sections.echo}`);
+    }
+    if (valueParts.length > 0) {
+      const name = sections.cellIdx !== undefined ? `return (Out[${sections.cellIdx}])` : "return";
+      parts.push(sectionize(name, valueParts.join("\n\n")));
+    }
+    if (sections.kernelText?.trim()) parts.push(sectionize("kernel", sections.kernelText));
+    if (sections.subagentsText?.trim()) parts.push(sectionize("subagents", sections.subagentsText));
+    if (parts.length === 0) return finalText;
+    return parts.join("\n");
   }
 
   private appendStdout(text: string): void {
-    if (!text) {
-      return;
-    }
-    this.stdoutCharsSeen += text.length;
-    const remaining = this.options.maxOutputChars - this.stdout.length;
-    if (remaining > 0) {
-      this.stdout += text.slice(0, remaining);
-    }
+    // Python owns the emergency spool ceiling. Retain the complete framed text
+    // here; model-facing collapsing happens once, in exec_cell.
+    if (text) this.stdout += text;
   }
 
   private send(msg: Record<string, unknown>): void {
@@ -552,54 +607,61 @@ class PersistentSessionProtocol {
   }
 
   /** Run one chunk. The caller serializes (one exec at a time). */
-  async exec(code: string, timeoutMs: number | undefined, backgrounded: boolean): Promise<CodeExecutionResult> {
+  async exec(code: string, timeoutMs: number | undefined): Promise<CodeExecutionResult> {
     if (this.execResolve) {
       // Serialization is the manager's job; this is defense in depth so two
       // overlapping execs can never clobber each other's promise state.
       throw new PtcProtocolError(
-        "python session is busy: another chunk is already executing (python_exec calls are serialized per session)"
+        "python kernel is busy: another cell is already executing (exec_cell calls are serialized per kernel)"
       );
     }
     this.execId = `exec_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
     this.execStartedAt = Date.now();
     this.chunkLines = code.split("\n");
     this.stdout = "";
-    this.stdoutCharsSeen = 0;
     this.currentLine = undefined;
     this.totalLines = undefined;
     this.activeTool = undefined;
     this.lastSubagentSnapshot = undefined;
-    this.backgrounded = backgrounded;
 
-    const promise = new Promise<CodeExecutionResult>((resolve, reject) => {
-      this.execResolve = resolve;
-      this.execReject = reject;
-      this.execRejectRef = reject;
-    });
-    this.currentExecPromiseField = promise;
-
-    this.execTimeoutMs = timeoutMs;
-    this.armExecTimeout();
-
+    const sourcePath = this.cellFile;
+    const sourceCellIndex = this.sourceCellIndex;
+    const initialCellCount = this.initialCellCount;
+    this.cellFile = undefined;
+    this.sourceCellIndex = undefined;
+    this.initialCellCount = undefined;
     this.send({
       type: "exec",
       id: this.execId,
       code,
       user_code_line_count: this.chunkLines.length,
       notebook: this.notebookPath,
-      source_path: this.cellFile,
+      source_path: sourcePath,
+      source_cell_index: sourceCellIndex,
+      initial_cell_count: initialCellCount,
     });
-    this.cellFile = undefined;
+
+    // Do not arm protocol state until send succeeds. A closed/broken stdin must
+    // fail this call without leaving the session permanently "busy".
+    const promise = new Promise<CodeExecutionResult>((resolve, reject) => {
+      this.execResolve = resolve;
+      this.execReject = reject;
+    });
+    this.execTimeoutMs = timeoutMs;
+    this.armExecTimeout();
     return promise;
   }
 
   currentExecId(): string | null {
-    return this.execResolve || this.backgrounded ? this.execId : null;
+    return this.execResolve ? this.execId : null;
   }
 
   /** Ask the interpreter to write the cumulative cells to disk (AST-aware). */
   async exportScript(cells: string[], targetPath: string, timeoutMs: number | undefined): Promise<ScriptExportResult> {
-    this.scriptExportId = `export_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+    const exportId = `export_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+    this.send({ type: "export_script", id: exportId, path: targetPath, cells });
+
+    this.scriptExportId = exportId;
     const promise = new Promise<ScriptExportResult>((resolve, reject) => {
       this.scriptExportResolve = resolve;
       this.scriptExportReject = reject;
@@ -608,17 +670,21 @@ class PersistentSessionProtocol {
     let timeout: NodeJS.Timeout | undefined;
     if (timeoutMs !== undefined) {
       timeout = setTimeout(() => {
-        this.scriptExportReject?.(new Error(`Script export timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+        if (this.scriptExportId !== exportId) {
+          return;
+        }
+        const reject = this.scriptExportReject;
+        this.scriptExportId = "";
+        this.scriptExportResolve = undefined;
+        this.scriptExportReject = undefined;
+        reject?.(new Error(`Script export timed out after ${Math.round(timeoutMs / 1000)} seconds`));
       }, timeoutMs);
       timeout.unref?.();
     }
-    void promise.finally(() => {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-    });
-
-    this.send({ type: "export_script", id: this.scriptExportId, path: targetPath, cells });
+    void promise.then(
+      () => timeout && clearTimeout(timeout),
+      () => timeout && clearTimeout(timeout)
+    );
     return promise;
   }
 
@@ -627,7 +693,10 @@ class PersistentSessionProtocol {
     if (this.execResolve) {
       throw new PythonSessionError("kernel is busy executing a cell; inspect after it finishes");
     }
-    this.inspectId = `inspect_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+    const inspectId = `inspect_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+    this.send({ type: "inspect", id: inspectId });
+
+    this.inspectId = inspectId;
     const promise = new Promise<KernelDigest>((resolve, reject) => {
       this.inspectResolve = resolve;
       this.inspectReject = reject;
@@ -635,24 +704,24 @@ class PersistentSessionProtocol {
     let timeout: NodeJS.Timeout | undefined;
     if (timeoutMs !== undefined) {
       timeout = setTimeout(() => {
-        this.inspectReject?.(new Error(`kernel inspect timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+        if (this.inspectId !== inspectId) {
+          return;
+        }
+        const reject = this.inspectReject;
+        this.inspectId = "";
+        this.inspectResolve = undefined;
+        this.inspectReject = undefined;
+        reject?.(new Error(`kernel inspect timed out after ${Math.round(timeoutMs / 1000)} seconds`));
       }, timeoutMs);
       timeout.unref?.();
     }
-    void promise.finally(() => {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-    });
-    this.send({ type: "inspect", id: this.inspectId });
+    void promise.then(
+      () => timeout && clearTimeout(timeout),
+      () => timeout && clearTimeout(timeout)
+    );
     return promise;
   }
 
-  currentExecPromise(): Promise<CodeExecutionResult> | null {
-    return this.execResolve || this.backgrounded ? this.currentExecPromiseField ?? null : null;
-  }
-
-  /** Convert the running exec to a background run (stops streaming updates). */
   setNotebookPath(notebookPath: string | undefined): void {
     this.notebookPath = notebookPath;
   }
@@ -661,13 +730,12 @@ class PersistentSessionProtocol {
     this.cellFile = cellFile;
   }
 
-  setBackgrounded(flag: boolean): void {
-    this.backgrounded = flag;
-    if (flag) {
-      // Emit one final update so the render collapses cleanly.
-      this.emitUpdate();
-      this.backgrounded = true;
-    }
+  setSourceCellIndex(sourceCellIndex: number | undefined): void {
+    this.sourceCellIndex = sourceCellIndex;
+  }
+
+  setInitialCellCount(initialCellCount: number | undefined): void {
+    this.initialCellCount = initialCellCount;
   }
 
   async dispose(): Promise<void> {
@@ -685,6 +753,109 @@ class PersistentSessionProtocol {
 // Session manager
 // ---------------------------------------------------------------------------
 
+interface SessionSpawnOptions {
+  code: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
+interface NotebookCell extends Record<string, unknown> {
+  cell_type?: string;
+  source?: unknown;
+}
+
+interface PreparedSource {
+  path: string;
+  kind: "notebook" | "python";
+  cells: NotebookCell[];
+  pythonCode?: string;
+  prefixCellCount: number;
+}
+
+function notebookText(value: unknown): string {
+  if (Array.isArray(value)) return value.map((part) => String(part)).join("");
+  return typeof value === "string" ? value : "";
+}
+
+function parseNotebookDocument(text: string, sourcePath: string): { document: Record<string, unknown>; cells: NotebookCell[] } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch (error) {
+    throw new PythonSessionError(
+      `could not parse source notebook ${sourcePath}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new PythonSessionError(`source notebook ${sourcePath} is not a JSON object`);
+  }
+  const document = parsed as Record<string, unknown>;
+  if (!Array.isArray(document.cells)) {
+    throw new PythonSessionError(`source notebook ${sourcePath} has no cells array`);
+  }
+  const cells = document.cells.map((cell, index) => {
+    if (!cell || typeof cell !== "object" || Array.isArray(cell)) {
+      throw new PythonSessionError(`source notebook ${sourcePath} has an invalid cell at position ${index + 1}`);
+    }
+    return cell as NotebookCell;
+  });
+  return { document, cells };
+}
+
+function emptyNotebookDocument(): string {
+  return `${JSON.stringify({
+    cells: [],
+    metadata: {
+      kernelspec: { display_name: "Python 3 (ptc kernel)", language: "python", name: "python3" },
+      language_info: { name: "python" },
+    },
+    nbformat: 4,
+    nbformat_minor: 5,
+  }, null, 1)}\n`;
+}
+
+function sanitizeSkillNotebookName(name: string): string {
+  const withoutExtension = name.trim().replace(/\.ipynb$/i, "");
+  const sanitized = withoutExtension
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!sanitized) {
+    throw new PythonSessionError("promotion name must contain at least one letter or number");
+  }
+  return sanitized;
+}
+
+function extractNotebookCellOutput(cell: Record<string, unknown>): string {
+  const metadata = cell.metadata;
+  if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+    const fullOutput = (metadata as Record<string, unknown>).ptc_full_output;
+    if (typeof fullOutput === "string") return fullOutput;
+  }
+
+  const outputs = Array.isArray(cell.outputs) ? cell.outputs : [];
+  const parts: string[] = [];
+  for (const rawOutput of outputs) {
+    if (!rawOutput || typeof rawOutput !== "object" || Array.isArray(rawOutput)) continue;
+    const output = rawOutput as Record<string, unknown>;
+    if (output.output_type === "stream") {
+      parts.push(notebookText(output.text));
+    } else if (output.output_type === "execute_result") {
+      const data = output.data;
+      const text = data && typeof data === "object" && !Array.isArray(data)
+        ? notebookText((data as Record<string, unknown>)["text/plain"])
+        : "";
+      const count = typeof output.execution_count === "number" ? output.execution_count : cell.execution_count;
+      parts.push(`Out[${String(count)}]: ${text}`);
+    } else if (output.output_type === "error") {
+      const traceback = notebookText(output.traceback);
+      parts.push(traceback || `${String(output.ename ?? "Error")}: ${String(output.evalue ?? "")}`);
+    }
+  }
+  return parts.join(parts.length > 1 ? "\n\n" : "");
+}
+
 interface SessionRecord {
   id: string;
   notebookPath?: string;
@@ -698,15 +869,12 @@ interface SessionRecord {
   queue: Promise<void>;
   /** Foreground jobs accepted but not yet settled (queued-call detection). */
   pendingJobs: number;
-  background: Map<string, { code: string; status: "pending" | "done" | "error"; result?: CodeExecutionResult }>;
   latestSnapshot: SubagentRuntimeSnapshot | null;
-}
-
-export interface PythonSessionManagerHooks {
-  onSubagentSnapshot?: (sessionId: string, execId: string, snapshot: SubagentRuntimeSnapshot) => void;
-  onBackgroundComplete?: (completion: BackgroundCompletion) => void;
-  /** Report for a chunk interrupted after pi had already aborted the tool call. */
-  onInterrupted?: (sessionId: string, text: string) => void;
+  /** Total copied prefix cells, including markdown. */
+  prefixCellCount: number;
+  /** Number of source code chunks attempted during provisioning. */
+  prefixChunkCount: number;
+  sourcedFrom?: string;
 }
 
 export class PythonSessionManager {
@@ -728,8 +896,7 @@ export class PythonSessionManager {
         id: session.id,
         createdAt: session.createdAt,
         lastUsedAt: session.lastUsedAt,
-        chunks: session.chunks.length,
-        hasPendingBackground: [...session.background.values()].some((entry) => entry.status === "pending"),
+        chunks: session.prefixCellCount + Math.max(0, session.chunks.length - session.prefixChunkCount),
         running: Boolean(session.protocol.currentExecId()),
         notebookPath: session.notebookPath,
       }));
@@ -767,6 +934,49 @@ export class PythonSessionManager {
     return record.protocol.inspectKernel(options.timeoutMs);
   }
 
+  /** Read a 1-based cell output from the most recently used kernel's notebook. */
+  async readCellOutput(
+    cellIdx: number,
+    options: { offset?: number; limit?: number } = {}
+  ): Promise<{ text: string; notebookPath: string; cellIdx: number }> {
+    if (!Number.isInteger(cellIdx) || cellIdx < 1) {
+      throw new PythonSessionError("cellIdx must be a positive 1-based integer");
+    }
+    const record = [...this.sessions.values()]
+      .filter((session) => !session.killed && session.notebookPath)
+      .sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0];
+    if (!record?.notebookPath) {
+      throw new PythonSessionError("no notebook-backed kernel is available");
+    }
+
+    let document: unknown;
+    try {
+      document = JSON.parse(await fs.promises.readFile(record.notebookPath, "utf8")) as unknown;
+    } catch (error) {
+      throw new PythonSessionError(
+        `could not read notebook ${record.notebookPath}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    if (!document || typeof document !== "object" || !Array.isArray((document as { cells?: unknown }).cells)) {
+      throw new PythonSessionError(`notebook ${record.notebookPath} has no valid cells array`);
+    }
+    const cells = (document as { cells: unknown[] }).cells.filter(
+      (cell): cell is Record<string, unknown> => Boolean(cell) && typeof cell === "object" && !Array.isArray(cell)
+    );
+    const cell = cells.find((candidate) => candidate.execution_count === cellIdx);
+    if (!cell) {
+      throw new PythonSessionError(
+        `cell ${cellIdx} is not present in ${record.notebookPath} (${cells.length} cells recorded)`
+      );
+    }
+    const fullOutput = extractNotebookCellOutput(cell);
+    return {
+      text: sliceCellOutput(fullOutput, { cellIdx, ...options }),
+      notebookPath: record.notebookPath,
+      cellIdx,
+    };
+  }
+
   /** All subagent snapshots across sessions (sessions may each have their own). */
   allSubagentSnapshots(): Array<{ sessionId: string; snapshot: SubagentRuntimeSnapshot }> {
     const result: Array<{ sessionId: string; snapshot: SubagentRuntimeSnapshot }> = [];
@@ -779,6 +989,121 @@ export class PythonSessionManager {
     return result;
   }
 
+  resolveLibraryDir(): string {
+    const configured = this.settings.libraryDir?.trim() || process.env.PTC_LIBRARY_DIR?.trim();
+    if (configured) {
+      const expanded = configured === "~" || configured.startsWith(`~${path.sep}`)
+        ? path.join(homedir(), configured.slice(2))
+        : configured;
+      return path.resolve(expanded);
+    }
+    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homedir(), ".config", "pi");
+    return path.resolve(agentDir, "ptc-library");
+  }
+
+  private resolveSourcePath(source: string, cwd: string): string {
+    const requested = source.trim();
+    if (!requested) {
+      throw new PythonSessionError("source must not be empty");
+    }
+
+    if (path.isAbsolute(requested)) {
+      return requested;
+    }
+
+    const isBareName = path.basename(requested) === requested;
+    if (isBareName) {
+      const libraryDir = this.resolveLibraryDir();
+      const extension = path.extname(requested).toLowerCase();
+      const candidates = extension
+        ? [path.join(libraryDir, requested)]
+        : [path.join(libraryDir, `${requested}.ipynb`), path.join(libraryDir, `${requested}.py`)];
+      const libraryMatch = candidates.find((candidate) => fs.existsSync(candidate));
+      if (libraryMatch) return libraryMatch;
+    }
+
+    return path.resolve(cwd, requested);
+  }
+
+  private async prepareSource(
+    source: string | undefined,
+    cwd: string,
+    notebookPath: string | undefined
+  ): Promise<PreparedSource | undefined> {
+    if (!source) return undefined;
+    if (!notebookPath) {
+      throw new PythonSessionError("provisioning from source requires a destination notebookPath");
+    }
+
+    const sourcePath = this.resolveSourcePath(source, cwd);
+    const extension = path.extname(sourcePath).toLowerCase();
+    if (extension !== ".ipynb" && extension !== ".py") {
+      throw new PythonSessionError(`source must be a .ipynb or .py file: ${sourcePath}`);
+    }
+
+    let sourceText: string;
+    try {
+      sourceText = await fs.promises.readFile(sourcePath, "utf8");
+    } catch (error) {
+      throw new PythonSessionError(
+        `could not read source ${sourcePath}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+
+    const destination = path.resolve(cwd, notebookPath);
+    if (path.resolve(sourcePath) === destination) {
+      throw new PythonSessionError("source and destination notebook must be different files; the source is never modified");
+    }
+    await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+
+    if (extension === ".ipynb") {
+      const { cells } = parseNotebookDocument(sourceText, sourcePath);
+      await fs.promises.copyFile(sourcePath, destination);
+      return { path: sourcePath, kind: "notebook", cells, prefixCellCount: cells.length };
+    }
+
+    await fs.promises.writeFile(destination, emptyNotebookDocument(), "utf8");
+    return {
+      path: sourcePath,
+      kind: "python",
+      cells: [],
+      pythonCode: sourceText,
+      prefixCellCount: 1,
+    };
+  }
+
+  private spawnSession(code: string, cwd: string): ChildProcess {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (this.settings.subagentsProfile) {
+      env.PI_SUBAGENTS_PROFILE = this.settings.subagentsProfile;
+    }
+
+    // The current sandbox API takes one options object. Keep a compatibility
+    // path for older SandboxManager implementations while the contract migration
+    // lands; their synchronous spawn captures the scoped value before restore.
+    if (this.sandboxManager.spawn.length <= 1) {
+      const spawnWithOptions = this.sandboxManager.spawn as unknown as (
+        options: SessionSpawnOptions
+      ) => ChildProcess;
+      return spawnWithOptions.call(this.sandboxManager, { code, cwd, env });
+    }
+
+    if (!this.settings.subagentsProfile) {
+      return this.sandboxManager.spawn(code, cwd);
+    }
+    const previous = process.env.PI_SUBAGENTS_PROFILE;
+    try {
+      process.env.PI_SUBAGENTS_PROFILE = this.settings.subagentsProfile;
+      return this.sandboxManager.spawn(code, cwd);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.PI_SUBAGENTS_PROFILE;
+      } else {
+        process.env.PI_SUBAGENTS_PROFILE = previous;
+      }
+    }
+  }
+
   async provision(options: {
     cwd: string;
     ctx: ExtensionContext;
@@ -787,18 +1112,20 @@ export class PythonSessionManager {
     parentToolCallId?: string;
     script?: string;
     notebookPath?: string;
-  }): Promise<{ id: string; scriptError?: PtcPythonError }> {
-    const liveCount = [...this.sessions.values()].filter((session) => !session.killed).length;
-    if (liveCount >= this.settings.maxPythonSessions) {
-      throw new PythonSessionError(
-        `python session limit reached (${this.settings.maxPythonSessions}). Live sessions: ${
-          this.list().map((s) => s.id).join(", ") || "(none)"
-        }`
-      );
-    }
+    source?: string;
+  }): Promise<{
+    id: string;
+    sourcedFrom?: string;
+    sourceError?: SourceExecutionError;
+    scriptError?: PtcPythonError;
+  }> {
+    // Back-burner: limit disabled 2026-09-26 — revisit for provisioning churn per docs/BACK-BURNER.md §2
+    // Keep maxPythonSessions parsing for compatibility, but do not reject new kernels here.
 
     const sessionId = randomUUID().replace(/-/g, "").slice(0, 12);
     const { cwd } = options;
+    const notebookPath = options.notebookPath ? path.resolve(cwd, options.notebookPath) : undefined;
+    const preparedSource = await this.prepareSource(options.source, cwd, notebookPath);
     const callableToolRuntime = this.toolRegistry.createCallableToolRuntime(cwd, this.settings, {
       ctx: options.ctx,
       signal: options.signal,
@@ -810,21 +1137,16 @@ export class PythonSessionManager {
       toolWrappers: generateToolWrappers(callableToolRuntime.tools),
       runtime: { rpcCode, runtimeCode, sessionCode },
       maxParallelToolCalls: this.settings.maxParallelToolCalls,
-      maxOutputChars: this.settings.maxOutputChars,
+      // session-prelude's legacy field name feeds the runtime's sole emergency
+      // capture valve; it is no longer a model-facing output limit.
+      maxOutputChars: this.settings.maxSpoolChars,
       hostWorkspaceRoot: cwd,
       runtimeWorkspaceRoot: this.sandboxManager.getRuntimeWorkspaceRoot(cwd),
       autoimportSubagents: !process.env.PI_SUBAGENT_DEPTH,
     });
 
-    // The spawner library reads PI_SUBAGENTS_PROFILE from the interpreter's env;
-    // process.env is inherited by the sandbox spawn, so publish the override here.
-    if (this.settings.subagentsProfile) {
-      process.env.PI_SUBAGENTS_PROFILE = this.settings.subagentsProfile;
-    }
-
-    const proc = this.sandboxManager.spawn(prelude, cwd);
+    const proc = this.spawnSession(prelude, cwd);
     const protocol = new PersistentSessionProtocol(proc, callableToolRuntime.runTool, {
-      maxOutputChars: this.settings.maxOutputChars,
       terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
       sendSignal: (signal) => {
         this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal);
@@ -850,24 +1172,77 @@ export class PythonSessionManager {
       killed: false,
       queue: Promise.resolve(),
       pendingJobs: 0,
-      background: new Map(),
       latestSnapshot: null,
-      notebookPath: options.notebookPath,
+      notebookPath,
+      prefixCellCount: preparedSource?.prefixCellCount ?? 0,
+      prefixChunkCount: 0,
+      sourcedFrom: preparedSource?.path,
     };
 
-    await protocol.waitReady(15_000);
-    if (options.notebookPath) {
-      protocol.setNotebookPath(options.notebookPath);
+    const reap = () => this.reapSession(record);
+    proc.once("exit", reap);
+    proc.once("error", reap);
+
+    try {
+      await protocol.waitReady(15_000);
+      if (record.killed || proc.exitCode !== null || proc.signalCode !== null) {
+        throw new PythonSessionError("python session exited during startup");
+      }
+    } catch (error) {
+      record.killed = true;
+      this.terminateSession(record);
+      await protocol.dispose().catch(() => undefined);
+      throw error;
+    }
+    if (notebookPath) {
+      protocol.setNotebookPath(notebookPath);
+    }
+    if (preparedSource) {
+      // The first frame tells the runtime that copied markdown and code cells
+      // occupy the prefix numbering range. It is consumed once by the protocol.
+      protocol.setInitialCellCount(preparedSource.prefixCellCount);
     }
 
     this.sessions.set(sessionId, record);
     this.recency = this.recency.filter((id) => id !== sessionId);
     this.recency.push(sessionId);
 
+    let sourceError: SourceExecutionError | undefined;
+    if (preparedSource) {
+      const sourceCells = preparedSource.kind === "python"
+        ? [{ code: preparedSource.pythonCode ?? "", index: 0, file: preparedSource.path }]
+        : preparedSource.cells
+            .map((cell, index) => ({ cell, index }))
+            .filter(({ cell }) => cell.cell_type === "code")
+            .map(({ cell, index }) => ({ code: notebookText(cell.source), index, file: undefined }));
+
+      for (const sourceCell of sourceCells) {
+        record.prefixChunkCount += 1;
+        try {
+          await this.execChunk(
+            record,
+            sourceCell.code,
+            options.onUpdate,
+            options.signal,
+            sourceCell.file,
+            undefined,
+            sourceCell.index
+          );
+        } catch (error) {
+          sourceError = {
+            cellIdx: sourceCell.index + 1,
+            message: error instanceof Error ? error.message : String(error),
+            traceback: error instanceof PtcPythonError ? error.traceback : undefined,
+          };
+          break;
+        }
+      }
+    }
+
     let scriptError: PtcPythonError | undefined;
     if (options.script) {
       try {
-        await this.execChunk(record, options.script, false, options.onUpdate);
+        await this.execChunk(record, options.script, options.onUpdate);
       } catch (error) {
         if (error instanceof PtcPythonError) {
           scriptError = error;
@@ -877,12 +1252,12 @@ export class PythonSessionManager {
       }
     }
 
-    return { id: sessionId, scriptError };
+    return { id: sessionId, sourcedFrom: preparedSource?.path, sourceError, scriptError };
   }
 
   /** Foreground exec: serialized per session, streams updates, blocks. */
   /**
-   * Foreground exec: serialized per session. pi may dispatch several python_exec
+   * Foreground exec: serialized per session. pi may dispatch several exec_cell
    * calls in one assistant message (parallel tool calls), and a session has one
    * interpreter and one exec loop — so every call must queue behind the previous
    * one instead of racing it.
@@ -900,7 +1275,7 @@ export class PythonSessionManager {
         content: [
           {
             type: "text",
-            text: "Queued: another python_exec chunk is still running in this session",
+            text: "Queued: another exec_cell cell is still running in this kernel",
           },
         ],
         details: { sessionId: record.id },
@@ -908,8 +1283,8 @@ export class PythonSessionManager {
     }
     record.pendingJobs += 1;
     const job = record.queue.then(
-      () => this.execChunk(record, code, false, options.onUpdate, options.signal, options.file, options.notebookPath),
-      () => this.execChunk(record, code, false, options.onUpdate, options.signal, options.file, options.notebookPath)
+      () => this.execChunk(record, code, options.onUpdate, options.signal, options.file, options.notebookPath),
+      () => this.execChunk(record, code, options.onUpdate, options.signal, options.file, options.notebookPath)
     );
     // Advance the queue regardless of this job's outcome so a failed exec cannot
     // wedge every later call on the session.
@@ -928,104 +1303,6 @@ export class PythonSessionManager {
     return job;
   }
 
-  /** Background exec: queues the chunk, returns the exec id immediately. */
-  async execBackground(
-    sessionId: string,
-    code: string,
-    options: SessionExecOptions
-  ): Promise<{ execId: string }> {
-    const record = this.require(sessionId);
-    validateUserCode(code);
-
-    let resolveExecId!: (execId: string) => void;
-    let rejectExecId!: (error: Error) => void;
-    const execIdPromise = new Promise<string>((resolve, reject) => {
-      resolveExecId = resolve;
-      rejectExecId = reject;
-    });
-
-    const run = async (): Promise<void> => {
-      if (record.killed || record.proc.exitCode !== null) {
-        throw new PythonSessionError(`python session ${record.id} is no longer running; provision a new one`);
-      }
-      record.lastUsedAt = Date.now();
-      record.chunks.push(code);
-      const execPromise = record.protocol.exec(code, this.settings.executionTimeoutMs, true);
-      const execId = record.protocol.currentExecId() ?? "unknown";
-      record.background.set(execId, { code, status: "pending" });
-      resolveExecId(execId);
-      let result: CodeExecutionResult;
-      try {
-        result = await execPromise;
-        const entry = record.background.get(execId);
-        if (entry) {
-          entry.status = "done";
-          entry.result = result;
-        }
-      } catch (error) {
-        result = {
-          output: error instanceof Error ? error.message : String(error),
-          details: {
-            nestedToolCalls: 0,
-            nestedToolNames: [],
-            nestedResultChars: 0,
-            nestedResultCount: 0,
-            nestedErrors: 1,
-            durationMs: 0,
-            estimatedAvoidedTokens: 0,
-            execId,
-          },
-        };
-        const entry = record.background.get(execId);
-        if (entry) {
-          entry.status = "error";
-          entry.result = result;
-        }
-      }
-      this.hooks.onBackgroundComplete?.({ sessionId: record.id, execId, result });
-    };
-
-    record.queue = record.queue
-      .then(run)
-      .catch((error) => {
-        rejectExecId(error instanceof Error ? error : new Error(String(error)));
-      });
-
-    return { execId: await execIdPromise };
-  }
-
-  /** Wait for a backgrounded exec to finish (python_exec wait_for). */
-  async waitForExec(sessionId: string, execId: string): Promise<CodeExecutionResult> {
-    const record = this.require(sessionId);
-    const entry = record.background.get(execId);
-    if (!entry) {
-      const known = [...record.background.keys()].join(", ") || "(none)";
-      throw new PythonSessionError(`Unknown background exec ${execId} in session ${sessionId}. Known: ${known}`);
-    }
-    if (entry.result) {
-      return entry.result;
-    }
-    const deadline = Date.now() + this.settings.executionTimeoutMs;
-    while (!entry.result && Date.now() < deadline) {
-      if (record.killed) {
-        throw new PythonSessionError(`python session ${sessionId} was disposed while waiting for ${execId}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-    if (!entry.result) {
-      throw new PythonSessionError(`Timed out waiting for background exec ${execId}`);
-    }
-    return entry.result;
-  }
-
-  pendingBackground(sessionId: string): Array<{ execId: string; status: string }> {
-    const record = this.sessions.get(sessionId);
-    if (!record) {
-      return [];
-    }
-    return [...record.background.entries()].map(([execId, entry]) => ({ execId, status: entry.status }));
-  }
-
   /**
    * Interrupt the chunk running in a session (Ctrl-C semantics). The interpreter
    * and its namespace survive; the running tool call reports the abort with the
@@ -1040,72 +1317,39 @@ export class PythonSessionManager {
     return true;
   }
 
-  /**
-   * Convert the currently-running foreground exec into a background run
-   * ("User manually backgrounded this ptc run"). Returns its exec id, or null
-   * when nothing is executing in the session.
-   */
-  async markBackgrounded(sessionId: string): Promise<string | null> {
-    const record = this.sessions.get(sessionId);
-    if (!record) {
-      return null;
-    }
-    const execId = record.protocol.currentExecId();
-    const execPromise = record.protocol.currentExecPromise();
-    if (!execId || !execPromise) {
-      return null;
-    }
-    record.protocol.setBackgrounded(true);
-    const entry: { code: string; status: "pending" | "done" | "error"; result?: CodeExecutionResult } = { code: "", status: "pending" };
-    record.background.set(execId, entry);
-    void execPromise
-      .then((result: CodeExecutionResult) => {
-        entry.status = "done";
-        entry.result = result;
-        this.hooks.onBackgroundComplete?.({ sessionId: record.id, execId, result });
-      })
-      .catch((error: unknown) => {
-        entry.status = "error";
-        entry.result = {
-          output: error instanceof Error ? error.message : String(error),
-          details: {
-            nestedToolCalls: 0,
-            nestedToolNames: [],
-            nestedResultChars: 0,
-            nestedResultCount: 0,
-            nestedErrors: 1,
-            durationMs: 0,
-            estimatedAvoidedTokens: 0,
-            execId,
-          },
-        };
-        this.hooks.onBackgroundComplete?.({ sessionId: record.id, execId, result: entry.result });
-      });
-    return execId;
-  }
-
   private async execChunk(
     record: SessionRecord,
     code: string,
-    backgrounded: boolean,
     onUpdate?: ToolUpdateCallback,
     signal?: AbortSignal,
     cellFile?: string,
-    notebookPath?: string
+    notebookPath?: string,
+    sourceCellIndex?: number
   ): Promise<CodeExecutionResult> {
-    validateUserCode(code);
+    // Sourced library cells must be recorded even when they contain code that
+    // ordinary model-authored cells reject before execution. Let the runtime
+    // report/record those failures against the copied prefix cell.
+    if (sourceCellIndex === undefined) {
+      validateUserCode(code);
+    }
     if (record.killed || record.proc.exitCode !== null) {
       throw new PythonSessionError(`python session ${record.id} is no longer running; provision a new one`);
     }
     if (signal?.aborted) {
-      throw new PtcAbortError("python_exec aborted before the chunk started");
+      throw new PtcAbortError("exec_cell aborted before the cell started");
     }
     record.lastUsedAt = Date.now();
+    this.recency = this.recency.filter((id) => id !== record.id);
+    this.recency.push(record.id);
     record.chunks.push(code);
     record.protocol.setUpdateHandler(onUpdate);
-    record.protocol.setNotebookPath(notebookPath ?? record.notebookPath);
+    if (notebookPath) record.notebookPath = notebookPath;
+    record.protocol.setNotebookPath(record.notebookPath);
     if (cellFile) {
       record.protocol.setCellFile(cellFile);
+    }
+    if (sourceCellIndex !== undefined) {
+      record.protocol.setSourceCellIndex(sourceCellIndex);
     }
 
     // An aborted tool call interrupts the running chunk (Ctrl-C semantics) and
@@ -1121,7 +1365,7 @@ export class PythonSessionManager {
     }
 
     try {
-      return await record.protocol.exec(code, this.settings.executionTimeoutMs, backgrounded);
+      return await record.protocol.exec(code, this.settings.executionTimeoutMs);
     } finally {
       if (abortListener && signal) {
         signal.removeEventListener("abort", abortListener);
@@ -1131,6 +1375,85 @@ export class PythonSessionManager {
     }
   }
 
+  /** Copy a complete notebook artifact into the reusable PTC library. */
+  async promoteToSkillNotebook(options: {
+    name: string;
+    notebookPath?: string;
+    overwrite?: boolean;
+    cwd?: string;
+  }): Promise<SkillNotebookPromotionResult> {
+    const cwd = options.cwd ?? process.cwd();
+    const recentRecord = [...this.recency]
+      .reverse()
+      .map((id) => this.sessions.get(id))
+      .find((record): record is SessionRecord => Boolean(record?.notebookPath && !record.killed));
+    const notebookPath = options.notebookPath
+      ? path.resolve(cwd, options.notebookPath)
+      : recentRecord?.notebookPath;
+    if (!notebookPath) {
+      throw new PythonSessionError(
+        "no session notebook is available; pass notebookPath or provision a notebook-backed kernel first"
+      );
+    }
+    if (path.extname(notebookPath).toLowerCase() !== ".ipynb") {
+      throw new PythonSessionError(`promotion source must be a .ipynb notebook: ${notebookPath}`);
+    }
+
+    const sourceRecord = [...this.sessions.values()].find(
+      (record) => record.notebookPath && path.resolve(record.notebookPath) === path.resolve(notebookPath)
+    );
+    if (sourceRecord) {
+      await sourceRecord.queue;
+    }
+
+    let notebookTextOnDisk: string;
+    try {
+      notebookTextOnDisk = await fs.promises.readFile(notebookPath, "utf8");
+    } catch (error) {
+      throw new PythonSessionError(
+        `could not read notebook ${notebookPath}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    parseNotebookDocument(notebookTextOnDisk, notebookPath);
+
+    const name = sanitizeSkillNotebookName(options.name);
+    const libraryDir = this.resolveLibraryDir();
+    const targetPath = path.join(libraryDir, `${name}.ipynb`);
+    const overwritten = fs.existsSync(targetPath);
+    if (overwritten && !options.overwrite) {
+      throw new PythonSessionError(
+        `library notebook already exists: ${targetPath}; pass overwrite: true to replace it`
+      );
+    }
+    if (path.resolve(notebookPath) === path.resolve(targetPath)) {
+      if (!options.overwrite) {
+        throw new PythonSessionError(
+          `library notebook already exists: ${targetPath}; pass overwrite: true to replace it`
+        );
+      }
+      return { name, path: targetPath, notebookPath, overwritten: true };
+    }
+
+    await fs.promises.mkdir(libraryDir, { recursive: true });
+    try {
+      await fs.promises.copyFile(
+        notebookPath,
+        targetPath,
+        options.overwrite ? 0 : fs.constants.COPYFILE_EXCL
+      );
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") {
+        throw new PythonSessionError(
+          `library notebook already exists: ${targetPath}; pass overwrite: true to replace it`
+        );
+      }
+      throw error;
+    }
+    return { name, path: targetPath, notebookPath, overwritten };
+  }
+
+  /** Legacy script export retained for API callers; notebook promotion is preferred. */
   async toScript(
     sessionId: string,
     options: { cwd: string; path?: string; name?: string }
@@ -1142,7 +1465,7 @@ export class PythonSessionManager {
 
     // Overwrite-guard resolution happens host-side so the target is known to
     // the caller; the interpreter performs the AST-aware export write.
-    const dir = options.path ? path.dirname(options.path) : path.join(options.cwd, ".pi", "scripts");
+    const dir = options.path ? path.dirname(options.path) : path.join(".pi", "scripts");
     const baseName = options.path
       ? path.basename(options.path)
       : options.name
@@ -1150,10 +1473,16 @@ export class PythonSessionManager {
           ? options.name
           : `${options.name}.py`
         : `ptc-session-${record.id}.py`;
-    let target = path.resolve(options.cwd, path.join(dir, baseName));
+    const extension = path.extname(baseName);
+    const stem = extension ? baseName.slice(0, -extension.length) : baseName;
+    let candidate = baseName;
+    let target = path.resolve(options.cwd, dir, candidate);
     let counter = 2;
     while (fs.existsSync(target)) {
-      target = path.join(dir, baseName.replace(/(\.py)?$/, (match) => `-${counter}.py`));
+      candidate = extension === ".py"
+        ? `${stem}-${counter}.py`
+        : `${stem}-${counter}${extension}`;
+      target = path.resolve(options.cwd, dir, candidate);
       counter += 1;
     }
 
@@ -1164,10 +1493,9 @@ export class PythonSessionManager {
     return result;
   }
 
-  /** Most recent session with a running or pending exec, for /ptc defaults. */
+  /** Most recent session with a running exec, for /ptc defaults. */
   mostRecentActive(): SessionSummary | null {
-    const summaries = this.list();
-    return summaries.filter((s) => s.running || s.hasPendingBackground)[0] ?? null;
+    return this.list().find((session) => session.running) ?? null;
   }
 
   async dispose(sessionId: string): Promise<void> {
@@ -1180,6 +1508,14 @@ export class PythonSessionManager {
     this.recency = this.recency.filter((id) => id !== sessionId);
     await record.protocol.dispose();
     this.terminateSession(record);
+  }
+
+  private reapSession(record: SessionRecord): void {
+    record.killed = true;
+    if (this.sessions.get(record.id) === record) {
+      this.sessions.delete(record.id);
+      this.recency = this.recency.filter((id) => id !== record.id);
+    }
   }
 
   private terminateSession(record: SessionRecord): void {

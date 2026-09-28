@@ -9,8 +9,15 @@ import {
   PtcTransportError,
 } from "./execution/execution-errors";
 import { normalizeToolResult } from "./tool-adapters";
-import { estimateTokensFromChars } from "./utils";
-import type { CodeExecutionResult, ExecutionDetails, RpcErrorPayload, RpcMessage, SubagentRuntimeSnapshot } from "./contracts/execution-types";
+import { appendPythonErrorHelp, estimateTokensFromChars, logWarning } from "./utils";
+import type {
+  CodeExecutionResult,
+  ExecutionDetails,
+  PtcImageArtifact,
+  RpcErrorPayload,
+  RpcMessage,
+  SubagentRuntimeSnapshot,
+} from "./contracts/execution-types";
 
 type RunTool = (toolName: string, params: unknown, nestedCallId: string) => Promise<unknown>;
 
@@ -24,6 +31,28 @@ function isString(value: unknown): value is string {
 
 function isRpcErrorPayload(value: unknown): value is RpcErrorPayload {
   return isRecord(value) && isString(value.type) && isString(value.message) && (value.stack === undefined || isString(value.stack));
+}
+
+function isPtcImageArtifact(value: unknown): value is PtcImageArtifact {
+  return (
+    isRecord(value) &&
+    isString(value.mimeType) &&
+    isString(value.data) &&
+    (value.width === undefined || (typeof value.width === "number" && Number.isFinite(value.width))) &&
+    (value.height === undefined || (typeof value.height === "number" && Number.isFinite(value.height)))
+  );
+}
+
+function validateImages(value: unknown, frameType: "complete" | "exec_done"): PtcImageArtifact[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || !value.every(isPtcImageArtifact)) {
+    throw new PtcProtocolError(
+      `Invalid ${frameType} frame: images must be an array of { mimeType: string, data: string } artifacts.`
+    );
+  }
+  return value;
 }
 
 type RpcMessageType = RpcMessage["type"];
@@ -85,22 +114,21 @@ function validateStdoutMessage(value: Record<string, unknown>): Extract<RpcMessa
 function validateCompleteMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "complete" }> {
   const totalOutputChars = value.total_output_chars;
   if (
-    isString(value.output) &&
-    (totalOutputChars === undefined ||
-      (typeof totalOutputChars === "number" && Number.isFinite(totalOutputChars) && totalOutputChars >= 0))
+    !isString(value.output) ||
+    (totalOutputChars !== undefined &&
+      !(typeof totalOutputChars === "number" && Number.isFinite(totalOutputChars) && totalOutputChars >= 0))
   ) {
-    const images = Array.isArray(value.images) ? (value.images as any) : undefined;
-    return {
-      type: "complete",
-      output: value.output,
-      images,
-      total_output_chars: totalOutputChars,
-    };
+    throw new PtcProtocolError(
+      "Invalid complete frame: expected string output and optional non-negative total_output_chars."
+    );
   }
 
-  throw new PtcProtocolError(
-    "Invalid complete frame: expected string output and optional non-negative total_output_chars."
-  );
+  return {
+    type: "complete",
+    output: value.output,
+    images: validateImages(value.images, "complete"),
+    total_output_chars: totalOutputChars,
+  };
 }
 
 function validateErrorMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "error" }> {
@@ -127,24 +155,61 @@ function validateExecDoneMessage(value: Record<string, unknown>): Extract<RpcMes
   if (!isString(value.id) || !isString(value.output)) {
     throw new PtcProtocolError("Invalid exec_done frame: expected string id and output.");
   }
+  const echo = value.echo;
+  if (echo !== undefined && echo !== null && !isString(echo)) {
+    throw new PtcProtocolError("Invalid exec_done frame: echo must be a string when present.");
+  }
+  const kernelText = value.kernel_text;
+  if (kernelText !== undefined && kernelText !== null && !isString(kernelText)) {
+    throw new PtcProtocolError("Invalid exec_done frame: kernel_text must be a string when present.");
+  }
+  const subagentsText = value.subagents_text;
+  if (subagentsText !== undefined && subagentsText !== null && !isString(subagentsText)) {
+    throw new PtcProtocolError("Invalid exec_done frame: subagents_text must be a string when present.");
+  }
   const totalOutputChars = value.total_output_chars;
   if (totalOutputChars !== undefined && !(typeof totalOutputChars === "number" && Number.isFinite(totalOutputChars) && totalOutputChars >= 0)) {
     throw new PtcProtocolError("Invalid exec_done frame: total_output_chars must be a non-negative number.");
+  }
+  const cell = value.cell;
+  if (cell !== undefined && !(typeof cell === "number" && Number.isInteger(cell) && cell > 0)) {
+    throw new PtcProtocolError("Invalid exec_done frame: cell must be a positive integer.");
   }
   return {
     type: "exec_done",
     id: value.id,
     output: value.output,
-    images: Array.isArray(value.images) ? (value.images as never) : undefined,
+    echo: echo ?? undefined,
+    kernel_text: kernelText ?? undefined,
+    subagents_text: subagentsText ?? undefined,
+    images: validateImages(value.images, "exec_done"),
     total_output_chars: totalOutputChars,
+    cell,
   };
 }
 
 function validateExecErrorMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "exec_error" }> {
-  if (!isString(value.id) || !isString(value.message) || (value.traceback !== undefined && !isString(value.traceback))) {
-    throw new PtcProtocolError("Invalid exec_error frame: expected string id/message and optional traceback.");
+  if (
+    !isString(value.id) ||
+    !isString(value.message) ||
+    (value.traceback !== undefined && !isString(value.traceback)) ||
+    (value.interrupted !== undefined && typeof value.interrupted !== "boolean") ||
+    (value.line !== undefined && !(typeof value.line === "number" && Number.isFinite(value.line))) ||
+    (value.source !== undefined && !isString(value.source))
+  ) {
+    throw new PtcProtocolError(
+      "Invalid exec_error frame: expected string id/message and valid optional traceback/interrupted/line/source fields."
+    );
   }
-  return { type: "exec_error", id: value.id, message: value.message, traceback: value.traceback };
+  return {
+    type: "exec_error",
+    id: value.id,
+    message: value.message,
+    traceback: value.traceback,
+    interrupted: value.interrupted,
+    line: value.line,
+    source: value.source,
+  };
 }
 
 function validateSessionReadyMessage(value: Record<string, unknown>): Extract<RpcMessage, { type: "session_ready" }> {
@@ -214,14 +279,12 @@ function serializeError(error: unknown): RpcErrorPayload {
   };
 }
 
-const DEFAULT_MAX_OUTPUT_CHARS = 100_000;
 const MAX_STDERR_CHARS = 64_000;
 const EXIT_FRAME_GRACE_MS = 100;
 const NATURAL_EXIT_GRACE_MS = 250;
 const TERMINATION_GRACE_MS = 1_000;
 
 export interface RpcProtocolOptions {
-  maxOutputChars?: number;
   /** Abort nested host tools when the Python execution fails or times out. */
   onFailure?: (error: Error) => void;
   /** Sandbox-aware termination (for example, killing a local process group). */
@@ -238,7 +301,6 @@ export class RpcProtocol {
   private stderr = "";
   private stderrCharsSeen = 0;
   private stdout = "";
-  private stdoutCharsSeen = 0;
   private userCodeLines: string[];
   private completed = false;
   private succeeded = false;
@@ -252,12 +314,11 @@ export class RpcProtocol {
   private nestedErrors = 0;
   private currentLine?: number;
   private totalLines?: number;
-  private activeTool?: string;
+  private activeTools = new Map<string, string>();
   private executionTimeout?: NodeJS.Timeout;
   private exitFrameTimer?: NodeJS.Timeout;
   private forceKillTimer?: NodeJS.Timeout;
   private abortHandler?: () => void;
-  private readonly maxOutputChars: number;
 
   constructor(
     private proc: ChildProcess,
@@ -268,9 +329,6 @@ export class RpcProtocol {
     private options: RpcProtocolOptions = {}
   ) {
     this.userCodeLines = userCode.split("\n");
-    this.maxOutputChars = Number.isFinite(options.maxOutputChars) && (options.maxOutputChars as number) > 0
-      ? Math.floor(options.maxOutputChars as number)
-      : DEFAULT_MAX_OUTPUT_CHARS;
 
     if (!proc.stdout) {
       throw new PtcTransportError("Python process did not expose stdout for the RPC protocol.");
@@ -353,7 +411,13 @@ export class RpcProtocol {
 
     if (signal) {
       this.abortHandler = () => {
-        this.rejectOnce(new PtcAbortError("Execution aborted"));
+        const reason = signal.reason;
+        const message = reason instanceof Error
+          ? reason.message
+          : reason === undefined
+            ? "Execution aborted"
+            : String(reason);
+        this.rejectOnce(reason instanceof PtcAbortError ? reason : new PtcAbortError(message));
       };
       if (signal.aborted) {
         queueMicrotask(this.abortHandler);
@@ -427,28 +491,13 @@ export class RpcProtocol {
   }
 
   private appendStdout(text: string): void {
-    if (!text) {
-      return;
-    }
-
-    this.stdoutCharsSeen += text.length;
-    const remaining = this.maxOutputChars - this.stdout.length;
-    if (remaining > 0) {
-      this.stdout += text.slice(0, remaining);
-    }
+    // The Python runtime is the single full-capture/safety-valve site. The host
+    // must retain every character it receives so it can persist and preview once.
+    if (text) this.stdout += text;
   }
 
-  private buildFinalOutput(finalText: string, reportedTotalChars?: number): string {
-    const observedChars = this.stdoutCharsSeen + finalText.length;
-    const totalChars = Math.max(observedChars, reportedTotalChars ?? observedChars);
-    const remaining = this.maxOutputChars - this.stdout.length;
-    const retainedFinal = remaining > 0 ? finalText.slice(0, remaining) : "";
-    const retained = this.stdoutCharsSeen > 0 ? `${this.stdout}${retainedFinal}`.trim() : retainedFinal;
-
-    if (totalChars <= this.maxOutputChars) {
-      return retained;
-    }
-    return `${retained}\n\n[Output truncated - showing first ${this.maxOutputChars} characters of ${totalChars}]`;
+  private buildFinalOutput(finalText: string): string {
+    return this.stdout ? `${this.stdout}${finalText}`.trim() : finalText;
   }
 
   private resolveOnce(result: CodeExecutionResult): void {
@@ -495,9 +544,21 @@ export class RpcProtocol {
       currentLine: this.currentLine,
       totalLines: this.totalLines,
       userCode: this.userCodeLines,
-      activeTool: this.activeTool,
+      // A single active tool is useful progress context. With concurrent nested
+      // calls there is no truthful scalar value, so omit it rather than race.
+      activeTool: this.activeTools.size === 1 ? this.activeTools.values().next().value : undefined,
       ...overrides,
     };
+  }
+
+  private emitUpdate(update: Parameters<AgentToolUpdateCallback<unknown>>[0]): void {
+    try {
+      this.onUpdate?.(update);
+    } catch (error) {
+      logWarning(
+        `RPC onUpdate callback failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   private parseMessage(line: string): RpcMessage {
@@ -526,8 +587,7 @@ export class RpcProtocol {
       case "execution_progress":
         this.currentLine = msg.line;
         this.totalLines = msg.total_lines;
-        this.activeTool = undefined;
-        this.onUpdate?.({
+        this.emitUpdate({
           content: [{ type: "text", text: `Executing line ${msg.line}/${msg.total_lines}` }],
           details: this.buildExecutionDetails(),
         });
@@ -539,18 +599,18 @@ export class RpcProtocol {
 
       case "complete":
         this.resolveOnce({
-          output: this.buildFinalOutput(msg.output, msg.total_output_chars),
+          output: this.buildFinalOutput(msg.output),
           images: msg.images,
           details: this.buildExecutionDetails(),
         });
         break;
 
       case "error":
-        this.rejectOnce(new PtcPythonError(msg.message, msg.traceback));
+        this.rejectOnce(new PtcPythonError(msg.message, appendPythonErrorHelp(msg.traceback, msg.message)));
         break;
 
       case "update":
-        this.onUpdate?.({
+        this.emitUpdate({
           content: [{ type: "text", text: msg.message }],
           details: this.buildExecutionDetails(),
         });
@@ -561,9 +621,9 @@ export class RpcProtocol {
   private async handleToolCall(msg: Extract<RpcMessage, { type: "tool_call" }>): Promise<void> {
     this.nestedToolCalls += 1;
     this.nestedToolNames.push(msg.tool);
-    this.activeTool = msg.tool;
+    this.activeTools.set(msg.id, msg.tool);
 
-    this.onUpdate?.({
+    this.emitUpdate({
       content: [{ type: "text", text: `Calling ${msg.tool}()` }],
       details: this.buildExecutionDetails(),
     });
@@ -582,7 +642,7 @@ export class RpcProtocol {
       this.nestedErrors += 1;
       response = { type: "tool_result", id: msg.id, error: serializeError(error) };
     } finally {
-      this.activeTool = undefined;
+      this.activeTools.delete(msg.id);
     }
 
     if (!this.completed) {

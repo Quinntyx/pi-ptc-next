@@ -38,25 +38,130 @@ function loadToolRegistryWithStubbedHost() {
   }
 }
 
-function createRegistry() {
+function createRegistry(getAllTools = () => []) {
   const ToolRegistry = loadToolRegistryWithStubbedHost();
   const pi = {
-    getAllTools() {
-      return [];
-    },
+    getAllTools,
   };
   return new ToolRegistry(pi);
 }
 
+test("ToolRegistry treats an explicit empty ptc.callers allowlist as deny-all", () => {
+  const registry = createRegistry();
+  registry.upsertTool({
+    name: "query_db",
+    description: "Query DB",
+    parameters: stringParamSchema(),
+    ptc: { enabled: true, readOnly: true, callers: [] },
+    async execute() {
+      return { content: [{ type: "text", text: "ok" }], details: undefined };
+    },
+  });
+
+  const settings = baseSettings({ trustedReadOnlyTools: ["query_db"] });
+  const callable = registry.getCallableTools(process.cwd(), settings);
+  assert.ok(!callable.some((tool) => tool.name === "query_db"));
+
+  const routable = registry.getAutoRoutableToolNames(process.cwd(), settings);
+  assert.ok(!routable.includes("query_db"));
+});
+
+const activityWrappedParams = () => ({
+  type: "object",
+  properties: {
+    value: { type: "string" },
+    activity: { type: "string", description: "Activity label" },
+  },
+  required: ["value"],
+});
+
+test("ToolRegistry keeps the clean custom-tool schema over pi's activity-wrapped copy", () => {
+  const piTools = [
+    {
+      name: "query_db",
+      description: "Query DB (activity-wrapped)",
+      parameters: activityWrappedParams(),
+    },
+  ];
+  const registry = createRegistry(() => piTools);
+  registry.upsertTool({
+    name: "query_db",
+    description: "Query DB",
+    parameters: stringParamSchema(),
+    ptc: { enabled: true, readOnly: true },
+    async execute() {
+      return { content: [{ type: "text", text: "ok" }], details: undefined };
+    },
+  });
+
+  const info = registry.getAllTools(process.cwd()).find((tool) => tool.name === "query_db");
+  assert.ok(info);
+  // The author's declared schema wins; the leaked `activity` kwarg must not appear.
+  assert.equal(info.description, "Query DB");
+  assert.ok(!("activity" in info.parameters.properties));
+});
+
+test("ToolRegistry only claims extension ownership in removeTool when a tool was removed", () => {
+  const registry = createRegistry();
+
+  assert.equal(registry.removeTool("bash"), false);
+  // A no-op removeTool must not permanently hide the builtin.
+  const names = registry.getAllTools(process.cwd()).map((tool) => tool.name);
+  assert.ok(names.includes("bash"));
+
+  registry.upsertTool({
+    name: "query_db",
+    description: "Query DB",
+    parameters: stringParamSchema(),
+    async execute() {
+      return { content: [{ type: "text", text: "ok" }], details: undefined };
+    },
+  });
+  assert.equal(registry.removeTool("query_db"), true);
+  assert.ok(!registry.getAllTools(process.cwd()).some((tool) => tool.name === "query_db"));
+});
+
+test("ToolRegistry denylist uses every currently registered PTC tool name", () => {
+  const { PTC_TOOL_NAMES } = require("../dist/tool-registry.js");
+  assert.deepEqual(PTC_TOOL_NAMES, [
+    "provision_kernel",
+    "exec_cell",
+    "list_kernels",
+    "inspect_kernel",
+    "provision_dependency",
+    "read_cell_output",
+  ]);
+
+  const registry = createRegistry();
+  for (const name of PTC_TOOL_NAMES) {
+    registry.upsertTool({
+      name,
+      description: name,
+      parameters: stringParamSchema(),
+      ptc: { enabled: true, readOnly: true, callers: ["direct", "code_execution"] },
+      async execute() {
+        return { content: [{ type: "text", text: "ok" }], details: undefined };
+      },
+    });
+  }
+
+  const settings = baseSettings({
+    allowMutations: true,
+    allowBash: true,
+    callableTools: [...PTC_TOOL_NAMES],
+  });
+  assert.deepEqual(registry.getCallableTools(process.cwd(), settings), []);
+  assert.deepEqual(registry.getAutoRoutableToolNames(process.cwd(), settings), []);
+});
+
 function baseSettings(overrides = {}) {
   return {
     executionTimeoutMs: 1000,
-    maxOutputChars: 1000,
+    outputPreviewChars: 1000,
+    maxSpoolChars: 10_000_000,
     allowMutations: false,
     allowBash: false,
     maxParallelToolCalls: 4,
-    useDocker: false,
-    allowUnsandboxedSubprocess: true,
     debugLogging: false,
     autoRoute: true,
     trustedReadOnlyTools: undefined,

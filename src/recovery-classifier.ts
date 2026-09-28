@@ -16,15 +16,21 @@ const KNOWN_ASYNC_HELPERS = [
 ] as const;
 
 const helperPattern = KNOWN_ASYNC_HELPERS.map((name) => escapeRegExp(name)).join("|");
-const helperCallPattern = new RegExp(`\\b(?:${helperPattern})\\s*\\(`);
+// (?<![.\w]) excludes attribute access (open(p).read(), f.find(x)) and word tails.
+const helperCallPattern = new RegExp(`(?<![.\\w])(?:${helperPattern})\\s*\\(`);
 const awaitedHelperCallPattern = new RegExp(`\\bawait\\s+(?:${helperPattern})\\s*\\(`);
 const iteratedHelperPatterns = [
-  new RegExp(`\\b(?:sorted|list|tuple|set)\\s*\\([^\\n]*\\b(?:${helperPattern})\\s*\\(`),
-  new RegExp(`\\bfor\\b[^\\n]*\\bin\\b[^\\n]*\\b(?:${helperPattern})\\s*\\(`),
-  new RegExp(`\\b(?:${helperPattern})\\s*\\([^\\n]*\\)\\s*\\[`),
-  new RegExp(`^[^#\\n=]+,\\s*[^#\\n=]+=\\s*(?:\\*\\s*)?(?:${helperPattern})\\s*\\(`),
+  new RegExp(`\\b(?:sorted|list|tuple|set)\\s*\\([^\\n]*(?<![.\\w])(?:${helperPattern})\\s*\\(`),
+  new RegExp(`\\bfor\\b[^\\n]*\\bin\\b[^\\n]*(?<![.\\w])(?:${helperPattern})\\s*\\(`),
+  new RegExp(`(?<![.\\w])(?:${helperPattern})\\s*\\([^\\n]*\\)\\s*\\[`),
+  new RegExp(`^[^#\\n=]+,\\s*[^#\\n=]+=\\s*(?:\\*\\s*)?(?<![.\\w])(?:${helperPattern})\\s*\\(`),
+  // Common iteration/aggregation wrappers: "\n".join(read(f)), sum/min/max(glob(p)), dict(zip(...)).
+  new RegExp(`\\b(?:sum|min|max|any|all|len|dict|zip|map|filter|enumerate)\\s*\\([^\\n]*(?<![.\\w])(?:${helperPattern})\\s*\\(`),
+  new RegExp(`\\bjoin\\s*\\([^\\n]*(?<![.\\w])(?:${helperPattern})\\s*\\(`),
 ] as const;
-const missingAwaitDiagnosticPattern = /\bcoroutine\b|was never awaited|\bawait\b/i;
+// Must require coroutine/never-awaited markers: a bare "await" in a traceback echo
+// or "SyntaxError: 'await' outside function" is not evidence of a missing await.
+const missingAwaitDiagnosticPattern = /\bcoroutine\b|was never awaited/i;
 const iteratedCoroutineDiagnosticPattern =
   /'coroutine' object is not iterable|'coroutine' object is not subscriptable|cannot unpack non-iterable coroutine object/i;
 
@@ -32,8 +38,38 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Quote-aware comment stripper: truncates at "#" only when it appears outside a
+// string literal, so evidence like f"#chunk-{read(path)}" is preserved.
 function stripComment(line: string): string {
-  return line.replace(/#.*$/, "").trim();
+  let result = "";
+  let quote: string | null = null;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quote !== null) {
+      result += ch;
+      if (ch === "\\") {
+        i += 1;
+        if (i < line.length) {
+          result += line[i];
+        }
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      result += ch;
+      continue;
+    }
+    if (ch === "#") {
+      break;
+    }
+    result += ch;
+  }
+  return result.trim();
 }
 
 function getEvidenceLines(traceback?: string, code?: string): string[] {

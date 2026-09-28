@@ -1,11 +1,12 @@
 export interface PtcSettings {
   executionTimeoutMs: number;
-  maxOutputChars: number;
+  /** Maximum text returned directly to the model before head/tail collapsing. */
+  outputPreviewChars: number;
+  /** Emergency per-cell capture ceiling; output below this is always persisted in full. */
+  maxSpoolChars: number;
   allowMutations: boolean;
   allowBash: boolean;
   maxParallelToolCalls: number;
-  useDocker: boolean;
-  allowUnsandboxedSubprocess: boolean;
   debugLogging: boolean;
   autoRoute: boolean;
   autoRecover?: boolean;
@@ -15,6 +16,8 @@ export interface PtcSettings {
   blockedTools?: string[];
   maxPythonSessions: number;
   scriptsDir?: string;
+  /** Reusable notebook library; env fallback is PTC_LIBRARY_DIR. */
+  libraryDir?: string;
   subagentsProfile?: string;
   subagentFooter: boolean;
 }

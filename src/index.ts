@@ -10,7 +10,7 @@ import type {
   Theme,
   ToolRenderResultOptions,
 } from "@mariozechner/pi-coding-agent";
-import { Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { Container, Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { PtcPythonError } from "./execution/execution-errors";
 import { CustomToolManager } from "./custom-tool-manager";
 import { buildCodeExecutionRecoveryPrompt, classifyCodeExecutionFailure } from "./recovery-classifier";
@@ -32,9 +32,12 @@ import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
 import type { SubagentRuntimeSnapshot } from "./contracts/execution-types";
 import {
+  collapseOutputPreview,
   debugLog,
   isMutationPrompt,
   loadSettingsFromEnv,
+  logWarning,
+  parseSectionedOutput,
   shouldAutoRoutePromptToCodeExecution,
   withActivityLabel,
 } from "./utils";
@@ -45,17 +48,23 @@ import {
   type CodeViewState,
 } from "./execution/code-view";
 import { relevantAgents, renderSubagentNotification, renderSubagentPanel } from "./execution/subagent-panel";
-import {
-  PythonSessionManager,
-  UnknownSessionError,
-  type PythonSessionManagerHooks,
-  type SessionSummary,
-} from "./python-session-manager";
+import { PythonSessionManager } from "./python-session-manager";
+import type {
+  PythonSessionManagerHooks,
+  SessionSummary,
+} from "./contracts/execution-types";
 
 // Running tally of cumulative PTC token savings, shared in-process on globalThis
 // so other extensions (e.g. the prompt status bar) can surface it without a cross-package import.
-const ptcTokensSaved = { tokensSaved: 0 };
-(globalThis as Record<string, unknown>).__ptcTokensSaved = ptcTokensSaved;
+const ptcGlobal = globalThis as Record<string, unknown>;
+const existingTokenTally = ptcGlobal.__ptcTokensSaved;
+const ptcTokensSaved =
+  typeof existingTokenTally === "object" &&
+  existingTokenTally !== null &&
+  typeof (existingTokenTally as { tokensSaved?: unknown }).tokensSaved === "number"
+    ? (existingTokenTally as { tokensSaved: number })
+    : { tokensSaved: 0 };
+ptcGlobal.__ptcTokensSaved = ptcTokensSaved;
 
 //
 // Minimal structural view of the render context the pi TUI passes as the fourth
@@ -133,6 +142,46 @@ function renderExecutingCode(
 }
 
 
+/** Full-width horizontal rule; the Component.render(width) contract supplies the edge. */
+class RuleComponent implements Component {
+  constructor(private readonly theme: Theme) {}
+
+  render(width: number): string[] {
+    return [this.theme.fg("muted", "─".repeat(Math.max(1, width)))];
+  }
+
+  invalidate(): void {}
+}
+
+/** Compact per-pool/stage rollup for finished workflow cells (display only). */
+function renderWorkflowRollup(details: ExecutionDetails | undefined, theme: Theme): Component | null {
+  const pools = (details?.subagentSnapshot?.pools ?? []).filter((pool) =>
+    (pool.stages ?? []).some((stage) => stage.submitted > 0)
+  );
+  if (pools.length === 0) return null;
+  let settled = 0;
+  let submitted = 0;
+  let failed = 0;
+  const stageLines: string[] = [];
+  for (const pool of pools) {
+    for (const stage of pool.stages ?? []) {
+      if (stage.submitted === 0) continue;
+      settled += stage.settled;
+      submitted += stage.submitted;
+      failed += stage.failed;
+      stageLines.push(theme.fg("muted", `  ${stage.name}: ${stage.settled}/${stage.submitted} settled`));
+    }
+  }
+  if (submitted === 0) return null;
+  const glyph = failed > 0 ? "!" : settled >= submitted ? "✓" : "●";
+  const color = failed > 0 ? "warning" : "success";
+  const lines = [
+    `${theme.fg("muted", "[workflow]")} ${theme.fg(color, `${glyph} ${settled}/${submitted} done`)}`,
+    ...stageLines,
+  ];
+  return new Text(lines.join("\n"), 0, 0);
+}
+
 function renderCompletedOutput(
   resultText: string,
   details: ExecutionDetails | undefined,
@@ -142,7 +191,9 @@ function renderCompletedOutput(
     return new Text(resultText || "(No output)", 0, 0);
   }
 
-  const durationSec = (details.durationMs / 1000).toFixed(1).replace(/\.0$/, "");
+  const durationStr = typeof details.durationMs === "number"
+    ? ` • ${(details.durationMs / 1000).toFixed(1).replace(/\.0$/, "")}s`
+    : "";
   const avoidTok = details.estimatedAvoidedTokens > 0
     ? ` • ~${details.estimatedAvoidedTokens.toLocaleString()} tokens saved`
     : "";
@@ -158,23 +209,57 @@ function renderCompletedOutput(
 
   const header = theme.fg(
     "muted",
-    `[PTC] ${nestedStr}${avoidTok} • ${durationSec}s`
+    `[PTC] ${nestedStr}${avoidTok}${durationStr}`
   ) + imgStr + sessionStr;
 
-  const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
-  const subagentBlock = subagentLines.length > 0 ? `\n${subagentLines.join("\n")}\n` : "";
-
-  const rawBody = resultText || "(No output)";
-  const bodyLines = rawBody.split("\n");
-  const maxDisplayLines = 25;
-  let displayedBody = rawBody;
-
-  if (bodyLines.length > maxDisplayLines) {
-    displayedBody = bodyLines.slice(0, maxDisplayLines).join("\n") +
-      `\n${theme.fg("muted", `... (${bodyLines.length - maxDisplayLines} more lines omitted in view)`)}`;
+  const sections = details.sectioned ? parseSectionedOutput(resultText) : null;
+  if (!sections) {
+    // Legacy blob (stale runtime) or error text: render verbatim.
+    const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
+    const subagentBlock = subagentLines.length > 0 ? `\n${subagentLines.join("\n")}\n` : "";
+    const rawBody = resultText || "(No output)";
+    const bodyLines = rawBody.split("\n");
+    const maxDisplayLines = 25;
+    let displayedBody = rawBody;
+    if (bodyLines.length > maxDisplayLines) {
+      displayedBody = bodyLines.slice(0, maxDisplayLines).join("\n") +
+        `\n${theme.fg("muted", `... (${bodyLines.length - maxDisplayLines} more lines omitted in view)`)}`;
+    }
+    return new Text(`${header}${subagentBlock}\n${displayedBody}`, 0, 0);
   }
 
-  return new Text(`${header}${subagentBlock}\n${displayedBody}`, 0, 0);
+  // Sectioned result: rule-separated blocks (rules run to the right edge, like
+  // edit/write chrome), workflow rollup + live panel between return and kernel.
+  const container = new Container();
+  container.addChild(new Text(header, 0, 0));
+  const addRule = () => container.addChild(new RuleComponent(theme));
+  const addSection = (body: string) => container.addChild(new Text(body || "(empty)", 0, 0));
+
+  const kernel = sections.find((s) => s.name === "kernel");
+  for (const section of sections) {
+    if (section === kernel) continue;
+    addRule();
+    addSection(section.body);
+  }
+  const rollup = renderWorkflowRollup(details, theme);
+  if (rollup) {
+    addRule();
+    container.addChild(rollup);
+  }
+  const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
+  if (subagentLines.length > 0) {
+    addRule();
+    container.addChild(new Text(subagentLines.join("\n"), 0, 0));
+  }
+  if (kernel) {
+    addRule();
+    addSection(kernel.body);
+  }
+  if (container.children.length === 1) {
+    // Header with no sections at all (shouldn't happen, but never render a bare header).
+    container.addChild(new Text("(No output)", 0, 0));
+  }
+  return container;
 }
 
 function getExtensionRoot(): string {
@@ -205,48 +290,44 @@ function buildRecoveryContextMessage(content: string) {
 // Tool descriptions
 // ============================================================================
 
-function buildToolDescription(currentSettings: PtcSettings, callableTools: ToolInfo[]): string {
+function buildToolDescription(callableTools: ToolInfo[]): string {
   const callableHelperLines = describePythonHelpers(callableTools);
-  const callable = callableTools.map((tool) => tool.ptc?.pythonName || tool.name).join(", ");
-  const dockerBehavior = currentSettings.useDocker
-    ? "- Docker isolation is required for this session; if Docker is unavailable, execution fails instead of falling back to subprocess."
-    : "- Local subprocess mode is active because PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true. Nested tool policy still applies, but Python itself is not isolated by Docker in this mode.";
+  const callable = callableTools.map((tool) => tool.ptc?.pythonName || tool.name).join(", ") || "(none)";
+  const helperList = callableHelperLines.length > 0
+    ? `- ${callableHelperLines.join("\n- ")}`
+    : "- No host-tool helpers are currently enabled.";
 
-  return `Persistent Python sessions with local programmatic tool calling.
+  return `Host tools callable from Python in this kernel: ${callable}
 
-Workflow:
-1. provision_kernel — start a persistent Jupyter-like kernel bound to a notebook file (.ipynb). Throwaway scratch work still gets a notebook: pass a /tmp path.
-2. exec_cell — run cells in that kernel. It behaves exactly like a Jupyter kernel: imports, variables, functions, and classes carry over to later cells and later turns, so import each module once and build on it. The last bare expression of a cell echoes automatically. Every executed cell is appended to the notebook file on disk.
-3. inspect_kernel — see what the namespace already has; provision_dependency — install a missing package.
-4. when a workflow's subagents are done, close the pool with pool.close() so no tmux windows pile up — the echoed summary is the workflow report.
-
-Prefer exec_cell for repo-wide analysis, repeated lookups, loops, grouping, ranking, counting, filtering, or any task with 3+ dependent tool calls. Use direct tools for one-file reads, one-off grep/find calls, or tiny lookups.
-
-exec_cell runs synchronously and streams progress — including a live viewer of any pi_subagents fan-out the cell runs (agent status rows render under the code view while it executes). Prefer orchestrating an entire fan-out inside one cell: submit to pools, consume with pool.pop, close the pool, return the summary. For orchestrated workflow policy (approval, autonomy), see the pi-subagents skill.
-
-Subagents: the autoimported pi_subagents module spawns real pi instances in tmux windows (AgentHandle / AgentSession). Ask it what is available before naming a model — subagents.capabilities(), subagents.best_model_match("astra").slug, subagents.thinking_levels() — then pass model=/thinking= to subagents.agent().
-
-Important rules:
-- Top-level await is already available. Do not call asyncio.run(...).
-- Definitions persist across chunks: import once, define reusable functions once.
-- A chunk's output should be compact; large intermediates stay in the session.
-- Keep code in cells: the notebook on disk is the durable, re-runnable record — don't create .py files unless the user asks.
-
-Callable tool set for this session: ${callable}
-
-Python helpers currently available in this session:
-- ${callableHelperLines.join("\n- ")}
+Available Python helpers:
+${helperList}
 - ptc.gather_limit(coros, limit=...) -> list
 - ptc.read_many(paths, max_concurrency=None) -> list[str]
 - ptc.read_tree(pattern, path='.', ...) -> list[dict]
 - ptc.find_files / ptc.find_files_abs / ptc.read_text / ptc.json_dump
 - np / pd / plt lazy imports (matplotlib figures are captured automatically)
-${dockerBehavior}`;
+
+Python runs as a local subprocess. Nested host-tool policy still applies.`;
+}
+
+function currentToolDescription(
+  toolRegistry: ToolRegistry,
+  settings: PtcSettings,
+  sessionState: PtcSessionState
+): string {
+  try {
+    return buildToolDescription(toolRegistry.getCallableTools(sessionState.currentCwd, settings));
+  } catch (error) {
+    logWarning(`Unable to build the dynamic PTC tool description: ${error instanceof Error ? error.message : String(error)}`);
+    return buildToolDescription([]);
+  }
 }
 
 const PROVISION_DESCRIPTION = `Start a persistent Jupyter-like Python kernel and return its session id. The kernel requires a notebook file path (.ipynb): every executed cell is appended to it with its outputs, so the notebook on disk is always a live record of the session — read it any time.
 
-- notebook (required): path to the .ipynb file (created if missing). Relative paths resolve against the cwd. For throwaway/scratch work, just pass a /tmp path (e.g. /tmp/scratch.ipynb) — throwaway kernels work exactly like durable ones.
+- notebook (required): path to the destination .ipynb file (created if missing). Relative paths resolve against the cwd. For throwaway/scratch work, pass a /tmp path.
+- source (optional): a .ipynb or .py workflow to execute while provisioning. A notebook is copied to the destination first, including interleaved markdown, then its code cells run in order and record fresh outputs. A .py file becomes one virtual prefix cell. Bare names resolve from the PTC notebook library. The source is never modified.
+- Prefix numbering includes every sourced notebook cell, including markdown: for 7 source cells, the first new exec_cell is cell 8. A sourcing error is recorded on the failed cell and leaves the kernel usable.
 - The kernel works like a Jupyter kernel: imports, variables, functions, and classes persist between cells and between conversation turns. Do NOT re-import or redefine; build on what is there.
 - inspect_kernel shows what the namespace already has; provision_dependency installs a missing package into the kernel's environment.
 
@@ -255,13 +336,22 @@ The kernel stays alive until the conversation ends or /ptc kill, so reuse one ke
 const EXEC_CELL_DESCRIPTION = `Execute a cell in a persistent Jupyter-like kernel (session_id from provision_kernel).
 
 - State persists: imports, variables, functions, and classes from earlier cells are still there — never re-import, never redefine; write each cell as the continuation of the live namespace.
-- The last bare expression of a cell is echoed automatically (Out[n] semantics) — no print/return needed to see a value. Every result also ends with a [kernel] footer summarizing the namespace (cell count, defs, and what this cell added or changed).
+- The last bare expression of a cell is echoed automatically (Out[n] semantics) — no print/return needed to see a value.
+- Results are sectioned by the host so provenance is structural: 'output:' (everything the cell printed), 'return (Out[n]):' (the echoed value), 'kernel:' (namespace summary), 'subagents:' (pool progress, when pools exist). Section markers sit at column 0; everything indented under a marker was produced by the cell — a cell that prints "kernel:" stays inside its section and cannot impersonate one.
 - Top-level await works; do not call asyncio.run(...). Errors never kill the kernel — fix and retry in the same namespace.
+- Large results are shown as a head/tail preview. Use read_cell_output(cellIdx, offset?, limit?) to page through the full notebook-persisted output without re-running the cell.
 - file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; tracebacks map to the real file). Prefer cells: the notebook on disk is already the durable record.
 - IPython magics (%timeit, !pip, ...) do not exist here — cells starting with % or ! are rejected before execution with the native equivalent.
 - confirm (optional): set true to ask the user for approval before running. The popup shows the full cell body in a Shiki-syntax-highlighted, scrollable viewport (PgUp/PgDn to scroll). Run most cells immediately; set confirm=true for destructive work. Never set it when the user said "run autonomously" or "don't prompt me". Approval/autonomy policy for orchestrated workflows: see the pi-subagents skill.
 
 Cells run synchronously and stream progress, including a live viewer of any pi_subagents fan-out. End subagent workflows with pool.close() — its echoed summary is the report.`;
+
+const PROMOTE_DESCRIPTION = `Promote a polished notebook into the reusable PTC workflow library.
+
+- name (required): safe library name; it is normalized to a lowercase hyphenated filename.
+- notebookPath (optional): source .ipynb; defaults to the most recently used session notebook.
+- overwrite (optional): false by default. Existing library notebooks are never replaced unless explicitly true.
+- The notebook is copied intact, preserving interleaved markdown, code cells, and outputs. Prefer this over legacy script export after a successful nontrivial workflow.`;
 
 const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into the kernel environment shared by all kernels (uv-backed, fast).
 
@@ -287,7 +377,7 @@ function listKernelsTool(sessionManager: PythonSessionManager): PtcToolDefinitio
         };
       }
       const lines = kernels.map((kernel) => {
-        const state = kernel.running ? "executing" : kernel.hasPendingBackground ? "background pending" : "idle";
+        const state = kernel.running ? "executing" : "idle";
         const notebook = kernel.notebookPath ? ` · ${kernel.notebookPath}` : "";
         return `${kernel.id} · ${state} · ${kernel.chunks} cell${kernel.chunks === 1 ? "" : "s"}${notebook}`;
       });
@@ -299,12 +389,91 @@ function listKernelsTool(sessionManager: PythonSessionManager): PtcToolDefinitio
   });
 }
 
-function inspectKernelTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+function readCellOutputTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+  return withActivityLabel({
+    name: "read_cell_output",
+    label: "read output",
+    description:
+      "Read the full durable output of a cell from the most recently used kernel's notebook. " +
+      "Cell numbers are 1-based and match Out[n], exec_cell previews, and inspect_kernel's cell count. " +
+      "Use offset/limit to continue through large output, like the native read tool.",
+    parameters: Type.Object({
+      cellIdx: Type.Integer({ minimum: 1, description: "1-based notebook cell/execution number." }),
+      offset: Type.Optional(Type.Integer({ minimum: 1, description: "1-based output line to start reading." })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of output lines to return." })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const { cellIdx, offset, limit } = params as { cellIdx: number; offset?: number; limit?: number };
+      try {
+        const result = await sessionManager.readCellOutput(cellIdx, { offset, limit });
+        return {
+          content: [{ type: "text", text: result.text }],
+          details: result,
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `read_cell_output failed: ${error instanceof Error ? error.message : String(error)}` }],
+          details: { cellIdx },
+        };
+      }
+    },
+  });
+}
+
+function promoteToSkillNotebookTool(sessionManager: PythonSessionManager): PtcToolDefinition {
+  return withActivityLabel({
+    name: "promote_to_skill_notebook",
+    label: "promote notebook",
+    description: PROMOTE_DESCRIPTION,
+    parameters: Type.Object({
+      name: Type.String({ description: "Library notebook name; sanitized to a safe lowercase hyphenated filename." }),
+      notebookPath: Type.Optional(
+        Type.String({ description: "Notebook to copy; defaults to the most recently used session notebook." })
+      ),
+      overwrite: Type.Optional(
+        Type.Boolean({ description: "Replace an existing library notebook with the same sanitized name. Default false." })
+      ),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const { name, notebookPath, overwrite } = params as {
+        name: string;
+        notebookPath?: string;
+        overwrite?: boolean;
+      };
+      try {
+        const result = await sessionManager.promoteToSkillNotebook({
+          name,
+          notebookPath,
+          overwrite,
+          cwd: ctx.cwd,
+        });
+        return {
+          content: [{
+            type: "text",
+            text: `Promoted ${result.notebookPath} to library notebook ${result.name} at ${result.path}.`,
+          }],
+          details: result,
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: `promote_to_skill_notebook failed: ${error instanceof Error ? error.message : String(error)}`,
+          }],
+          details: { name, notebookPath: notebookPath ?? null },
+        };
+      }
+    },
+  });
+}
+
+function inspectKernelTool(sessionManager: PythonSessionManager, toolDescription: string): PtcToolDefinition {
   return withActivityLabel({
     name: "inspect_kernel",
     label: "python",
     description:
-      "Inspect what a kernel's namespace already has: imported modules, defined functions and classes, variables with type previews, and the cell count. Use it before writing a cell so you reuse what is there instead of re-importing or redefining.",
+      "Inspect what a kernel's namespace already has: imported modules, defined functions and classes, variables with type previews, and the cell count. Use it before writing a cell so you reuse what is there instead of re-importing or redefining.\n\n" +
+      toolDescription,
     parameters: Type.Object({
       session_id: Type.Optional(
         Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
@@ -411,12 +580,9 @@ interface PtcSessionState {
   pendingRecoveryPrompt: string | null;
   recoveryAllowed: boolean;
   recoveryState: PtcRecoveryState | null;
-  /** /ptc background target: tool call id of the blocking exec in flight. */
-  activeForegroundToolCallId: string | null;
-  activeForegroundSessionId: string | null;
+  /** Foreground calls may run in parallel across kernels; retain every target. */
+  activeForegroundExecutions: Map<string, string>;
   lastSubagentSnapshot: SubagentRuntimeSnapshot | null;
-  /** Set by /ptc background; observed by the in-flight python_exec. */
-  requestedBackground: string | null;
   /** Last tool execution context, for footer updates outside tool executes. */
   lastCtx: ExtensionContext | null;
 }
@@ -453,6 +619,9 @@ function applyAutoRouting(
   if (!nextActiveTools.includes("provision_kernel")) {
     nextActiveTools.push("provision_kernel");
   }
+  if (!nextActiveTools.includes("read_cell_output")) {
+    nextActiveTools.push("read_cell_output");
+  }
 
   if (!areToolListsEqual(activeTools, nextActiveTools)) {
     sessionState.activeToolsBeforeRouting = activeTools;
@@ -480,16 +649,16 @@ function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessi
 }
 
 // Shiki syntax highlighting for the cell-approval preview. Shiki is ESM-only
-// while this package compiles to CJS, so it is loaded through a native dynamic
-// import (works under jiti and plain Node alike) with a graceful fallback to
-// unhighlighted text if the load or highlighting fails.
+// while this package is loaded as TypeScript through jiti; jiti's transformed
+// dynamic import resolves bare specifiers from this package's node_modules and
+// shims the ESM interop (a raw `new Function("m", "return import(m)")` does NOT
+// work under jiti: the VM context has no dynamic import callback). Falls back
+// to unhighlighted text if the load or highlighting fails.
 interface ShikiToken {
   content: string;
   color?: string;
   fontStyle?: number;
 }
-
-const nativeImport = new Function("m", "return import(m)") as (m: string) => Promise<any>;
 
 function hexToAnsiFg(hex: string): string | null {
   const match = /^#([0-9a-fA-F]{6})$/.exec(hex.trim());
@@ -512,9 +681,12 @@ let highlighterPromise: Promise<any> | null = null;
 function getHighlighter(): Promise<any> | null {
   if (!highlighterPromise) {
     const themeName = process.env.PTC_CODE_THEME || "github-dark";
-    highlighterPromise = nativeImport("shiki")
+    highlighterPromise = import("shiki")
       .then((shiki: any) => shiki.createHighlighter({ themes: [themeName], langs: ["python"] }))
       .catch((error: unknown) => {
+        // A transient module/theme failure should not disable highlighting for
+        // the rest of the process lifetime; allow the next request to retry.
+        highlighterPromise = null;
         debugLog(`shiki unavailable, approval preview falls back to plain text: ${error instanceof Error ? error.message : String(error)}`);
         return null;
       });
@@ -569,24 +741,64 @@ function execFilePtc(
   options: { timeoutMs?: number; signal?: AbortSignal }
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(
+    if (options.signal?.aborted) {
+      reject(new Error(`provision_dependency aborted: ${String(options.signal.reason ?? "request cancelled")}`));
+      return;
+    }
+
+    let aborted = false;
+    let child: ReturnType<typeof execFile> | undefined;
+    const onAbort = () => {
+      aborted = true;
+      child?.kill("SIGTERM");
+    };
+    child = execFile(
       command,
       args,
       { timeout: options.timeoutMs, killSignal: "SIGTERM", maxBuffer: 4 * 1024 * 1024 },
       (error, stdout, stderr) => {
-        if (options.signal?.aborted) {
-          reject(new Error("provision_dependency aborted"));
+        options.signal?.removeEventListener("abort", onAbort);
+        const stdoutText = String(stdout);
+        const stderrText = String(stderr);
+        const output = [stderrText.trim(), stdoutText.trim()].filter(Boolean).join("\n");
+
+        // The signal wins races with an exit callback: an aborted install must
+        // never be reported as a successful/already-satisfied install.
+        if (aborted || options.signal?.aborted) {
+          reject(new Error(`provision_dependency aborted: ${String(options.signal?.reason ?? "request cancelled")}`));
           return;
         }
-        if (error && typeof (error as { code?: unknown }).code === "undefined") {
-          reject(error);
+        if (!error) {
+          resolve({ stdout: stdoutText, stderr: stderrText });
           return;
         }
-        // uv exits non-zero for resolution failures; surface stdout/stderr and
-        // let the caller decide from the output text.
-        resolve({ stdout: String(stdout), stderr: String(stderr) });
+
+        const failure = error as typeof error & {
+          code?: string | number | null;
+          killed?: boolean;
+          signal?: NodeJS.Signals | null;
+        };
+        if (failure.code === "ENOENT") {
+          reject(new Error(`Unable to run ${command}: executable not found (ENOENT). Install ${command} and ensure it is on PATH.`));
+          return;
+        }
+        if (failure.killed || failure.signal || failure.code === null) {
+          const timeout = options.timeoutMs === undefined
+            ? "the process was terminated"
+            : `it timed out after ${Math.round(options.timeoutMs / 1000)} seconds`;
+          reject(new Error(`${command} failed because ${timeout}${output ? `:\n${output}` : "."}`));
+          return;
+        }
+
+        const exit = failure.code === undefined ? "" : ` (exit ${String(failure.code)})`;
+        reject(new Error(`${command} failed${exit}: ${output || failure.message}`));
       }
     );
+
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) {
+      onAbort();
+    }
   });
 }
 
@@ -701,7 +913,7 @@ async function requestCellApproval(
           lines.push(theme.fg("muted", "Why reject? (Enter to submit)"));
           lines.push(...editor.getLines());
         }
-        lines.push(theme.fg("dim", "↑/↓ select · PgUp/PgDn scroll · Home/End top/bottom · Enter confirm · y approve · n reject · Esc reject"));
+        lines.push(theme.fg("dim", "↑/↓ select · wheel/PgUp/PgDn scroll · Home/End top/bottom · Enter confirm · y approve · n reject · Esc reject"));
         return lines;
       }
 
@@ -767,8 +979,24 @@ async function requestCellApproval(
         }
       }
 
+      /**
+       * Wheel scrolling: pi-tui's alt-screen renderer dispatches wheel events
+       * as normalized mouse events to the component under the pointer before
+       * falling back to chat scrolling. Consuming them here scrolls the code
+       * viewport; wheelDelta is negative when scrolling up.
+       */
+      function handleMouse(event: { type?: string; wheelDelta?: number }): { handled: boolean } | undefined {
+        if (event.type !== "wheel") return undefined;
+        const delta = event.wheelDelta ?? 0;
+        if (delta !== 0) {
+          rowOffset += delta; // render() clamps to the valid range
+          refresh();
+        }
+        return { handled: true };
+      }
+
       void visibleWidth;
-      return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
+      return { render, invalidate: () => { cachedLines = undefined; }, handleInput, handleMouse };
     });
   } catch (error) {
     // A broken dialog must not run the cell unasked.
@@ -782,7 +1010,6 @@ async function requestCellApproval(
 
 
 function provisionKernelTool(
-  pi: ExtensionAPI,
   sessionManager: PythonSessionManager,
   sessionState: PtcSessionState
 ): PtcToolDefinition {
@@ -793,11 +1020,17 @@ function provisionKernelTool(
     parameters: Type.Object({
       notebook: Type.String({
         description:
-          "Path to the .ipynb notebook file bound to this kernel (created if missing; .ipynb appended when omitted). Every executed cell is appended to it live. For throwaway scratch work pass a /tmp path.",
+          "Path to the destination .ipynb notebook bound to this kernel (created if missing; .ipynb appended when omitted). Every executed cell is recorded in it live.",
       }),
+      source: Type.Optional(
+        Type.String({
+          description:
+            "Optional .ipynb or .py library workflow to copy/execute at provision time. Bare names resolve from the PTC library directory.",
+        })
+      ),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { notebook } = params as { notebook?: string };
+      const { notebook, source } = params as { notebook?: string; source?: string };
       if (!notebook || !notebook.trim()) {
         return {
           content: [{ type: "text", text: "provision_kernel requires a notebook path (.ipynb). For scratch work use a /tmp path." }],
@@ -808,22 +1041,31 @@ function provisionKernelTool(
       const notebookPath = resolved.endsWith(".ipynb") ? resolved : `${resolved}.ipynb`;
 
       try {
-        const { id, scriptError } = await sessionManager.provision({
+        const { id, sourcedFrom, sourceError, scriptError } = await sessionManager.provision({
           cwd: ctx.cwd,
           ctx,
           signal,
           onUpdate,
           parentToolCallId: toolCallId,
           notebookPath,
+          source,
         });
 
         const lines = [
           `Provisioned kernel ${id} — notebook ${notebookPath}.`,
+          sourcedFrom ? `Sourced from ${sourcedFrom}.` : "",
           `Run cells with exec_cell (session_id: ${id}); every cell is appended to the notebook.`,
-        ];
-        if (scriptError) {
+        ].filter(Boolean);
+        if (sourceError) {
           lines.push(
-            `The seeding script failed (the kernel is still usable):`,
+            `Sourcing failed in prefix cell ${sourceError.cellIdx} (the failed cell is recorded and the kernel is still usable):`,
+            sourceError.message,
+            ...(sourceError.traceback ? [sourceError.traceback] : []),
+            `Inspect the error with exec_cell in kernel ${id} and repair as needed.`
+          );
+        } else if (scriptError) {
+          lines.push(
+            `The legacy seeding script failed (the kernel is still usable):`,
             scriptError.message,
             ...(scriptError.traceback ? [scriptError.traceback] : []),
             `Inspect the error with exec_cell in kernel ${id} and repair as needed.`
@@ -834,12 +1076,14 @@ function provisionKernelTool(
           details: {
             sessionId: id,
             notebookPath,
+            sourcedFrom,
+            sourceError,
             scriptError: scriptError ? scriptError.message : undefined,
             nestedToolCalls: 0,
             nestedToolNames: [],
             nestedResultChars: 0,
             nestedResultCount: 0,
-            nestedErrors: scriptError ? 1 : 0,
+            nestedErrors: sourceError || scriptError ? 1 : 0,
             durationMs: 0,
             estimatedAvoidedTokens: 0,
           },
@@ -852,7 +1096,7 @@ function provisionKernelTool(
       }
     },
     renderResult(result: AgentToolResult<unknown>, { isPartial }: ToolRenderResultOptions, theme: Theme) {
-      const details = result.details as { sessionId?: string; notebookPath?: string; scriptError?: string } | undefined;
+      const details = result.details as { sessionId?: string; notebookPath?: string; sourcedFrom?: string; scriptError?: string } | undefined;
       if (isPartial) {
         return new Text(theme.fg("muted", "Provisioning kernel..."), 0, 0);
       }
@@ -868,12 +1112,13 @@ function execCellTool(
   pi: ExtensionAPI,
   sessionManager: PythonSessionManager,
   settings: PtcSettings,
-  sessionState: PtcSessionState
+  sessionState: PtcSessionState,
+  toolDescription: string
 ): PtcToolDefinition {
   return withActivityLabel({
     name: "exec_cell",
     label: "python",
-    description: EXEC_CELL_DESCRIPTION,
+    description: `${EXEC_CELL_DESCRIPTION}\n\n${toolDescription}`,
     parameters: Type.Object({
       session_id: Type.String({ description: "Session id from provision_kernel." }),
       code: Type.Optional(
@@ -915,10 +1160,23 @@ function execCellTool(
             };
           }
           const recoveryState = getRequestRecoveryState(sessionState);
+          let cellCode = code;
+          let resolvedCellFile: string | undefined;
+          if (cellFile) {
+            resolvedCellFile = path.isAbsolute(cellFile) ? cellFile : path.resolve(ctx.cwd, cellFile);
+            try {
+              cellCode = await fs.promises.readFile(resolvedCellFile, "utf8");
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              return {
+                content: [{ type: "text", text: `exec_cell could not read ${resolvedCellFile}: ${message}` }],
+                details: { sessionId, sourcePath: resolvedCellFile },
+              };
+            }
+          }
 
           if (needsConfirmation) {
-            const previewCode = code ?? `exec_cell(file: ${cellFile})`;
-            const decision = await requestCellApproval(ctx, sessionId, previewCode);
+            const decision = await requestCellApproval(ctx, sessionId, cellCode as string);
             if (decision.action === "reject") {
               return {
                 content: [{
@@ -931,19 +1189,26 @@ function execCellTool(
               };
             }
           }
-    
+
           // background/wait_for modes are WIP (deferred): synchronous runs make the
           // live subagent viewer straightforward. The manager keeps the machinery
           // for when it returns.
-    
+
           // Foreground exec with the recovery flow from the legacy code_execution tool.
       noteCodeExecutionAttempt(recoveryState);
       sessionState.lastCtx = ctx;
 
       try {
-        const execOptions = { cwd: ctx.cwd, ctx, signal, onUpdate, parentToolCallId: toolCallId, file: cellFile };
-        sessionState.activeForegroundToolCallId = toolCallId;
-        sessionState.activeForegroundSessionId = sessionId;
+        const execOptions = {
+          cwd: ctx.cwd,
+          ctx,
+          signal,
+          onUpdate,
+          parentToolCallId: toolCallId,
+          file: resolvedCellFile,
+        };
+        sessionState.activeForegroundExecutions.set(toolCallId, sessionId);
+        sessionState.lastSubagentSnapshot = null;
 
         // Keep the viewer animating during pure awaits: subagent state frames
         // only arrive on registry mutations, so a 120ms repaint ticker merges
@@ -956,7 +1221,7 @@ function execCellTool(
         };
         const repaint = setInterval(() => {
           if (!lastUpdate || !onUpdate) return;
-          const snapshot = sessionState.lastSubagentSnapshot ?? lastUpdate.details.subagentSnapshot;
+          const snapshot = lastUpdate.details.subagentSnapshot ?? sessionState.lastSubagentSnapshot ?? undefined;
           onUpdate?.({
             content: lastUpdate.content,
             details: { ...lastUpdate.details, subagentSnapshot: snapshot } as ExecutionDetails,
@@ -964,8 +1229,7 @@ function execCellTool(
         }, 120);
         repaint.unref?.();
 
-        const cellCode = code ?? "(exec_cell file mode)\n";
-        const execPromise = sessionManager.execForeground(sessionId, cellCode, {
+        const execPromise = sessionManager.execForeground(sessionId, cellCode as string, {
           ...execOptions,
           onUpdate: streamingOnUpdate,
         });
@@ -982,7 +1246,9 @@ function execCellTool(
         // Persist the subagent fan as a transcript notification: finished tool
         // results collapse into grouped one-line rows, so a workflow would
         // otherwise vanish the moment the chunk returns.
-        const notification = renderSubagentNotification(result.details.subagentSnapshot, result.details.execId);
+        const notification = result.details.subagentSnapshot
+          ? renderSubagentNotification(result.details.subagentSnapshot, ctx.ui.theme, result.details.execId)
+          : null;
         if (notification) {
           try {
             pi.sendMessage({ customType: "subagent-notification", content: notification, display: true }, { triggerTurn: false });
@@ -990,8 +1256,15 @@ function execCellTool(
             // never break the tool over transcript plumbing
           }
         }
+        const reportedCellIdx = result.details.cellIdx;
+        const compatibilityCellIdx = sessionManager.list().find((kernel) => kernel.id === sessionId)?.chunks ?? 1;
+        const visibleOutput = collapseOutputPreview(
+          result.output,
+          settings.outputPreviewChars,
+          reportedCellIdx ?? compatibilityCellIdx
+        );
         const content: Array<{ type: "text"; text: string } | { type: "image"; mimeType: string; data: string }> = [
-          { type: "text", text: result.output || "(No output)" },
+          { type: "text", text: visibleOutput || "(No output)" },
         ];
         if (result.images && result.images.length > 0) {
           for (const img of result.images) {
@@ -1015,11 +1288,10 @@ function execCellTool(
             sessionState.pendingRecoveryPrompt = buildCodeExecutionRecoveryPrompt(failureClass);
           }
         }
-        noteCodeExecutionFailure(recoveryState);
+        noteCodeExecutionFailure(recoveryState, error);
         throw error;
       } finally {
-        sessionState.activeForegroundToolCallId = null;
-        sessionState.activeForegroundSessionId = null;
+        sessionState.activeForegroundExecutions.delete(toolCallId);
       }
     },
     renderResult(
@@ -1063,15 +1335,6 @@ function execCellTool(
   });
 }
 
-function describeSessionError(error: unknown, sessionManager: PythonSessionManager): string {
-  if (error instanceof UnknownSessionError) {
-    const summaries = sessionManager.list();
-    const sessionLines = summaries.map((s) => `  - ${s.id} (${s.chunks} cells${s.hasPendingBackground ? ", pending background" : ""})`);
-    return `${error.message}${sessionLines.length ? `\nLive sessions:\n${sessionLines.join("\n")}` : ""}`;
-  }
-  return error instanceof Error ? error.message : String(error);
-}
-
 // ============================================================================
 // /ptc command
 // ============================================================================
@@ -1085,16 +1348,18 @@ function resolveTargetSession(
     const found = sessionManager.list().find((s) => s.id === requested);
     return found ?? { error: `Unknown python session ${requested}. Live: ${sessionManager.list().map((s) => s.id).join(", ") || "(none)"}` };
   }
+  const sessions = sessionManager.list();
+  const activeSessionIds = Array.from(sessionState.activeForegroundExecutions.values()).reverse();
   const target =
-    (sessionState.activeForegroundSessionId ? sessionManager.list().find((s) => s.id === sessionState.activeForegroundSessionId) : undefined) ??
+    activeSessionIds.map((id) => sessions.find((session) => session.id === id)).find(Boolean) ??
     sessionManager.mostRecentActive() ??
-    sessionManager.list()[0];
-  return target ?? { error: "No python sessions. Provision one with provision_python_session first." };
+    sessions[0];
+  return target ?? { error: "No python sessions. Provision one with provision_kernel first." };
 }
 
 function registerPtcCommand(pi: ExtensionAPI, sessionManager: PythonSessionManager, sessionState: PtcSessionState): void {
   pi.registerCommand("ptc", {
-    description: "Control PTC python sessions: /ptc <interrupt|kill> [session_id] (background/foreground are WIP)",
+    description: "Control PTC Python kernels: /ptc <interrupt|kill> [session_id]",
     handler: async (args: string | undefined, ctx: ExtensionCommandContext) => {
       const [actionRaw, requestedId] = (args ?? "").trim().split(/\s+/);
       const action = (actionRaw ?? "").toLowerCase();
@@ -1211,7 +1476,7 @@ function updateSubagentFooter(
     return;
   }
   const running = relevant.filter((a) => a.status === "running" || a.status === "starting").length;
-  const settled = relevant.filter((a) => a.status === "settled").length;
+  const settled = relevant.filter((a) => a.status === "settled" || a.status === "closed").length;
   const bits: string[] = [];
   if (running) bits.push(`● ${running} running`);
   if (settled) bits.push(`✓ ${settled} done`);
@@ -1239,10 +1504,13 @@ async function handleSessionStart(
     sessionState.customToolsStarted = true;
   }
 
-  pi.registerTool(provisionKernelTool(pi, sessionManager, sessionState));
-  pi.registerTool(execCellTool(pi, sessionManager, settings, sessionState));
+  const toolDescription = currentToolDescription(toolRegistry, settings, sessionState);
+  pi.registerTool(provisionKernelTool(sessionManager, sessionState));
+  pi.registerTool(execCellTool(pi, sessionManager, settings, sessionState, toolDescription));
   pi.registerTool(listKernelsTool(sessionManager));
-  pi.registerTool(inspectKernelTool(sessionManager));
+  pi.registerTool(readCellOutputTool(sessionManager));
+  pi.registerTool(promoteToSkillNotebookTool(sessionManager));
+  pi.registerTool(inspectKernelTool(sessionManager, toolDescription));
   pi.registerTool(provisionDependencyTool(sessionManager, sandboxManager));
 }
 
@@ -1267,7 +1535,7 @@ function handleBeforeAgentStart(
   if (Number.isFinite(depth) && depth > 0) {
     const depthNote =
       `You are a pi subagent at nesting depth ${depth}. Subagent spawning is unavailable: ` +
-      "`import pi_subagents` raises NotImplementedError in this environment. `python_exec` " +
+      "`import pi_subagents` raises NotImplementedError in this environment. `exec_cell` " +
       "remains available for computation. Report your final answer as your last message.";
     result = { ...(result ?? {}), systemPrompt: `${result?.systemPrompt ?? event.systemPrompt}\n\n${depthNote}` };
   }
@@ -1283,6 +1551,26 @@ function handleContext(sessionState: PtcSessionState, event: { messages: Array<R
   const messages = [...event.messages, buildRecoveryContextMessage(sessionState.pendingRecoveryPrompt)];
   sessionState.pendingRecoveryPrompt = null;
   return { messages };
+}
+
+function handleToolResult(
+  sessionState: PtcSessionState,
+  event: { toolName: string; isError: boolean; details?: unknown }
+): { details?: unknown } | undefined {
+  if (event.toolName !== "exec_cell" || !event.isError || !sessionState.recoveryState) {
+    return undefined;
+  }
+  const priorDetails =
+    typeof event.details === "object" && event.details !== null && !Array.isArray(event.details)
+      ? (event.details as Record<string, unknown>)
+      : {};
+  return {
+    details: {
+      ...priorDetails,
+      telemetry: buildPtcExecutionTelemetry(sessionState.recoveryState),
+      recovery: buildPtcRecoveryDetails(sessionState.recoveryState),
+    },
+  };
 }
 
 function handleAgentEnd(pi: ExtensionAPI, sessionState: PtcSessionState): void {
@@ -1310,7 +1598,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   const settings = loadSettingsFromEnv();
   const extensionRoot = getExtensionRoot();
   const toolRegistry = new ToolRegistry(pi);
-  const sandboxManager = await createSandbox(settings);
+  const sandboxManager = await createSandbox();
   const sessionState: PtcSessionState = {
     currentCwd: context?.cwd ?? process.cwd(),
     customToolsStarted: false,
@@ -1318,10 +1606,8 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
     pendingRecoveryPrompt: null,
     recoveryAllowed: true,
     recoveryState: null,
-    activeForegroundToolCallId: null,
-    activeForegroundSessionId: null,
+    activeForegroundExecutions: new Map(),
     lastSubagentSnapshot: null,
-    requestedBackground: null,
     lastCtx: context ?? null,
   };
 
@@ -1351,7 +1637,7 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   // when missing and install/refresh pi_subagents from git. The sync stamp
   // lives inside this package's clone, so `pi update` (which resets and cleans
   // the clone) triggers a fresh sync on the next session start.
-  if (!settings.useDocker && !process.env.PI_SUBAGENT_DEPTH) {
+  if (!process.env.PI_SUBAGENT_DEPTH) {
     void ensureSubagentsEnv({ extensionRoot }).catch((error) => {
       debugLog("pi_subagents provisioning failed", String(error));
     });
@@ -1359,7 +1645,17 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
 
   registerPtcCommand(pi, sessionManager, sessionState);
 
-  const onToolSetChanged = () => undefined;
+  const onToolSetChanged = () => {
+    // During initial startup handleSessionStart registers all tools once after
+    // the custom-tool scan. Later hot reloads replace these two definitions so
+    // the model-facing helper list stays in sync with the callable tool set.
+    if (!sessionState.customToolsStarted) {
+      return;
+    }
+    const toolDescription = currentToolDescription(toolRegistry, settings, sessionState);
+    pi.registerTool(execCellTool(pi, sessionManager, settings, sessionState, toolDescription));
+    pi.registerTool(inspectKernelTool(sessionManager, toolDescription));
+  };
 
   const customToolManager = new CustomToolManager(extensionRoot, pi, toolRegistry, onToolSetChanged);
 
@@ -1375,12 +1671,14 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
   );
   const onBeforeAgentStart = handleBeforeAgentStart.bind(undefined, pi, toolRegistry, settings, sessionState);
   const onContext = handleContext.bind(undefined, sessionState);
+  const onToolResult = handleToolResult.bind(undefined, sessionState);
   const onAgentEnd = handleAgentEnd.bind(undefined, pi, sessionState);
   const onSessionShutdown = handleSessionShutdown.bind(undefined, customToolManager, sandboxManager, sessionManager);
 
   pi.on("session_start", onSessionStart);
   pi.on("before_agent_start", onBeforeAgentStart);
   (pi as unknown as { on(event: "context", handler: typeof onContext): void }).on("context", onContext);
+  pi.on("tool_result", onToolResult);
   pi.on("agent_end", onAgentEnd);
   pi.on("session_shutdown", onSessionShutdown);
 }

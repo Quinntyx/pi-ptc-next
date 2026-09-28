@@ -53,6 +53,10 @@ class GrepMatch(TypedDict):
     text: str
     kind: str
 
+class GrepResult(TypedDict):
+    matches: List[GrepMatch]
+    matchLimitReached: Optional[int]
+
 class BashResult(TypedDict):
     stdout: str
     stderr: str

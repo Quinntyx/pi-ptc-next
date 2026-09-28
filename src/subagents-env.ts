@@ -9,7 +9,7 @@
  *
  *   1. venv: create ~/.cache/pi-ptc/python-env when missing (uv when
  *      available, else `python3 -m venv`) — resolvePythonExecutable()
- *      prefers this venv for all python_exec sessions.
+ *      prefers this venv for all provision_kernel interpreters.
  *   2. source: PTC_SUBAGENTS_SOURCE (dev checkout, e.g. ~/docs/src/pi-subagents)
  *      when present, else a managed git clone at ~/.cache/pi-ptc/pi-subagents
  *      (cloned from PTC_SUBAGENTS_REPO_URL, fetched + reset on each sync).
@@ -22,8 +22,10 @@
  * package clones, wiping the stamp, so updating extensions re-syncs
  * pi_subagents. Between updates the stamp throttles syncs to once per
  * PTC_SUBAGENTS_SYNC_INTERVAL_HOURS (default 24). Runs are serialized by a
- * lock file; failures are stamped too so a broken repo doesn't retry every
- * session start.
+ * pid-tagged lock file (atomic O_CREAT|O_EXCL acquire; a lock whose holder has
+ * died is broken). Successes are stamped; failures are stamped too but retry
+ * immediately while the runtime is still missing, so a failed initial
+ * clone/install doesn't block for the whole interval.
  */
 import { execFile, execFileSync, spawn } from "child_process";
 import {
@@ -32,8 +34,11 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
+  writeSync,
 } from "fs";
 import { dirname } from "path";
 import { homedir } from "os";
@@ -44,6 +49,8 @@ import { debugLog, logWarning } from "./utils";
 const DEFAULT_REPO_URL = "https://git.quinntyx.dev/quinntyx/pi-subagents";
 const DEV_SOURCE_DEFAULT = join(homedir(), "docs", "src", "pi-subagents");
 const LOCK_MAX_AGE_MS = 5 * 60 * 1000;
+/** Rotate subagents-sync.log once it exceeds this size (keeps one .1 backup). */
+const MAX_LOG_BYTES = 1_000_000;
 
 export interface SubagentsEnvOptions {
   /** Cache root holding python-env/ and the managed pi-subagents clone. */
@@ -84,12 +91,12 @@ interface Paths {
 }
 
 function resolvePaths(options: SubagentsEnvOptions): Paths {
-  const cacheRoot = options.cacheRoot ?? join(homedir(), ".cache", "pi-ptc");
+  const cacheRoot = options.cacheRoot ?? defaultCacheRoot();
   const extensionRoot = options.extensionRoot ?? cacheRoot;
   return {
     cacheRoot,
     venvDir: join(cacheRoot, "python-env"),
-    venvPython: join(cacheRoot, "python-env", "bin", "python"),
+    venvPython: venvPythonPath(cacheRoot),
     cloneDir: join(cacheRoot, "pi-subagents"),
     lockFile: join(cacheRoot, "subagents-sync.lock"),
     logFile: join(cacheRoot, "subagents-sync.log"),
@@ -124,9 +131,46 @@ export function isStampStale(
   return now - stamp.syncedAt > syncIntervalMs;
 }
 
-/** Where resolvePythonExecutable() should look (mirror of sandbox-manager). */
-export function ptcVenvPythonPath(): string {
-  return join(homedir(), ".cache", "pi-ptc", "python-env", "bin", "python");
+/**
+ * Pure: whether a sync should run given the current stamp.
+ *
+ * Beyond the usual staleness throttle, a fresh stamp that recorded a *failure*
+ * (`ok: false`) while the runtime is still missing retries immediately instead
+ * of blocking for the whole interval — a failed initial clone/install used to
+ * leave pi_subagents unavailable for up to 24h.
+ */
+export function shouldAttemptSync(
+  stamp: Stamp | undefined,
+  syncIntervalMs: number,
+  now: number,
+  runtimeReady: boolean,
+): boolean {
+  if (isStampStale(stamp, syncIntervalMs, now)) return true;
+  return stamp?.ok === false && !runtimeReady;
+}
+
+/** Pure: is a usable pi_subagents source available (dev checkout or managed clone)? */
+export function sourceAvailable(devSource: string | undefined, cloneDir: string): boolean {
+  return resolveSourceDir(devSource) !== undefined || existsSync(join(cloneDir, ".git"));
+}
+
+/** Pure: default cache root shared with sandbox-manager's venv lookup. */
+export function defaultCacheRoot(): string {
+  return join(homedir(), ".cache", "pi-ptc");
+}
+
+/**
+ * Pure: path of the python interpreter inside the PTC venv.
+ *
+ * Shared single source of truth for venv layout (see review C5):
+ * `sandbox-manager.ts resolvePythonExecutable` should consume this instead of
+ * re-deriving the path. Both historically hardcoded `bin/python` (the POSIX
+ * layout); Windows venvs use `Scripts\python.exe`, so this is platform-aware.
+ */
+export function venvPythonPath(cacheRoot: string = defaultCacheRoot()): string {
+  return process.platform === "win32"
+    ? join(cacheRoot, "python-env", "Scripts", "python.exe")
+    : join(cacheRoot, "python-env", "bin", "python");
 }
 
 // --- process helpers ------------------------------------------------------------
@@ -153,6 +197,7 @@ function run(cmd: string, args: string[], timeoutMs = 180_000): Promise<RunResul
 
 /** Run a command with stdout/stderr appended to the sync log; await exit. */
 function runLogged(logFile: string, cmd: string, args: string[]): Promise<boolean> {
+  rotateLogIfNeeded(logFile);
   return new Promise((resolve) => {
     const log = openSync(logFile, "a");
     const child = spawn(cmd, args, { stdio: ["ignore", log, log] });
@@ -160,6 +205,18 @@ function runLogged(logFile: string, cmd: string, args: string[]): Promise<boolea
     child.on("exit", (code) => resolve(code === 0));
     child.on("error", () => resolve(false));
   });
+}
+
+/** Size-cap the sync log: keep one generation as `<logFile>.1`. */
+function rotateLogIfNeeded(logFile: string): void {
+  try {
+    if (statSync(logFile).size > MAX_LOG_BYTES) {
+      rmSync(`${logFile}.1`, { force: true });
+      renameSync(logFile, `${logFile}.1`);
+    }
+  } catch {
+    // no log yet (ENOENT) or rotation failed — appending still works
+  }
 }
 
 function hasCommand(cmd: string): boolean {
@@ -194,6 +251,71 @@ function syncIntervalFromEnv(): number {
   return Number.isFinite(hours) && hours >= 0 ? hours * 3_600_000 : 24 * 3_600_000;
 }
 
+// --- lock ------------------------------------------------------------------------
+
+/**
+ * Atomically create the lock file (O_CREAT|O_EXCL via "wx") and stamp it with
+ * the holder's pid. Returns false when another process won the race — there is
+ * no check-then-write window, so two concurrent pi processes can never both
+ * hold the lock (M9).
+ */
+function acquireLock(paths: Paths): boolean {
+  try {
+    const fd = openSync(paths.lockFile, "wx");
+    try {
+      writeSync(fd, String(process.pid));
+    } finally {
+      closeSync(fd);
+    }
+    return true;
+  } catch {
+    return false; // EEXIST (lost the race) or the filesystem refused
+  }
+}
+
+/**
+ * Pure-ish: the pid recorded in the lock file, or undefined for legacy content.
+ *
+ * Legacy locks (pre-M9) held a Date.now() timestamp instead of a pid; those are
+ * always >= 2^31 while real pids are < 2^31 (pid_t is int32), so values in the
+ * timestamp range are treated as legacy and handled by the age heuristic.
+ */
+export function readLockPid(lockFile: string): number | undefined {
+  try {
+    const pid = Number(readFileSync(lockFile, "utf8").trim());
+    return Number.isInteger(pid) && pid > 0 && pid < 2 ** 31 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a process with this pid is (probably) still running. */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: alive but owned by another user; anything else: gone
+    return (error as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+/**
+ * Drop the lock only if it still holds OUR pid (M9/L18): a stale-lock breaker
+ * or a later holder may have replaced the file since we acquired it, and our
+ * cleanup must never delete a live sync's lock.
+ */
+function releaseLock(paths: Paths): void {
+  try {
+    if (readLockPid(paths.lockFile) === process.pid) {
+      rmSync(paths.lockFile, { force: true });
+    }
+  } catch {
+    // best-effort; a leftover lock with a dead pid is broken on next run
+  }
+}
+
 // --- sync -------------------------------------------------------------------------
 
 export async function ensureSubagentsEnv(
@@ -201,25 +323,43 @@ export async function ensureSubagentsEnv(
 ): Promise<SubagentsEnvResult> {
   const paths = resolvePaths(options);
   mkdirSync(paths.cacheRoot, { recursive: true });
+  const nowMs = options.now?.() ?? Date.now();
 
-  // Serialize across concurrent pi processes; a stale lock (>5 min) is broken.
-  try {
-    if (existsSync(paths.lockFile)) {
-      const age = Date.now() - Number(readFileSync(paths.lockFile, "utf8").trim() || 0);
-      if (age >= 0 && age < LOCK_MAX_AGE_MS) {
-        return { status: "skipped", reason: "another sync holds the lock" };
+  if (!acquireLock(paths)) {
+    // Lock exists: held by a live process, or left behind by a crashed one.
+    const pid = readLockPid(paths.lockFile);
+    let stale: boolean;
+    if (pid !== undefined) {
+      // Pid-tagged lock: stale iff the holder is dead, regardless of age.
+      stale = !pidAlive(pid);
+    } else {
+      // Legacy timestamp-only lock: fall back to the age heuristic.
+      let age: number;
+      try {
+        age = nowMs - Number(readFileSync(paths.lockFile, "utf8").trim() || 0);
+      } catch {
+        age = 0;
       }
-      rmSync(paths.lockFile, { force: true });
+      stale = !(age >= 0 && age < LOCK_MAX_AGE_MS);
     }
-    writeFileSync(paths.lockFile, String(Date.now()));
-  } catch {
-    return { status: "skipped", reason: "lock unavailable" };
+    if (!stale) {
+      return { status: "skipped", reason: "another sync holds the lock" };
+    }
+    // Break the stale lock (its holder is provably gone) and retry once.
+    try {
+      rmSync(paths.lockFile, { force: true });
+    } catch {
+      // ignore; the re-acquire below will surface contention
+    }
+    if (!acquireLock(paths)) {
+      return { status: "skipped", reason: "another sync holds the lock" };
+    }
   }
 
   try {
     return await sync(options, paths);
   } finally {
-    rmSync(paths.lockFile, { force: true });
+    releaseLock(paths);
   }
 }
 
@@ -242,7 +382,10 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
     stamp = undefined;
   }
   const intervalMs = syncIntervalFromEnv();
-  if (!isStampStale(stamp, intervalMs, options.now?.() ?? Date.now())) {
+  const devSource = options.devSource ?? process.env.PTC_SUBAGENTS_SOURCE ?? DEV_SOURCE_DEFAULT;
+  const runtimeReady =
+    existsSync(paths.venvPython) && sourceAvailable(devSource, paths.cloneDir);
+  if (!shouldAttemptSync(stamp, intervalMs, options.now?.() ?? Date.now(), runtimeReady)) {
     return { status: "skipped", reason: "recently synced", venvPython: paths.venvPython };
   }
 
@@ -255,7 +398,6 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
   }
 
   // 2. resolve the source dir (dev checkout wins, else managed clone)
-  const devSource = options.devSource ?? process.env.PTC_SUBAGENTS_SOURCE ?? DEV_SOURCE_DEFAULT;
   let pkgDir = resolveSourceDir(devSource);
   let managed = false;
   if (!pkgDir) {

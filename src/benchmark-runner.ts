@@ -4,6 +4,19 @@ import { parseEvalCase, type EvalCase } from "./eval-cases";
 import type { RecoveryFailureClass } from "./recovery-state";
 import { estimateTokensFromChars, shouldAutoRoutePromptToCodeExecution } from "./utils";
 
+/**
+ * Exhaustive map over the RecoveryFailureClass union: adding a member to the
+ * union without listing it here is a compile error, so parseFailureClass stays
+ * derived from the union instead of drifting away from it.
+ */
+const RECOVERY_FAILURE_CLASS_MEMBERS: Record<RecoveryFailureClass, true> = {
+  "missing-await": true,
+  "async-wrapper-iterated": true,
+};
+
+const ISO_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:[Zz]|[+-]\d{2}:?\d{2})?)?$/;
+
 export const BENCHMARK_OBSERVED_FIRST_PATHS = ["code_execution", "direct", "none"] as const;
 
 export type BenchmarkObservedFirstPath = (typeof BENCHMARK_OBSERVED_FIRST_PATHS)[number];
@@ -47,6 +60,8 @@ export interface BenchmarkRegression {
 export interface BenchmarkComparison {
   baseline_path: string;
   regressions: BenchmarkRegression[];
+  added_case_ids: string[];
+  removed_case_ids: string[];
 }
 
 export interface BenchmarkRun {
@@ -137,11 +152,24 @@ function parseBoolean(value: string | undefined): boolean | undefined {
 }
 
 function parseFailureClass(value: string | undefined): RecoveryFailureClass | null {
-  if (value === "missing-await" || value === "async-wrapper-iterated") {
-    return value;
+  if (value !== undefined && value in RECOVERY_FAILURE_CLASS_MEMBERS) {
+    return value as RecoveryFailureClass;
   }
 
   return null;
+}
+
+export function isValidIsoTimestamp(value: string): boolean {
+  const trimmed = value.trim();
+  return ISO_TIMESTAMP_PATTERN.test(trimmed) && Number.isFinite(Date.parse(trimmed));
+}
+
+/**
+ * Filesystem-safe rendering of a timestamp for use in result file names:
+ * colons and other path-hostile characters become dashes.
+ */
+function sanitizeTimestampForFilename(timestamp: string): string {
+  return timestamp.replace(/[^A-Za-z0-9._-]+/g, "-");
 }
 
 export function resolveBenchmarkEvalsPath(cwd: string = process.cwd(), evalsPath: string = process.env.PTC_EVALS_PATH || ".pi/evals/ptc"): string {
@@ -158,7 +186,7 @@ export function getProviderModelSlug(provider: string, model: string): string {
 }
 
 export function getDefaultBenchmarkResultPath(evalsPath: string, provider: string, model: string, timestamp: string): string {
-  return path.join(evalsPath, "results", getProviderModelSlug(provider, model), `${timestamp}.json`);
+  return path.join(evalsPath, "results", getProviderModelSlug(provider, model), `${sanitizeTimestampForFilename(timestamp)}.json`);
 }
 
 export function getDefaultBenchmarkBaselinePath(evalsPath: string, provider: string, model: string): string {
@@ -175,15 +203,33 @@ export function loadEvalCasesFromDisk(evalsPath: string, caseIds?: string[]): Ev
 
   const cases = fileNames.map((fileName) => {
     const filePath = path.join(casesDir, fileName);
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
-    return parseEvalCase(parsed, fileName);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to parse eval case file ${filePath}: ${message}`);
+    }
+    return parseEvalCase(parsed, filePath);
   });
 
   if (!selectedCaseIds) {
     return cases;
   }
 
-  return cases.filter((evalCase) => selectedCaseIds.has(evalCase.id));
+  const matched = cases.filter((evalCase) => selectedCaseIds.has(evalCase.id));
+  const matchedIds = new Set(matched.map((evalCase) => evalCase.id));
+  const unknownIds = [...selectedCaseIds].filter((id) => !matchedIds.has(id)).sort();
+  if (unknownIds.length > 0) {
+    const availableIds = cases.map((evalCase) => evalCase.id).sort();
+    throw new Error(
+      `Unknown eval case id(s): ${unknownIds.join(", ")}${
+        availableIds.length > 0 ? `. Available case id(s): ${availableIds.join(", ")}` : " (no eval cases found)"
+      }`
+    );
+  }
+
+  return matched;
 }
 
 export function createDeterministicBenchmarkExecutor(): BenchmarkCaseExecutor {
@@ -297,12 +343,62 @@ function buildBenchmarkSummary(records: BenchmarkResultRecord[]): BenchmarkRunSu
   };
 }
 
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateBenchmarkRunShape(value: unknown, filePath: string): BenchmarkRun {
+  const issues: string[] = [];
+
+  if (!isRecordValue(value)) {
+    throw new Error(`Benchmark run at ${filePath} has an unexpected shape: expected an object`);
+  }
+
+  if (typeof value.provider !== "string" || value.provider.length === 0) {
+    issues.push("provider must be a non-empty string");
+  }
+  if (typeof value.model !== "string" || value.model.length === 0) {
+    issues.push("model must be a non-empty string");
+  }
+  if (typeof value.generated_at !== "string" || value.generated_at.length === 0) {
+    issues.push("generated_at must be a non-empty string");
+  }
+  if (!Array.isArray(value.results)) {
+    issues.push("results must be an array");
+  } else {
+    value.results.forEach((entry, index) => {
+      const caseId = isRecordValue(entry) && isRecordValue(entry.result) ? entry.result.case_id : undefined;
+      if (typeof caseId !== "string" || caseId.length === 0) {
+        issues.push(`results[${index}].result.case_id must be a non-empty string`);
+      }
+    });
+  }
+  if (!isRecordValue(value.summary)) {
+    issues.push("summary must be an object");
+  }
+
+  if (issues.length > 0) {
+    throw new Error(`Benchmark run at ${filePath} has an unexpected shape: ${issues.join("; ")}`);
+  }
+
+  return value as unknown as BenchmarkRun;
+}
+
 export function readBenchmarkRun(filePath: string): BenchmarkRun {
-  return JSON.parse(fs.readFileSync(filePath, "utf8")) as BenchmarkRun;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to parse benchmark run file ${filePath}: ${message}`);
+  }
+
+  return validateBenchmarkRunShape(parsed, filePath);
 }
 
 export function compareBenchmarkRuns(current: BenchmarkRun, baseline: BenchmarkRun, baselinePath: string): BenchmarkComparison {
   const regressions: BenchmarkRegression[] = [];
+  const currentIds = new Set(current.results.map((record) => record.result.case_id));
   const baselineByCaseId = new Map(baseline.results.map((record) => [record.result.case_id, record.result]));
 
   for (const record of current.results) {
@@ -348,9 +444,14 @@ export function compareBenchmarkRuns(current: BenchmarkRun, baseline: BenchmarkR
     }
   }
 
+  const addedCaseIds = [...currentIds].filter((caseId) => !baselineByCaseId.has(caseId)).sort();
+  const removedCaseIds = [...baselineByCaseId.keys()].filter((caseId) => !currentIds.has(caseId)).sort();
+
   return {
     baseline_path: baselinePath,
     regressions,
+    added_case_ids: addedCaseIds,
+    removed_case_ids: removedCaseIds,
   };
 }
 
@@ -397,7 +498,16 @@ interface ParsedCliArgs {
   timestamp?: string;
 }
 
-function parseCliArgs(argv: string[]): ParsedCliArgs {
+function requireCliValue(argv: string[], flagIndex: number, flag: string): string {
+  const value = argv[flagIndex + 1];
+  if (value === undefined || value.trim() === "" || value.startsWith("-")) {
+    const got = value === undefined ? "no value provided" : `invalid value ${JSON.stringify(value)}`;
+    throw new Error(`${flag} requires a value (${got})`);
+  }
+  return value;
+}
+
+export function parseCliArgs(argv: string[]): ParsedCliArgs {
   const parsed: ParsedCliArgs = {
     provider: "local",
     model: "deterministic",
@@ -405,40 +515,46 @@ function parseCliArgs(argv: string[]): ParsedCliArgs {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    const next = argv[index + 1];
 
     switch (arg) {
       case "--provider":
-        parsed.provider = next;
+        parsed.provider = requireCliValue(argv, index, arg);
         index += 1;
         break;
       case "--model":
-        parsed.model = next;
+        parsed.model = requireCliValue(argv, index, arg);
         index += 1;
         break;
       case "--evals-path":
-        parsed.evalsPath = next;
+        parsed.evalsPath = requireCliValue(argv, index, arg);
         index += 1;
         break;
       case "--baseline":
-        parsed.baselinePath = next;
+        parsed.baselinePath = requireCliValue(argv, index, arg);
         index += 1;
         break;
       case "--results-path":
-        parsed.resultsPath = next;
+        parsed.resultsPath = requireCliValue(argv, index, arg);
         index += 1;
         break;
       case "--cases":
-        parsed.caseIds = next
+        parsed.caseIds = requireCliValue(argv, index, arg)
           .split(",")
           .map((value) => value.trim())
           .filter(Boolean);
         index += 1;
         break;
-      case "--timestamp":
-        parsed.timestamp = next;
+      case "--timestamp": {
+        const value = requireCliValue(argv, index, arg);
+        if (!isValidIsoTimestamp(value)) {
+          throw new Error(
+            `--timestamp must be an ISO-like timestamp (e.g. 2026-03-16T00:00:00.000Z), got ${JSON.stringify(value)}`
+          );
+        }
+        parsed.timestamp = value;
         index += 1;
         break;
+      }
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }

@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
-const { RpcProtocol } = require("../dist/rpc-protocol.js");
+const { RpcProtocol, validateRpcMessage } = require("../dist/rpc-protocol.js");
 
 class FakeProcess extends EventEmitter {
   constructor() {
@@ -140,22 +140,15 @@ test("RpcProtocol timeout settles once and terminates Python", async () => {
   await protocol.dispose();
 });
 
-test("RpcProtocol bounds streamed stdout before completion", async () => {
+test("RpcProtocol retains all stdout received from the runtime without a second truncation", async () => {
   const proc = new FakeProcess();
-  const protocol = new RpcProtocol(
-    proc,
-    async () => null,
-    "print('lots')",
-    undefined,
-    undefined,
-    { maxOutputChars: 5 }
-  );
+  const protocol = new RpcProtocol(proc, async () => null, "print('lots')");
 
   proc.stdout.write(JSON.stringify({ type: "stdout", text: "abcdefgh" }) + "\n");
   proc.stdout.write(JSON.stringify({ type: "complete", output: "xyz" }) + "\n");
 
   const result = await protocol.waitForCompletion();
-  assert.equal(result.output, "abcde\n\n[Output truncated - showing first 5 characters of 11]");
+  assert.equal(result.output, "abcdefghxyz");
 });
 
 test("RpcProtocol rejects an exited process even when inherited stdout stays open", async () => {
@@ -182,4 +175,101 @@ test("RpcProtocol dispose waits for a successful child to exit", async () => {
 
   assert.equal(proc.exitCode, 0);
   assert.deepEqual(proc.killSignals, []);
+});
+
+test("validateRpcMessage validates image artifacts and preserves exec_error metadata", () => {
+  assert.deepEqual(
+    validateRpcMessage({
+      type: "complete",
+      output: "figure",
+      images: [{ mimeType: "image/png", data: "abc", width: 10, height: 20 }],
+    }).images,
+    [{ mimeType: "image/png", data: "abc", width: 10, height: 20 }]
+  );
+  assert.throws(
+    () => validateRpcMessage({ type: "complete", output: "bad", images: [{ mimeType: 3, data: "abc" }] }),
+    /images must be an array/
+  );
+  assert.throws(
+    () => validateRpcMessage({ type: "exec_done", id: "e1", output: "bad", images: [null] }),
+    /images must be an array/
+  );
+  assert.deepEqual(
+    validateRpcMessage({
+      type: "exec_error",
+      id: "e1",
+      message: "interrupted",
+      traceback: "trace",
+      interrupted: true,
+      line: 7,
+      source: "/tmp/cell.py",
+    }),
+    {
+      type: "exec_error",
+      id: "e1",
+      message: "interrupted",
+      traceback: "trace",
+      interrupted: true,
+      line: 7,
+      source: "/tmp/cell.py",
+    }
+  );
+});
+
+test("RpcProtocol isolates onUpdate callback failures", async () => {
+  const proc = new FakeProcess();
+  const protocol = new RpcProtocol(
+    proc,
+    async () => null,
+    "return 1",
+    undefined,
+    () => {
+      throw new Error("broken UI");
+    }
+  );
+
+  proc.stdout.write(JSON.stringify({ type: "execution_progress", line: 1, total_lines: 1 }) + "\n");
+  proc.stdout.write(JSON.stringify({ type: "update", message: "still alive" }) + "\n");
+  proc.stdout.write(JSON.stringify({ type: "complete", output: "done" }) + "\n");
+
+  const result = await protocol.waitForCompletion();
+  assert.equal(result.output, "done");
+  assert.deepEqual(proc.killSignals, []);
+});
+
+test("RpcProtocol counts non-BMP output as Unicode code points", async () => {
+  const proc = new FakeProcess();
+  const protocol = new RpcProtocol(proc, async () => null, "print('emoji')");
+
+  proc.stdout.write(JSON.stringify({ type: "stdout", text: "😀😀" }) + "\n");
+  proc.stdout.write(JSON.stringify({ type: "complete", output: "", total_output_chars: 2 }) + "\n");
+
+  const result = await protocol.waitForCompletion();
+  assert.equal(result.output, "😀😀");
+});
+
+test("RpcProtocol appends one help hint after Python tracebacks", async () => {
+  const proc = new FakeProcess();
+  const protocol = new RpcProtocol(proc, async () => null, "missing_name");
+  proc.stdout.write(JSON.stringify({
+    type: "error",
+    message: "name 'missing_name' is not defined",
+    traceback: "Traceback (most recent call last):\nNameError: name 'missing_name' is not defined",
+  }) + "\n");
+
+  await assert.rejects(
+    protocol.waitForCompletion(),
+    /NameError: name 'missing_name' is not defined\nhelp: name is undefined — define it, or inspect_kernel/
+  );
+});
+
+test("RpcProtocol propagates AbortSignal reasons", async () => {
+  const proc = new FakeProcess();
+  const controller = new AbortController();
+  const protocol = new RpcProtocol(proc, async () => null, "return 1", controller.signal);
+
+  controller.abort(new Error("caller disconnected"));
+
+  await assert.rejects(protocol.waitForCompletion(), /caller disconnected/);
+  assert.deepEqual(proc.killSignals, ["SIGTERM"]);
 });

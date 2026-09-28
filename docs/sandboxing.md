@@ -2,14 +2,13 @@
 
 ## What it does
 
-`pi-ptc-next` executes Python by spawning a real interpreter process on your host machine — there is no container, VM, or other isolation substrate. Because that is a significant trust decision, the extension refuses to run Python at all until you explicitly opt in with `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true`. Once opted in, each Python session runs `python -u -c <code>` in your current working directory with the full host environment inherited, and a separate policy layer (`PTC_ALLOW_BASH`, `PTC_ALLOW_MUTATIONS`) controls which mutating pi tools the model can reach from inside Python. In short: the "sandbox" is opt-in host execution plus tool-call gating, not isolation.
+`pi-ptc-next` executes Python by spawning a real interpreter process on your host machine — there is no container, VM, or other isolation substrate. **There is currently no sandboxing at all: the extension only supports “yolo mode.”** Sandboxing is work-in-progress/planned — the intended direction is some form of VM-based checkpointing, but the implementation is complex and not started. A separate policy layer (`PTC_ALLOW_BASH`, `PTC_ALLOW_MUTATIONS`) controls which mutating pi tools the model can reach from inside Python; that tool-call gating is the only barrier that exists today. In short: the “sandbox” is plain host execution plus tool gating, not isolation.
 
 ## How it works
 
-### Execution mode: explicit local subprocess
+### Execution mode: plain host subprocess
 
-- `createSandbox()` (`src/sandbox-manager.ts:111`) rejects startup unless `settings.allowUnsandboxedSubprocess` is true, which is parsed from `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` (default `false`, values `1/true/yes/on` accepted — `src/utils.ts:80`):
-  > `PTC runs Python as a local subprocess. Set PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true to opt in.`
+- `createSandbox()` (`src/sandbox-manager.ts`) always returns the one implementation, `SubprocessSandbox`. There is no opt-in gate and no alternative backend — if you install the extension, Python runs on your host.
 - The only implementation is `SubprocessSandbox`. Each kernel is spawned as `python -u -c <code>` with `cwd` set to the session's working directory and `env: { ...process.env }` — the host environment is inherited wholesale (`src/sandbox-manager.ts:56-66`).
 - `getRuntimeWorkspaceRoot(cwd)` returns `cwd` unchanged (`src/sandbox-manager.ts:79-81`): there is no path-mapping or filesystem boundary. Python sees your real filesystem with your real permissions.
 
@@ -37,14 +36,13 @@ Independently of the subprocess gate, the tool registry (`src/tool-registry.ts:2
 - `bash` is blocked unless `PTC_ALLOW_BASH=true`.
 - All mutating tools (built-in `bash`, `edit`, `write`, and non-read-only custom tools) are blocked unless `PTC_ALLOW_MUTATIONS=true`. Read-only built-ins are callable by default; custom tools must opt in via `ptc: { enabled: true, readOnly: true, ... }`.
 
-So a fresh install with only `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true` gives Python read-only access to your repo through the pi tool helpers — no shell, no file writes from the model.
+So a fresh install out of the box gives Python read-only access to your repo through the pi tool helpers — no shell, no file writes from the model. The subprocess itself, however, runs unsandboxed on your host.
 
 ## Usage
 
-Opt in once per shell (or in your pi profile setup):
+Optional interpreter pinning:
 
 ```bash
-export PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true
 # optional: pin the interpreter instead of the ~/.cache/pi-ptc venv fallback
 export PTC_PYTHON_EXECUTABLE=/usr/bin/python3.12
 ```
@@ -63,21 +61,20 @@ import platform, os
 print(platform.python_version(), os.getcwd())
 ```
 
-Without `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true`, the extension fails at startup with the error quoted above — Python never runs, so there is no partial execution to clean up. With the flag set but `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH` unset, a cell calling `bash()` or `write()` gets a policy rejection from the tool registry rather than executing the mutation.
+With `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH` unset (the defaults), a cell calling `bash()` or `write()` gets a policy rejection from the tool registry rather than executing the mutation. Remember that the Python process itself is unsandboxed: these flags gate what the *model* can reach through the tool bridge, not what Python could do directly.
 
 ## Options / Configuration
 
 | Env var | Default | Effect |
 | --- | --- | --- |
-| `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` | `false` | Master gate; must be `true` (or `1/yes/on`) or Python execution is refused entirely |
 | `PTC_PYTHON_EXECUTABLE` | *(unset)* | Interpreter used for all kernels; overrides the `~/.cache/pi-ptc/python-env` venv and `python3` fallback |
 | `PTC_ALLOW_BASH` | `false` | Allow the `bash` tool from Python |
 | `PTC_ALLOW_MUTATIONS` | `false` | Allow mutating tools (`bash`, `edit`, `write`, non-read-only custom tools) from Python |
 | `PTC_EXECUTION_TIMEOUT_MS` | `270000` | Hard idle timeout for a Python execution (activity re-arms it) |
-| `PTC_DEBUG` | `false` | Debug logging; emits e.g. `Using subprocess runtime (PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true)` |
+| `PTC_DEBUG` | `false` | Debug logging; emits e.g. `Using subprocess runtime (no sandboxing substrate yet)` |
 | `PTC_SUBAGENTS_PROFILE` | *(unset)* | pi profile directory passed to subagent instances as `PI_SUBAGENTS_PROFILE` around each spawn |
 
-There are no sandbox-specific settings beyond these — no container image, network policy, or filesystem allowlist exists because no isolation substrate is implemented. Container/VM-based kernel snapshotting (e.g. E2B/Daytona) is deferred in `notes/BACK-BURNER.md`.
+There are no sandbox-specific settings beyond these — no container image, network policy, or filesystem allowlist exists because no isolation substrate is implemented. VM-based kernel checkpointing is the planned direction (see the yolo-mode note at the top); until it lands, treat every kernel as your own host Python.
 
 ## Standalone setup notes
 
@@ -88,4 +85,4 @@ Several defaults encode the author's machine layout. None break execution — ke
 - **Author-specific dev-checkout default**: when `PTC_SUBAGENTS_SOURCE` is unset, the provisioner probes `~/docs/src/pi-subagents` (`DEV_SOURCE_DEFAULT`) and installs it editable if it exists. On the author's machine this silently shadows the managed clone; elsewhere it just doesn't exist and the managed clone is used.
 - **pi profile assumptions**: `PTC_SUBAGENTS_PROFILE` / `PI_SUBAGENTS_PROFILE` assume a pi profiles layout like `~/.config/pi/profiles/subagents`. If you don't use pi profiles, leave it unset — kernels spawn with the host environment unchanged and subagents use their own defaults.
 - **Sync stamp inside the extension clone**: `.ptc-subagents-sync.json` lives in the extension's own directory and is re-synced after every `pi update` (the stamp is wiped by the update). This only matters if you rely on the managed pi-subagents clone; the venv itself is untouched.
-- **No isolation to lean on**: since execution is a plain host subprocess, `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH` are the only write/execute barriers between the model and your system. Don't enable the subprocess flag in untrusted workspaces, and don't enable both flags together unless you intend the model to be able to run shell commands and edit files.
+- **No isolation to lean on**: execution is a plain host subprocess, so `PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH` are the only barriers between what the *model* can reach and your system — and none at all between the Python process itself and your system. Don't use this extension in untrusted workspaces, and don't enable both flags together unless you intend the model to be able to run shell commands and edit files.

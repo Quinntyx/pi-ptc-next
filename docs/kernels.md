@@ -77,7 +77,6 @@ All settings are environment-based (`loadSettingsFromEnv`, `src/utils.ts:64-95`)
 | `PTC_MAX_PYTHON_SESSIONS` | `4` | Parsed but **not enforced** — provisioning never rejects; vestigial. |
 | `PTC_CODE_THEME` | `github-dark` | Shiki theme for the `confirm: true` cell-approval popup. |
 | `PTC_PYTHON_EXECUTABLE` | venv at `~/.cache/pi-ptc/python-env`, else `python3` | Interpreter used for kernels and for `provision_dependency` installs (`src/sandbox-manager.ts:35-42`). |
-| `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` | `false` | Must be `true` or the extension refuses to run Python at all (see `docs/sandboxing.md`). |
 | `PTC_DEBUG` | `false` | Debug logging to stdout. |
 
 Two timeouts are not configurable: nested host-tool calls from a cell time out after 300 s (`src/python-runtime/rpc.py:76`), and `inspect_kernel` waits at most 15 s for the namespace digest (`src/index.ts:470-517`). `provision_dependency` runs `uv pip install --python <kernel python> <package>` with a 180 s timeout and reports installed/updated vs. already satisfied; already-running kernels keep their loaded versions until restarted.

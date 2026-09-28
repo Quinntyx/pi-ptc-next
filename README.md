@@ -13,19 +13,15 @@ Fork of [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by Chr
 
 ## Install
 
-One environment variable is **mandatory** — the extension runs Python as a local host subprocess and refuses to start otherwise:
-
-```bash
-export PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true
-```
-
-Then install the extension:
+Install the extension:
 
 ```bash
 pi install git:github.com/edxeth/pi-ptc-next
 ```
 
 (Or `pi install /path/to/repo` for a local checkout.) No `npm install`/`npm run build` is needed — pi compiles the TypeScript at load time. Start `pi` and the extension registers its tools on session start.
+
+> **⚠️ No sandboxing yet — yolo mode only.** Kernels run as plain host Python subprocesses with your real filesystem, permissions, and environment. Sandboxing is planned (VM-based checkpointing) but not implemented — the implementation is complex. Tool gating (`PTC_ALLOW_MUTATIONS`/`PTC_ALLOW_BASH`) limits what the *model* can reach; it does not constrain the Python process itself. Don't use this in untrusted workspaces.
 
 ## What you get
 

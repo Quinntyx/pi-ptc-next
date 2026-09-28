@@ -1,8 +1,18 @@
 export const EVAL_CASE_EXPECTED_FIRST_PATHS = ["code_execution", "direct"] as const;
 export const EVAL_CASE_ACCEPTANCE_TYPES = ["exact", "structural", "behavioral"] as const;
+// Known acceptance rule keys. Kept in sync with evaluateRule() in benchmark-runner.ts;
+// validateEvalCase rejects rules with unknown keys so a typo fails at load time.
+export const EVAL_CASE_ACCEPTANCE_RULE_KEYS = [
+  "observed_first_path",
+  "success",
+  "recovery_attempted",
+  "failure_class",
+  "output_json",
+] as const;
 
 export type EvalCaseExpectedFirstPath = (typeof EVAL_CASE_EXPECTED_FIRST_PATHS)[number];
 export type EvalCaseAcceptanceType = (typeof EVAL_CASE_ACCEPTANCE_TYPES)[number];
+export type EvalCaseAcceptanceRuleKey = (typeof EVAL_CASE_ACCEPTANCE_RULE_KEYS)[number];
 
 export interface EvalCaseAcceptance {
   type: EvalCaseAcceptanceType;
@@ -73,6 +83,20 @@ export function validateEvalCase(value: unknown): string[] {
   value.acceptance.rules.forEach((rule, index) => {
     if (!isNonEmptyString(rule)) {
       errors.push(`acceptance.rules[${index}] must be a non-empty string`);
+      return;
+    }
+
+    const equalsIndex = rule.indexOf("=");
+    if (equalsIndex <= 0) {
+      errors.push(`acceptance.rules[${index}] must match "key=value" with a known rule key`);
+      return;
+    }
+
+    const key = rule.slice(0, equalsIndex).trim();
+    if (!EVAL_CASE_ACCEPTANCE_RULE_KEYS.includes(key as EvalCaseAcceptanceRuleKey)) {
+      errors.push(
+        `acceptance.rules[${index}] has unknown rule key "${key}" (expected one of: ${EVAL_CASE_ACCEPTANCE_RULE_KEYS.join(", ")})`
+      );
     }
   });
 

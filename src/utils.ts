@@ -1,7 +1,10 @@
 import { formatWithOptions } from "util";
 import type { PtcSettings } from "./contracts/settings";
 
-const DEFAULT_MAX_OUTPUT_SIZE = 100_000;
+export const DEFAULT_OUTPUT_PREVIEW_CHARS = 12_000;
+export const DEFAULT_MAX_SPOOL_CHARS = 10_000_000;
+export const DEFAULT_CELL_OUTPUT_LINES = 2_000;
+export const DEFAULT_CELL_OUTPUT_BYTES = 50 * 1024;
 const DEFAULT_EXECUTION_TIMEOUT_MS = 270_000;
 const DEFAULT_MAX_PARALLEL_TOOL_CALLS = 8;
 const DEBUG_PREFIX = "[PTC]";
@@ -63,19 +66,21 @@ export function loadSettingsFromEnv(): PtcSettings {
       process.env.PTC_EXECUTION_TIMEOUT_MS,
       DEFAULT_EXECUTION_TIMEOUT_MS
     ),
-    maxOutputChars: parsePositiveIntEnv(process.env.PTC_MAX_OUTPUT_CHARS, DEFAULT_MAX_OUTPUT_SIZE),
+    outputPreviewChars: parsePositiveIntEnv(
+      process.env.PTC_OUTPUT_PREVIEW_CHARS ?? process.env.PTC_MAX_OUTPUT_CHARS,
+      DEFAULT_OUTPUT_PREVIEW_CHARS
+    ),
+    maxSpoolChars: parsePositiveIntEnv(process.env.PTC_MAX_SPOOL_CHARS, DEFAULT_MAX_SPOOL_CHARS),
     allowMutations: parseBooleanEnv(process.env.PTC_ALLOW_MUTATIONS, false),
     allowBash: parseBooleanEnv(process.env.PTC_ALLOW_BASH, false),
     maxParallelToolCalls: parsePositiveIntEnv(
       process.env.PTC_MAX_PARALLEL_TOOL_CALLS,
       DEFAULT_MAX_PARALLEL_TOOL_CALLS
     ),
-    useDocker: parseBooleanEnv(process.env.PTC_USE_DOCKER, false),
-    allowUnsandboxedSubprocess: parseBooleanEnv(process.env.PTC_ALLOW_UNSANDBOXED_SUBPROCESS, false),
     debugLogging: parseBooleanEnv(process.env.PTC_DEBUG, false),
     autoRoute: parseBooleanEnv(process.env.PTC_AUTO_ROUTE, true),
     autoRecover: parseBooleanEnv(process.env.PTC_AUTO_RECOVER, false),
-    autoRecoverMaxAttempts: parseClampedIntEnv(process.env.PTC_AUTO_RECOVER_MAX_ATTEMPTS, 1, 0, 1),
+    autoRecoverMaxAttempts: parseClampedIntEnv(process.env.PTC_AUTO_RECOVER_MAX_ATTEMPTS, 1, 0, 4),
     trustedReadOnlyTools: parseListEnv(process.env.PTC_TRUSTED_READ_ONLY_TOOLS),
     callableTools: parseListEnv(process.env.PTC_CALLABLE_TOOLS),
     blockedTools: parseListEnv(process.env.PTC_BLOCKED_TOOLS),
@@ -101,7 +106,11 @@ export function shouldAutoRoutePromptToCodeExecution(prompt: string): boolean {
     return false;
   }
 
-  if (/\b(?:use|call|run|invoke) (?:the )?python_exec\b/.test(normalized)) {
+  // Current tool names (post exec_cell → exec_cell rename); "code_execution"
+  // is kept as an alias because prompts often refer to the execution path.
+  if (/\b(?:use|call|run|invoke) (?:the )?(?:exec_cell|provision_kernel|inspect_kernel|list_kernels|provision_dependency|code_execution)\b/.test(
+    normalized
+  )) {
     return true;
   }
 
@@ -127,21 +136,209 @@ export function shouldAutoRoutePromptToCodeExecution(prompt: string): boolean {
   return (hasFanout && (hasProcessing || hasContextPressure)) || (hasProcessing && hasContextPressure);
 }
 
-export function truncateOutput(output: string, maxOutputChars: number = DEFAULT_MAX_OUTPUT_SIZE): string {
-  if (output.length <= maxOutputChars) {
+function countNewlines(text: string): number {
+  let count = 0;
+  for (const char of text) {
+    if (char === "\n") count += 1;
+  }
+  return count;
+}
+
+// ── Sectioned cell output ────────────────────────────────────────────────────
+// The model-visible exec result is composed of host-owned sections. The host
+// inserts the section markers at column 0 and indents everything the cell
+// produced by two spaces, so provenance is structural (position), not
+// prefix-trust: a cell that prints "kernel:" lands *inside* the output section,
+// visibly distinct from the real marker.
+
+export const OUTPUT_SECTION_NAMES = ["output", "return", "kernel", "subagents"] as const;
+
+/** Indent a cell-produced body under a column-0 host marker. */
+export function sectionize(name: string, body: string): string {
+  const trimmed = body.replace(/\r?\n$/, "");
+  const indented = trimmed
+    .split("\n")
+    .map((line) => (line.trim() ? `  ${line}` : ""))
+    .join("\n");
+  return `${name}:\n${indented}`;
+}
+
+export interface OutputSection {
+  name: string;
+  /** Section body with the two-space cell indent removed. */
+  body: string;
+}
+
+/**
+ * Parse a sectioned result into its sections (dedented). Returns null when the
+ * text carries no column-0 section markers (legacy blob or error text) so the
+ * caller can render it verbatim.
+ */
+export function parseSectionedOutput(text: string): OutputSection[] | null {
+  const markerRe = /^(output|return|kernel|subagents)\b[^\n]*?:(.*)$/;
+  const sections: OutputSection[] = [];
+  let current: OutputSection | undefined;
+  let sawMarker = false;
+  let preamble = "";
+  for (const line of text.split("\n")) {
+    const match = markerRe.exec(line);
+    if (match) {
+      sawMarker = true;
+      current = { name: match[1], body: match[2] };
+      sections.push(current);
+      continue;
+    }
+    if (!current) {
+      preamble += `${line}\n`;
+      continue;
+    }
+    current.body += `${line.replace(/^  /, "")}\n`;
+  }
+  if (!sawMarker) return null;
+  void preamble;
+  return sections.map((s) => ({ name: s.name, body: s.body.replace(/\n$/, "") }));
+}
+
+function previewBounds(output: string, contentChars: number): { headEnd: number; tailStart: number } {
+  const headBudget = Math.floor(contentChars * 0.7);
+  const tailBudget = contentChars - headBudget;
+
+  let headEnd = output.lastIndexOf("\n", Math.max(0, headBudget));
+  let tailStart = output.indexOf("\n", Math.max(0, output.length - tailBudget));
+  if (tailStart >= 0) tailStart += 1;
+
+  // A single line has no boundaries to honor. Character slicing is the only
+  // bounded representation; read_cell_output applies its overlong-line notice.
+  if (headEnd <= 0 || tailStart < 0 || headEnd >= tailStart) {
+    headEnd = Math.min(headBudget, output.length);
+    tailStart = Math.max(headEnd, output.length - tailBudget);
+  }
+  return { headEnd, tailStart };
+}
+
+function hiddenLineCount(output: string, headEnd: number, tailStart: number): number {
+  if (tailStart <= headEnd) return 0;
+  const firstHiddenLine = countNewlines(output.slice(0, headEnd)) + (output[headEnd] === "\n" ? 1 : 0);
+  const lastHiddenPosition = tailStart - 1;
+  const lastHiddenLine = countNewlines(output.slice(0, lastHiddenPosition));
+  return Math.max(1, lastHiddenLine - firstHiddenLine + 1);
+}
+
+/** Build the bounded model-facing view; the input remains untouched for durable storage. */
+export function collapseOutputPreview(output: string, previewChars: number, cellIdx: number): string {
+  if (output.length <= previewChars) {
     return output;
   }
 
-  const truncated = output.substring(0, maxOutputChars);
-  const truncationNotice = `\n\n[Output truncated - showing first ${maxOutputChars} characters of ${output.length}]`;
-  return truncated + truncationNotice;
+  const limit = Math.max(1, Math.floor(previewChars));
+  let marker = "";
+  let headEnd = 0;
+  let tailStart = output.length;
+
+  // Marker digit widths affect the available head/tail budget. A few fixed-point
+  // passes settle those widths while preserving the hard preview bound.
+  for (let pass = 0; pass < 8; pass += 1) {
+    const contentChars = Math.max(0, limit - marker.length - 2);
+    ({ headEnd, tailStart } = previewBounds(output, contentChars));
+    const hiddenChars = tailStart - headEnd;
+    const hiddenLines = hiddenLineCount(output, headEnd, tailStart);
+    const nextMarker = `... ${hiddenLines} lines hidden (${hiddenChars} of ${output.length} chars) — full output: read_cell_output(cell_idx=${cellIdx}) ...`;
+    if (nextMarker === marker) break;
+    marker = nextMarker;
+  }
+
+  // Recompute once with the settled marker, then trim only at the inner edges if
+  // an unusually tiny configured limit leaves no room for both whole-line sides.
+  ({ headEnd, tailStart } = previewBounds(output, Math.max(0, limit - marker.length - 2)));
+  let head = output.slice(0, headEnd);
+  let tail = output.slice(tailStart);
+  let result = `${head}\n${marker}\n${tail}`;
+  if (result.length > limit) {
+    const excess = result.length - limit;
+    const trimHead = Math.min(head.length, Math.ceil(excess * 0.7));
+    const trimTail = Math.min(tail.length, excess - trimHead);
+    head = head.slice(0, head.length - trimHead);
+    tail = tail.slice(trimTail);
+    result = `${head}\n${marker}\n${tail}`;
+  }
+  return result;
 }
 
-export function formatPythonError(message: string, traceback?: string): string {
-  if (traceback) {
-    return `Python execution error:\n${message}\n\nTraceback:\n${traceback}`;
+function truncateUtf8Head(text: string, maxBytes: number): string {
+  const buffer = Buffer.from(text, "utf8");
+  if (buffer.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
+  return buffer.subarray(0, end).toString("utf8");
+}
+
+/** Apply read-like 1-based line slicing and bounded single-line handling. */
+export function sliceCellOutput(
+  output: string,
+  options: { cellIdx: number; offset?: number; limit?: number }
+): string {
+  const lines = output.split("\n");
+  const offset = Math.max(1, Math.floor(options.offset ?? 1));
+  if (offset > lines.length) {
+    throw new Error(`Offset ${offset} is beyond end of cell output (${lines.length} lines total)`);
   }
-  return `Python execution error: ${message}`;
+
+  const requestedLimit = options.limit === undefined
+    ? DEFAULT_CELL_OUTPUT_LINES
+    : Math.max(1, Math.floor(options.limit));
+  const end = Math.min(lines.length, offset - 1 + requestedLimit);
+  const selected = lines.slice(offset - 1, end);
+
+  if (selected.length > 0 && Buffer.byteLength(selected[0], "utf8") > DEFAULT_CELL_OUTPUT_BYTES) {
+    return `${truncateUtf8Head(selected[0], DEFAULT_CELL_OUTPUT_BYTES)}... [truncated]`;
+  }
+
+  const retained: string[] = [];
+  let bytes = 0;
+  for (const line of selected) {
+    const lineBytes = Buffer.byteLength(line, "utf8") + (retained.length > 0 ? 1 : 0);
+    if (retained.length >= DEFAULT_CELL_OUTPUT_LINES || bytes + lineBytes > DEFAULT_CELL_OUTPUT_BYTES) break;
+    retained.push(line);
+    bytes += lineBytes;
+  }
+
+  const lastLine = offset + retained.length - 1;
+  let result = retained.join("\n");
+  if (retained.length < selected.length) {
+    result += `\n\n[Showing lines ${offset}-${lastLine} of ${lines.length}. Use offset=${lastLine + 1} to continue.]`;
+  } else if (end < lines.length) {
+    result += `\n\n[${lines.length - end} more lines in cell output. Use offset=${end + 1} to continue.]`;
+  }
+  return result;
+}
+
+/** Return at most one deterministic nudge for a Python exception/traceback. */
+export function pythonErrorHelpHint(errorText: string): string | undefined {
+  if (/\b(?:ModuleNotFoundError|ImportError)\b/.test(errorText)) {
+    const missing = /No module named ["']([^"']+)["']/.exec(errorText)?.[1]?.split(".")[0];
+    return `help: install it with provision_dependency('${missing ?? "<distribution>"}') then re-run`;
+  }
+  if (/\bNameError\b/.test(errorText)) {
+    return "help: name is undefined — define it, or inspect_kernel to see live names (the kernel may have restarted)";
+  }
+  if (/\bSyntaxError\b/.test(errorText)) {
+    return "help: fix the syntax error at the reported line";
+  }
+  if (/\bFileNotFoundError\b/.test(errorText)) {
+    return "help: verify the path exists (read/ls the parent dir)";
+  }
+  if (/\bAttributeError\b/.test(errorText)) {
+    return "help: inspect_kernel to discover the real attribute/API";
+  }
+  return undefined;
+}
+
+export function appendPythonErrorHelp(traceback: string | undefined, message: string): string | undefined {
+  const hint = pythonErrorHelpHint(`${message}\n${traceback ?? ""}`);
+  if (!hint || traceback?.split("\n").some((line) => line.startsWith("help:"))) {
+    return traceback;
+  }
+  return traceback ? `${traceback.trimEnd()}\n${hint}` : hint;
 }
 
 export function estimateTokensFromChars(chars: number): number {
@@ -151,7 +348,7 @@ export function estimateTokensFromChars(chars: number): number {
 export function validateUserCode(userCode: string): void {
   if (/\basyncio\.run\s*\(/.test(userCode)) {
     throw new Error(
-      "Top-level await is already available inside python_exec. Remove asyncio.run(...) and await your coroutines directly."
+      "Top-level await is already available inside exec_cell. Remove asyncio.run(...) and await your coroutines directly."
     );
   }
 
