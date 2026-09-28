@@ -1093,7 +1093,7 @@ export class PythonSessionManager {
 
   /**
    * Resolve the PTC notebook library directory: settings.libraryDir, then
-   * PTC_LIBRARY_DIR (both `~/`-expanded), then `<pi agent dir>/ptc-library`.
+   * PTC_LIBRARY_DIR (both `~/`-expanded), then `<pi agent dir>/pycells-library`.
    */
   resolveLibraryDir(): string {
     const configured = this.settings.libraryDir?.trim() || process.env.PTC_LIBRARY_DIR?.trim();
@@ -1104,7 +1104,7 @@ export class PythonSessionManager {
       return path.resolve(expanded);
     }
     const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homedir(), ".pi", "agent");
-    return path.resolve(agentDir, "ptc-library");
+    return path.resolve(agentDir, "pycells-library");
   }
 
   private resolveSourcePath(source: string, cwd: string): string {

@@ -49,8 +49,8 @@ export PTC_EXECUTION_TIMEOUT_MS=600000
 # Give the model a larger head/tail preview of cell output
 export PTC_OUTPUT_PREVIEW_CHARS=20000
 
-# Keep reusable notebooks somewhere other than ~/.pi/agent/ptc-library
-export PTC_LIBRARY_DIR=~/notebooks/ptc-library
+# Keep reusable notebooks somewhere other than ~/.pi/agent/pycells-library
+export PTC_LIBRARY_DIR=~/notebooks/pycells-library
 
 # Debug logging while troubleshooting tool policy
 export PTC_DEBUG=1
@@ -112,7 +112,7 @@ enforcement.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `PTC_LIBRARY_DIR` | path (tilde-expanded) | `$PI_CODING_AGENT_DIR/ptc-library` | Reusable notebook library used by the notebook flows `/ptc` notebook flows (`resolveLibraryDir`, `src/python-session-manager.ts:992-1002`). `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`. |
+| `PTC_LIBRARY_DIR` | path (tilde-expanded) | `$PI_CODING_AGENT_DIR/pycells-library` | Reusable notebook library used by the notebook flows `/ptc` notebook flows (`resolveLibraryDir`, `src/python-session-manager.ts:992-1002`). `PI_CODING_AGENT_DIR` defaults to `~/.pi/agent`. |
 | `PTC_EVALS_PATH` | path | `.pi/evals/ptc` | Root of the JSON eval/benchmark cases (`src/benchmark-runner.ts:175`); read directly, not part of `PtcSettings`. |
 | `PTC_PYTHON_EXECUTABLE` | path | *(unset)* | Interpreter used for every kernel, verbatim and with no existence check. Overrides the venv resolution below (`src/sandbox-manager.ts:35-38`). |
 

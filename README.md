@@ -19,6 +19,10 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
    Pi downloads the extension into its own folder (`~/.pi/agent/git/github.com/Quinntyx/pi-pycells` by default) and runs `npm install` there; it usually takes under a minute. For local development, `pi install /path/to/repo` loads a checkout in place instead of cloning.
 
+> **Skills installed by the plugin:** the extension bundles two pi skills — `pycells-library` (teaches the agent to discover, run, and contribute notebook-library workflows) and `pi-subagents` (the full subagent-orchestration reference). They land in your agent dir with the plugin and are listed by pi's skill discovery.
+
+> Paths: this documentation writes `~/.pi/agent` (pi's default agent dir) everywhere. Pi honors `PI_CODING_AGENT_DIR`; if you (or pi-profiles) set it, every path below that lives in the agent dir moves with it.
+
 2. **Verify it works.** Start `pi` and describe a PTC-shaped task, or run once non-interactively (`-p`):
 
    ```bash
@@ -85,15 +89,40 @@ Results come back in completion order, sessions can be reused for follow-ups, an
 
 More: [docs/subagents.md](docs/subagents.md).
 
+### The notebook library
+
+> [!WARNING]
+> **Experimental.** The library and promotion flow is new; expect interface changes.
+
+Every kernel you run is a complete, self-documenting artifact — code, interleaved markdown, captured outputs, and the Python version it ran on. When a workflow works, promote it:
+
+```text
+> promote_to_skill_notebook({ name: "todo-scan" })
+```
+
+Promoted notebooks land in the library (`~/.pi/agent/pycells-library/`), and any future kernel can start from one:
+
+```python
+# provision_kernel({ notebook: "/tmp/work.ipynb", source: "todo-scan" })
+# — the sourced setup runs up front; the new kernel inherits the namespace,
+# and the first new exec_cell continues where the workflow left off (Out[8], not Out[1])
+```
+
+Why this is the good part:
+
+- **Reuse without re-prompting.** A workflow you tuned once (paths, filters, output shapes) becomes a named asset the model starts from instead of rediscovering.
+- **Version-pinned recipes.** Each notebook records the Python it ran on; promoted workflows keep running on that interpreter even after you bump defaults.
+- **Markdown travels with the code.** Sourced setup executes before your first cell, and the notebook's own notes guide the model through the workflow it contains.
+- **The source is never modified.** The new kernel gets a copy whose cells run as prefix cells; the original stays untouched.
+
+More: [docs/notebook-library.md](docs/notebook-library.md).
+
 ### Also in the box
 
 - **Live code view** — executed cells render with syntax highlighting and an executing-line marker; `confirm: true` cells show an approval popup before running; Esc or `/ptc interrupt` stops a chunk without killing the kernel.
 - **Custom tools** — drop `.js` files into `tools/` with a `ptc:` metadata block and they become callable from Python (hot-reloaded).
-- **Notebook library** — promote a working notebook with `promote_to_skill_notebook({ name })`, then start future kernels from it via `provision_kernel({ notebook: ..., source: "name" })` for reusable, pre-seeded workflows.
 
-More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom-tools.md](docs/custom-tools.md), [docs/notebook-library.md](docs/notebook-library.md).
-
-> Paths: this documentation writes `~/.pi/agent` (pi's default agent dir) everywhere. pi honors `PI_CODING_AGENT_DIR`; if you (or pi-profiles) set it, every path below that lives in the agent dir moves with it.
+More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom-tools.md](docs/custom-tools.md).
 
 ## Optional dependencies
 

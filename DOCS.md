@@ -60,7 +60,7 @@ top
 
 **5. Outputs are compact but never lost.** The model sees at most `PTC_OUTPUT_PREVIEW_CHARS` (default 12,000 chars) of any cell as a head/tail preview; the full output is persisted in the notebook's cell metadata and paged back via `read_cell_output(cellIdx, offset, limit)` (default 2,000 lines / 50 KB per call).
 
-**6. Reuse what worked.** Finish a good workflow with `promote_to_skill_notebook({ name: "event-analysis" })` to copy the complete notebook (markdown, code, outputs) into the library at `~/.pi/agent/ptc-library`, then start future kernels with `provision_kernel({ notebook: "/tmp/work.ipynb", source: "event-analysis" })` — the sourced setup runs up front and the kernel inherits the namespace.
+**6. Reuse what worked.** Finish a good workflow with `promote_to_skill_notebook({ name: "event-analysis" })` to copy the complete notebook (markdown, code, outputs) into the library at `~/.pi/agent/pycells-library`, then start future kernels with `provision_kernel({ notebook: "/tmp/work.ipynb", source: "event-analysis" })` — the sourced setup runs up front and the kernel inherits the namespace.
 
 More: [docs/kernels.md](docs/kernels.md) for the full kernel lifecycle, and [docs/notebook-library.md](docs/notebook-library.md) for sourcing/promotion semantics.
 
@@ -150,7 +150,7 @@ More: [docs/custom-tools.md](docs/custom-tools.md)
 
 ## The notebook library
 
-`~/.pi/agent/ptc-library` (override with `PTC_LIBRARY_DIR`) holds reusable workflow notebooks. `promote_to_skill_notebook({ name })` copies the complete live notebook — markdown, code, outputs — into the library under a sanitized lowercase-hyphenated name, refusing to overwrite unless `overwrite: true`. `provision_kernel({ ..., source: "name" })` starts a new kernel from a library workflow: a `.ipynb` source is copied verbatim and its code cells executed in order as prefix cells (markdown preserved, not executed); a `.py` source runs as one virtual prefix cell. Sourced setup has already run when your first cell executes — cell numbering includes all prefix cells (a 7-cell source makes your first new cell `Out[8]`). A failing source cell is recorded on that cell and leaves the kernel usable.
+`~/.pi/agent/pycells-library` (override with `PTC_LIBRARY_DIR`) holds reusable workflow notebooks. `promote_to_skill_notebook({ name })` copies the complete live notebook — markdown, code, outputs — into the library under a sanitized lowercase-hyphenated name, refusing to overwrite unless `overwrite: true`. `provision_kernel({ ..., source: "name" })` starts a new kernel from a library workflow: a `.ipynb` source is copied verbatim and its code cells executed in order as prefix cells (markdown preserved, not executed); a `.py` source runs as one virtual prefix cell. Sourced setup has already run when your first cell executes — cell numbering includes all prefix cells (a 7-cell source makes your first new cell `Out[8]`). A failing source cell is recorded on that cell and leaves the kernel usable.
 
 More: [docs/notebook-library.md](docs/notebook-library.md)
 
@@ -211,7 +211,7 @@ Everything is configured through environment variables, read **once** at extensi
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PTC_LIBRARY_DIR` | `$PI_CODING_AGENT_DIR/ptc-library` (`~/.pi/agent/ptc-library`) | Notebook library for `source` lookup and promotion. |
+| `PTC_LIBRARY_DIR` | `$PI_CODING_AGENT_DIR/pycells-library` (`~/.pi/agent/pycells-library`) | Notebook library for `source` lookup and promotion. |
 | `PTC_EVALS_PATH` | `.pi/evals/ptc` | Root of benchmark/eval cases. |
 
 ### pi-subagents provisioning
@@ -248,7 +248,7 @@ Several defaults encode the author's machine. None break core execution, but kno
 - **tmux is the only hard requirement for subagents.** `pi_subagents` warns at import (and its API raises) when not running under tmux. Spawned agents run under **your own agent dir by default** — same config, extensions (pi-sock), and auth as the orchestrator, so there is nothing to create. For a separate subagent environment, set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config (a pi-profiles-managed profile works: `PI_CODING_SUBAGENT_DIR=~/.config/pi/profiles/subagents`).
 - **`~/.cache/pi-pycells` cache root (non-configurable in code).** Holds the shared venv (`python-env/`), the managed `pi-subagents/` clone, the sync log (rotated at 1 MB), and the sync lock file. Once the venv exists, all kernels prefer it over `python3` — delete it, or set `PTC_PYTHON_EXECUTABLE`, to control your interpreter.
 - **Sync stamp inside the extension clone.** `.ptc-subagents-sync.json` lives in the extension's own directory; because `pi update` resets package clones, every update forces a fresh sync from whatever the repo variables resolve to at that moment. (The git-tracked stamp currently contains the author's absolute path — a harmless stale stamp that triggers one extra sync.)
-- **pi agent-dir conventions.** The notebook library defaults to `~/.pi/agent/ptc-library` (honoring `PI_CODING_AGENT_DIR`), and the default eval root `.pi/evals/ptc` assumes a pi-style project directory. Set `PTC_LIBRARY_DIR` / `PTC_EVALS_PATH` if your layout differs.
+- **pi agent-dir conventions.** The notebook library defaults to `~/.pi/agent/pycells-library` (honoring `PI_CODING_AGENT_DIR`), and the default eval root `.pi/evals/ptc` assumes a pi-style project directory. Set `PTC_LIBRARY_DIR` / `PTC_EVALS_PATH` if your layout differs.
 - **English-only routing heuristics.** The auto-routing signals and mutation-word list are hardcoded English regexes; prompts in other languages simply don't route. Naming a PTC tool explicitly ("use exec_cell to …") routes unconditionally.
 - **Custom `tools/` directory is not configurable.** Custom tools load from `<extensionRoot>/tools` inside the installed extension, so npm-installed files there can be wiped by upgrades — keep sources elsewhere and symlink them in, or maintain a patched local checkout.
 - **Benchmark harness is repo-only.** Eval cases, baselines, and the `run-benchmarks.js` flow exist only in the git repo (not the npm `files` allowlist), and there is no `benchmark` npm script — run `npm run build && node dist/run-benchmarks.js …` yourself.

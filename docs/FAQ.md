@@ -115,11 +115,11 @@ All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
 
 **Output/limits:** `PTC_OUTPUT_PREVIEW_CHARS` (12 000), `PTC_MAX_OUTPUT_CHARS` (legacy alias), `PTC_MAX_SPOOL_CHARS` (10 000 000), `PTC_EXECUTION_TIMEOUT_MS` (270 000), `PTC_MAX_PARALLEL_TOOL_CALLS` (8).
 
-**Paths:** `PTC_LIBRARY_DIR` (default `$PI_CODING_AGENT_DIR/ptc-library`), `PTC_PYTHON_EXECUTABLE`, `PTC_EVALS_PATH` (`.pi/evals/ptc`), `PTC_SCRIPTS_DIR` (**parsed but never used** — no effect; script export hardcodes `./.pi/scripts`).
+**Paths:** `PTC_LIBRARY_DIR` (default `$PI_CODING_AGENT_DIR/pycells-library`), `PTC_PYTHON_EXECUTABLE`, `PTC_EVALS_PATH` (`.pi/evals/ptc`), `PTC_SCRIPTS_DIR` (**parsed but never used** — no effect; script export hardcodes `./.pi/scripts`).
 
 **Subagents:** `PTC_SUBAGENTS_REPO_URL`, `PTC_SUBAGENTS_SOURCE`, `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` (24).
 
-**Non-`PTC_` vars:** `PI_CODING_AGENT_DIR` (moves `ptc-library` and pi's own config), `PI_SUBAGENT_DEPTH` (set by pi on spawned subagents — skips provisioning and the `pi_subagents` autoimport; spawned agents can't spawn agents), and `PI_CODING_SUBAGENT_DIR` (read by pi-subagents itself — separate agent dir for spawned subagents).
+**Non-`PTC_` vars:** `PI_CODING_AGENT_DIR` (moves `pycells-library` and pi's own config), `PI_SUBAGENT_DEPTH` (set by pi on spawned subagents — skips provisioning and the `pi_subagents` autoimport; spawned agents can't spawn agents), and `PI_CODING_SUBAGENT_DIR` (read by pi-subagents itself — separate agent dir for spawned subagents).
 
 ### What happens if I set a nonsense value for a `PTC_*` variable?
 
@@ -153,7 +153,7 @@ By default the read-only builtins are bridged (`read`, `glob`/`find`, `grep`, `l
 
 ### Where does the notebook library live?
 
-`$PI_CODING_AGENT_DIR/ptc-library` (override with `PTC_LIBRARY_DIR`). Gotcha: a nonstandard `PI_CODING_AGENT_DIR` silently moves it. Note the directory is **not** created at startup — nothing appears there until you use the promote/flow features.
+`$PI_CODING_AGENT_DIR/pycells-library` (override with `PTC_LIBRARY_DIR`). Gotcha: a nonstandard `PI_CODING_AGENT_DIR` silently moves it. Note the directory is **not** created at startup — nothing appears there until you use the promote/flow features.
 
 ---
 
