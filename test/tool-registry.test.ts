@@ -146,7 +146,6 @@ test("ToolRegistry denylist uses every currently registered PTC tool name", () =
   }
 
   const settings = baseSettings({
-    allowBash: true,
     callableTools: [...PTC_TOOL_NAMES],
   });
   assert.deepEqual(registry.getCallableTools(process.cwd(), settings), []);
@@ -158,7 +157,6 @@ function baseSettings(overrides = {}) {
     executionTimeoutMs: 1000,
     outputPreviewChars: 1000,
     maxSpoolChars: 10_000_000,
-    allowBash: false,
     maxParallelToolCalls: 4,
     debugLogging: false,
     autoRoute: true,
@@ -193,8 +191,11 @@ test("custom tools are callable with no allowlist now that mutation gating is go
   const callable = registry.getCallableTools(process.cwd(), baseSettings());
   const names = callable.map((tool) => tool.name);
 
-  // Builtins (read/edit/find/glob/grep/ls/write) plus the custom tool; mutations are no longer gated.
-  assert.deepEqual(names.sort(), ["edit", "find", "glob", "grep", "ls", "query_db", "read", "write"]);
+  // Builtins (bash/read/edit/find/glob/grep/ls/write) plus the custom tool; nothing is gated.
+  assert.deepEqual(
+    names.sort(),
+    ["bash", "edit", "find", "glob", "grep", "ls", "query_db", "read", "write"]
+  );
 });
 
 test("non-read-only custom tools are callable too (mutations are not gated, yolo mode)", () => {

@@ -105,9 +105,8 @@ function validateToolParams(tool: ToolInfo, params: unknown): void {
  *
  * Extension-registered tools shadow host tools with the same name; PTC-owned
  * tools are kept out of the callable set (cells reach them via the RPC bridge
- * instead). Bash is gated by `settings.allowBash`; mutating tools are not
- * gated — the Python process is unsandboxed (yolo mode), so filtering them
- * would be futile enforcement.
+ * instead). No tools are policy-gated (yolo mode): the Python process is
+ * unsandboxed, so filtering the model's tools would be futile enforcement.
  */
 export class ToolRegistry {
   private customTools = new Map<string, ToolInfo>();
@@ -243,10 +242,11 @@ export class ToolRegistry {
   }
 
   /**
-   * Tools exposed to cells as Python helpers: PTC-owned and blocked/allow-listed
-   * tools are excluded, bash requires `settings.allowBash`, and a tool must
-   * permit the `code_execution` caller (builtin/alias, or `ptc.enabled` for
-   * extension tools). Throws on duplicate or reserved Python helper names.
+   * Tools exposed to cells as Python helpers: PTC-owned tools are excluded,
+   * and a tool must permit the `code_execution` caller (builtin/alias, or
+   * `ptc.enabled` for extension tools). No policy gate exists beyond the
+   * PTC_CALLABLE_TOOLS/PTC_BLOCKED_TOOLS lists (yolo mode). Throws on
+   * duplicate or reserved Python helper names.
    */
   getCallableTools(cwd: string, settings: PtcSettings): ToolInfo[] {
     const allTools = this.getAllTools(cwd);
@@ -263,15 +263,11 @@ export class ToolRegistry {
       if (allowSet && !allowSet.has(tool.name)) {
         return false;
       }
-      if (tool.name === "bash" && !settings.allowBash) {
-        return false;
-      }
-
-      // Mutations are NOT gated here: the Python process itself is unsandboxed
-      // (yolo mode), so filtering mutating host tools is futile enforcement —
-      // a cell can just as well use native file operations. PTC_ALLOW_BASH
-      // still gates the bash bridge; real isolation arrives with the planned
-      // VM-based sandboxing.
+      // No tools are policy-gated here: the Python process itself is unsandboxed
+      // (yolo mode), so filtering host tools (bash included — os.system and
+      // subprocess reach the same places) is futile enforcement. Real
+      // isolation arrives with the planned VM-based sandboxing; only the
+      // PTC_CALLABLE_TOOLS/PTC_BLOCKED_TOOLS lists apply.
       const isBuiltin = tool.source === "builtin" || tool.source === "alias";
       return toolAllowsCodeExecutionCaller(tool) && (isBuiltin || tool.ptc?.enabled === true);
     });

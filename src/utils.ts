@@ -80,7 +80,6 @@ export function loadSettingsFromEnv(): PtcSettings {
       DEFAULT_OUTPUT_PREVIEW_CHARS
     ),
     maxSpoolChars: parsePositiveIntEnv(process.env.PTC_MAX_SPOOL_CHARS, DEFAULT_MAX_SPOOL_CHARS),
-    allowBash: parseBooleanEnv(process.env.PTC_ALLOW_BASH, false),
     maxParallelToolCalls: parsePositiveIntEnv(
       process.env.PTC_MAX_PARALLEL_TOOL_CALLS,
       DEFAULT_MAX_PARALLEL_TOOL_CALLS

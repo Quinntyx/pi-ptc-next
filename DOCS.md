@@ -79,7 +79,7 @@ More: [docs/kernels.md](docs/kernels.md)
 
 ## Calling pi tools from Python (the tool bridge)
 
-Inside a cell, pi's tools are plain `async` Python functions generated host-side from each tool's schema. Calls travel as JSON-RPC-style frames to the host, which runs the **real** tool implementation (same paths, truncation, permissions as direct tool use) and normalizes results to Python-friendly shapes: `read` → `str`; `find`/`glob`/`ls` → `list[str]`; `grep` → `{"matches": [...], "matchLimitReached": ...}`; `bash` → `{"stdout", "stderr", "exitCode"}`. A `ptc` helper object adds bounded parallelism: `ptc.gather_limit`, `ptc.read_many`, `ptc.read_tree`, `ptc.find_files`, `ptc.find_files_abs`, `ptc.read_text`, `ptc.json_dump`. All builtins except `bash` are callable by default; `bash` requires `PTC_ALLOW_BASH`. Mutating tools are not gated (see Sandboxing). Per-cell metrics report `estimatedAvoidedTokens` — context the model never had to see.
+Inside a cell, pi's tools are plain `async` Python functions generated host-side from each tool's schema. Calls travel as JSON-RPC-style frames to the host, which runs the **real** tool implementation (same paths, truncation, permissions as direct tool use) and normalizes results to Python-friendly shapes: `read` → `str`; `find`/`glob`/`ls` → `list[str]`; `grep` → `{"matches": [...], "matchLimitReached": ...}`; `bash` → `{"stdout", "stderr", "exitCode"}`. A `ptc` helper object adds bounded parallelism: `ptc.gather_limit`, `ptc.read_many`, `ptc.read_tree`, `ptc.find_files`, `ptc.find_files_abs`, `ptc.read_text`, `ptc.json_dump`. All bridged tools — builtins, `bash`, mutating tools, and `ptc.enabled` custom tools — are callable by default; no tool is policy-gated (see Sandboxing). Per-cell metrics report `estimatedAvoidedTokens` — context the model never had to see.
 
 ```python
 result = await grep("RpcProtocolError", path="src")
@@ -156,7 +156,7 @@ More: [docs/notebook-library.md](docs/notebook-library.md)
 
 ## Sandboxing and subprocess policy
 
-There is **no** container, VM, or isolation substrate — the extension currently only supports "yolo mode" — and there is no opt-in gate either: if the extension is loaded, kernels run as plain `python -u -c <code>` host subprocesses in your cwd with the full host environment inherited, seeing your real filesystem with your real permissions. Sandboxing is planned (VM-based checkpointing) but not implemented. The only tool-level gate that exists today is `bash` needing `PTC_ALLOW_BASH=true`; mutating tools are deliberately not gated (filtering them is futile when the Python process itself can edit files natively), so a minimal install gives the *model* full repo tool access and the Python process full host access. On non-Windows platforms kernels spawn as a detached process group, and cleanup SIGTERMs then SIGKILLs the whole group (including grandchildren such as subagent instances) after a 1 s grace. Don't use this in untrusted workspaces; don't set `PTC_ALLOW_BASH=true` unless you intend the model to run shell commands.
+There is **no** container, VM, or isolation substrate — the extension currently only supports "yolo mode" — and there is no opt-in gate either: if the extension is loaded, kernels run as plain `python -u -c <code>` host subprocesses in your cwd with the full host environment inherited, seeing your real filesystem with your real permissions. Sandboxing is planned (VM-based checkpointing) but not implemented. No tool is policy-gated: the Python process can reach everything natively (`os.system`, `subprocess`, plain file writes), so filtering the model's tools — `bash` included — is futile enforcement. A minimal install gives the *model* full repo tool access and the Python process full host access. On non-Windows platforms kernels spawn as a detached process group, and cleanup SIGTERMs then SIGKILLs the whole group (including grandchildren such as subagent instances) after a 1 s grace. Don't use this in untrusted workspaces.
 
 More: [docs/sandboxing.md](docs/sandboxing.md)
 
@@ -192,7 +192,6 @@ Everything is configured through environment variables, read **once** at extensi
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PTC_ALLOW_BASH` | `false` | Allow the `bash` tool from Python. |
 | `PTC_CALLABLE_TOOLS` | *(unset — all eligible)* | Explicit allowlist of tools callable from Python. |
 | `PTC_BLOCKED_TOOLS` | *(unset)* | Denylist; always wins over the allowlist. |
 

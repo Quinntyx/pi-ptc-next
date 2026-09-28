@@ -6,7 +6,6 @@ export interface PtcSettings {
   /** Emergency per-cell capture ceiling; output below this is always persisted in full. */
   maxSpoolChars: number;
   /** Gates the bash bridge inside cells; mutating tools are deliberately ungated (yolo mode). */
-  allowBash: boolean;
   /** Max tool calls a cell may have in flight at once (RPC bridge concurrency). */
   maxParallelToolCalls: number;
   debugLogging: boolean;

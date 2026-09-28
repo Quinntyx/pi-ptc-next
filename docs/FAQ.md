@@ -51,11 +51,11 @@ The old `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` startup gate was removed — there is
 
 ### Is there any sandboxing or cell-level confinement?
 
-No. Python cells run as a local subprocess and can spawn arbitrary child processes freely — `subprocess.run(['touch', ...])` inside a cell succeeds (rc 0). The extension currently only supports "yolo mode"; VM-based checkpointing is planned but complex and not implemented. `PTC_ALLOW_BASH` (default **false**) gates only the bridged `bash` tool — raw `subprocess` is never blocked, and mutating tools are not gated at all.
+No. Python cells run as a local subprocess and can spawn arbitrary child processes freely — `subprocess.run(['touch', ...])` inside a cell succeeds (rc 0). The extension currently only supports "yolo mode"; VM-based checkpointing is planned but complex and not implemented. No tools are gated — raw `subprocess`/`os.system` work (which is why gating the bridged `bash` tool was dropped as futile), and mutating tools are bridged too.
 
 ### Why does calling `bash(...)` in a cell raise `NameError: name 'bash' is not defined`?
 
-With `PTC_ALLOW_BASH=false` (the default), `bash` is silently filtered out of the bridge, so Python sees a missing name rather than a policy message. The model gets no hint that the tool exists but is blocked by policy — set `PTC_ALLOW_BASH=true` (or use `PTC_CALLABLE_TOOLS` / `PTC_BLOCKED_TOOLS` to tune the allow/deny lists) if you want it. Mutating tools like `edit`/`write` are not gated: filtering them is futile when cells can edit files natively (yolo mode).
+`bash` and mutating tools (`edit`/`write`) are bridged with no opt-in. Filtering them was dropped as futile — cells can run `os.system`/`subprocess` and edit files natively (yolo mode). Use `PTC_CALLABLE_TOOLS` / `PTC_BLOCKED_TOOLS` if you want to reshape the callable set.
 
 ### `provision_kernel` fails with `spawn python3 ENOENT` — what's wrong?
 
@@ -107,7 +107,7 @@ All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
 
 **Required:** none — all variables are optional. (The former mandatory `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` gate was removed; kernels run unsandboxed.)
 
-**Tools/policy:** `PTC_ALLOW_BASH` (false), `PTC_CALLABLE_TOOLS`, `PTC_BLOCKED_TOOLS`.
+**Tools/policy:** `PTC_CALLABLE_TOOLS`, `PTC_BLOCKED_TOOLS`.
 
 **Routing/recovery/sessions:** `PTC_AUTO_ROUTE` (true), `PTC_AUTO_RECOVER` (false), `PTC_AUTO_RECOVER_MAX_ATTEMPTS` (1, parsed 0–4), `PTC_MAX_PYTHON_SESSIONS` (4, clamped 1–32; enforcement currently disabled), `PTC_DEBUG` (false — `[PTC]` debug lines), `PTC_SUBAGENT_FOOTER` (true).
 
@@ -121,7 +121,7 @@ All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
 
 ### What happens if I set a nonsense value for a `PTC_*` variable?
 
-Nothing — silently. Garbage values are swallowed by lenient parsing (`src/utils.ts:10-58`): booleans are true only for `1/true/yes/on`; `parseInt` semantics mean `12abc` → 12 (so `PTC_EXECUTION_TIMEOUT_MS=270_000` becomes 270); `0` fails the `> 0` check and falls back to the default (8 for parallel calls); `999` sessions clamps to 32. Nothing is ever reported. A run with `PTC_AUTO_ROUTE=banana PTC_MAX_PARALLEL_TOOL_CALLS=0 PTC_MAX_PYTHON_SESSIONS=999 PTC_MAX_OUTPUT_CHARS=-5 PTC_MAX_SPOOL_CHARS=oink PTC_ALLOW_BASH=banana PTC_EXECUTION_TIMEOUT_MS=hotdog` loaded, ran a kernel, and produced normal output.
+Nothing — silently. Garbage values are swallowed by lenient parsing (`src/utils.ts:10-58`): booleans are true only for `1/true/yes/on`; `parseInt` semantics mean `12abc` → 12 (so `PTC_EXECUTION_TIMEOUT_MS=270_000` becomes 270); `0` fails the `> 0` check and falls back to the default (8 for parallel calls); `999` sessions clamps to 32. Nothing is ever reported. A run with `PTC_AUTO_ROUTE=banana PTC_MAX_PARALLEL_TOOL_CALLS=0 PTC_MAX_PYTHON_SESSIONS=999 PTC_MAX_OUTPUT_CHARS=-5 PTC_MAX_SPOOL_CHARS=oink PTC_EXECUTION_TIMEOUT_MS=hotdog` loaded, ran a kernel, and produced normal output.
 
 ### Why does my cell keep getting interrupted with `KeyboardInterrupt`?
 
@@ -147,7 +147,7 @@ Children spawned from a cell inherit the interpreter's RPC pipes. Any child that
 
 ### Which host tools can my Python code call, and how do I get more?
 
-By default a safe built-in subset is bridged (`read`, `glob`/`find`, `grep`, `ls`, and more — see README "Available Python functions" and `docs/tool-bridge.md`). `bash` needs `PTC_ALLOW_BASH=true`; mutating tools are not gated. Blocked tools show up as bare `NameError`s (see above).
+By default a safe built-in subset is bridged (`read`, `glob`/`find`, `grep`, `ls`, and more — see README "Available Python functions" and `docs/tool-bridge.md`). Nothing is gated. (Historical note: tools excluded via `PTC_BLOCKED_TOOLS`/`PTC_CALLABLE_TOOLS` show up as bare `NameError`s — see above.)
 
 ### Where does the notebook library live?
 

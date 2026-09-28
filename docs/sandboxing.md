@@ -2,7 +2,7 @@
 
 ## What it does
 
-`pi-ptc-next` executes Python by spawning a real interpreter process on your host machine — there is no container, VM, or other isolation substrate. **There is currently no sandboxing at all: the extension only supports “yolo mode.”** Sandboxing is work-in-progress/planned — the intended direction is some form of VM-based checkpointing, but the implementation is complex and not started. The only policy layer left is `PTC_ALLOW_BASH`, which gates the bridged `bash` tool. Mutating tools are deliberately not gated: with the Python process itself unsandboxed, filtering the model's mutating tools is futile enforcement — a cell can edit files natively. In short: the “sandbox” is plain host execution plus a single tool gate, not isolation.
+`pi-ptc-next` executes Python by spawning a real interpreter process on your host machine — there is no container, VM, or other isolation substrate. **There is currently no sandboxing at all: the extension only supports “yolo mode.”** Sandboxing is work-in-progress/planned — the intended direction is some form of VM-based checkpointing, but the implementation is complex and not started. There is no policy layer at all: gating the model's tools is futile enforcement when the Python process itself can run `os.system`, spawn `subprocess`, and write files natively. In short: the “sandbox” is plain host execution, not isolation.
 
 ## How it works
 
@@ -33,8 +33,7 @@ The shared venv is the same one the pi_subagents provisioner creates (`uv venv` 
 
 Independently of the subprocess gate, the tool registry (`src/tool-registry.ts:236-250`) gates which pi tools are callable:
 
-- `bash` is blocked unless `PTC_ALLOW_BASH=true`.
-- `bash` is blocked unless `PTC_ALLOW_BASH=true`. All other tools (including mutating ones like `edit`/`write`) are callable by default; custom tools must opt in via `ptc: { enabled: true, ... }`.
+- All bridged tools — builtins, `bash`, mutating tools like `edit`/`write` — are callable by default; custom tools must opt in via `ptc: { enabled: true, ... }`. Only `PTC_CALLABLE_TOOLS`/`PTC_BLOCKED_TOOLS` reshape the set.
 
 So a fresh install out of the box gives Python read-only access to your repo through the pi tool helpers — no shell, no file writes from the model. The subprocess itself, however, runs unsandboxed on your host.
 
@@ -61,14 +60,13 @@ import platform, os
 print(platform.python_version(), os.getcwd())
 ```
 
-With `PTC_ALLOW_BASH` unset (the default), a cell calling `bash()` raises `NameError` because the tool was filtered out of the bridge at startup. Remember that the Python process itself is unsandboxed: the flag gates what the *model* can reach through the tool bridge, not what Python could do directly.
+A cell calling `bash()` gets the bridged tool with no opt-in required — and remember the Python process is unsandboxed anyway: `os.system` and `subprocess.Popen` reach the same places, which is why no gate exists.
 
 ## Options / Configuration
 
 | Env var | Default | Effect |
 | --- | --- | --- |
 | `PTC_PYTHON_EXECUTABLE` | *(unset)* | Interpreter used for all kernels; overrides the `~/.cache/pi-ptc/python-env` venv and `python3` fallback |
-| `PTC_ALLOW_BASH` | `false` | Allow the `bash` tool from Python |
 | `PTC_EXECUTION_TIMEOUT_MS` | `270000` | Hard idle timeout for a Python execution (activity re-arms it) |
 | `PTC_DEBUG` | `false` | Debug logging; emits e.g. `Using subprocess runtime (no sandboxing substrate yet)` |
 | `PTC_SUBAGENTS_PROFILE` | *(unset)* | pi profile directory passed to subagent instances as `PI_SUBAGENTS_PROFILE` around each spawn |
@@ -84,4 +82,4 @@ Several defaults encode the author's machine layout. None break execution — ke
 - **Author-specific dev-checkout default**: when `PTC_SUBAGENTS_SOURCE` is unset, the provisioner probes `~/docs/src/pi-subagents` (`DEV_SOURCE_DEFAULT`) and installs it editable if it exists. On the author's machine this silently shadows the managed clone; elsewhere it just doesn't exist and the managed clone is used.
 - **pi profile assumptions**: `PTC_SUBAGENTS_PROFILE` / `PI_SUBAGENTS_PROFILE` assume a pi profiles layout like `~/.config/pi/profiles/subagents`. If you don't use pi profiles, leave it unset — kernels spawn with the host environment unchanged and subagents use their own defaults.
 - **Sync stamp inside the extension clone**: `.ptc-subagents-sync.json` lives in the extension's own directory and is re-synced after every `pi update` (the stamp is wiped by the update). This only matters if you rely on the managed pi-subagents clone; the venv itself is untouched.
-- **No isolation to lean on**: execution is a plain host subprocess — no barrier exists between the Python process and your system, and the only model-facing gate is `PTC_ALLOW_BASH`. Don't use this extension in untrusted workspaces, and don't enable `PTC_ALLOW_BASH` unless you intend the model to run shell commands.
+- **No isolation to lean on**: execution is a plain host subprocess — no barrier exists between the Python process and your system, and no model-facing gate exists either. Don't use this extension in untrusted workspaces.

@@ -26,7 +26,7 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
 To remove: `pi remove git:github.com/Quinntyx/pi-ptc-next`.
 
-> **⚠️ No sandboxing yet — yolo mode only.** Kernels run as plain host Python subprocesses with your real filesystem, permissions, and environment. Sandboxing is planned (VM-based checkpointing) but not implemented — the implementation is complex. `PTC_ALLOW_BASH` gates the bridged `bash` tool only; mutating tools are not gated at all — none of it constrains the Python process itself. Don't use this in untrusted workspaces.
+> **⚠️ No sandboxing yet — yolo mode only.** Kernels run as plain host Python subprocesses with your real filesystem, permissions, and environment. Sandboxing is planned (VM-based checkpointing) but not implemented — the implementation is complex. No tools are policy-gated — `os.system` and `subprocess` reach the same places the bridged `bash` tool would, so filtering is futile; none of it constrains the Python process itself. Don't use this in untrusted workspaces.
 
 ## Requirements
 

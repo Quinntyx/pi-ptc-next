@@ -108,7 +108,6 @@ All of these are environment variables read at tool-call selection time:
 |---|---|---|
 | `PTC_CALLABLE_TOOLS` | unset | Comma-separated allowlist of callable tools (e.g. `read,glob,find,grep,ls`). When set, *only* these tools are callable. |
 | `PTC_BLOCKED_TOOLS` | unset | Comma-separated denylist; wins over everything else. |
-| `PTC_ALLOW_BASH` | `false` | Must be true for `bash()` to be exposed. |
 | `PTC_MAX_PARALLEL_TOOL_CALLS` | `8` | Default concurrency for `ptc.gather_limit()` / `ptc.read_many()` / `ptc.read_tree()`. |
 | `PTC_EXECUTION_TIMEOUT_MS` | `270000` | Hard cell timeout; bounds the total time nested calls may take. |
 | `PTC_DEBUG` | `false` | Debug logging. |

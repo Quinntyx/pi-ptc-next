@@ -43,8 +43,7 @@ starting a new pi session (or reloading the extension), not just setting it mid-
 Set variables in the shell that launches pi (or in your pi profile's environment):
 
 ```bash
-# Expose the bridged bash tool to Python; raise the per-cell timeout
-export PTC_ALLOW_BASH=true
+# Raise the per-cell timeout
 export PTC_EXECUTION_TIMEOUT_MS=600000
 
 # Give the model a larger head/tail preview of cell output
@@ -66,9 +65,9 @@ import os, json
 return json.dumps({k: v for k, v in os.environ.items() if k.startswith("PTC_")}, indent=2)
 ```
 
-Without `PTC_ALLOW_BASH` the bridged `bash` tool is filtered out of cells; mutating tools are not
-gated (see `docs/sandboxing.md` for why). There is no required opt-in for Python execution itself:
-kernels run unsandboxed as host subprocesses (yolo mode — sandboxing is planned, not implemented).
+No tools are policy-gated: kernels run unsandboxed as host subprocesses (yolo mode — sandboxing is
+planned, not implemented), so gating the model's tools would be futile enforcement. Only
+`PTC_CALLABLE_TOOLS`/`PTC_BLOCKED_TOOLS` reshape the callable set.
 
 ## Environment variables
 
@@ -88,13 +87,12 @@ that file.
 
 Tool filtering happens in `ToolRegistry.getCallableTools` (`src/tool-registry.ts`):
 `PTC_BLOCKED_TOOLS` is checked first (denylist always wins), then `PTC_CALLABLE_TOOLS`
-(when set, only listed tools pass), then `bash` requires `PTC_ALLOW_BASH`. Mutating tools
-are deliberately not gated — the Python process is unsandboxed (yolo mode), so filtering
-the model's mutating tools is futile enforcement.
+(when set, only listed tools pass). Nothing else is gated — the Python process is
+unsandboxed (yolo mode), so filtering the model's tools (`bash` included) is futile
+enforcement.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `PTC_ALLOW_BASH` | bool | `false` | Allow the `bash` tool from Python. |
 | `PTC_CALLABLE_TOOLS` | comma list | *(unset — all eligible tools)* | Explicit allowlist override. |
 | `PTC_BLOCKED_TOOLS` | comma list | *(unset)* | Explicit denylist; wins over the allowlist. |
 
