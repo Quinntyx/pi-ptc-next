@@ -27,7 +27,7 @@ The shared venv is the same one the pi_subagents provisioner creates (`uv venv` 
 - On non-Windows platforms, kernels are spawned as a **detached process group** (`detected: true` / `detached: true` in `spawn`). This lets cleanup signal the whole group — including grandchild processes user code spawned (e.g. subagent instances holding RPC pipes) — instead of leaving orphans behind.
 - `terminate()` signals `-pid` (the group) on non-Windows; on Windows, or if the group is already gone (`ESRCH`), it falls back to `proc.kill(signal)` (`src/sandbox-manager.ts:68-82`).
 - `cleanup()` sends `SIGTERM` to all tracked children, waits up to 1 s (`PROCESS_TERMINATION_GRACE_MS`), then `SIGKILL`s survivors and waits again (`src/sandbox-manager.ts:84-102`).
-- The `SandboxManager` contract is evolving; `python-session-manager.ts:1075-1105` keeps a compatibility shim for older manager implementations whose `spawn` takes a single options object (detected via `fn.length`), and temporarily sets `PI_SUBAGENTS_PROFILE` on `process.env` around synchronous spawns when `PTC_SUBAGENTS_PROFILE` is configured.
+- The `SandboxManager` contract is evolving; `python-session-manager.ts` keeps a compatibility shim for older manager implementations whose `spawn` takes a single options object (detected via `fn.length`). Subagent agent-dir selection is purely env-driven (`PI_CODING_SUBAGENT_DIR` / `PI_CODING_AGENT_DIR`, inherited by kernels).
 
 ### What's blocked by default (tool policy)
 
@@ -69,7 +69,6 @@ A cell calling `bash()` gets the bridged tool with no opt-in required — and re
 | `PTC_PYTHON_EXECUTABLE` | *(unset)* | Interpreter used for all kernels; overrides the `~/.cache/pi-ptc/python-env` venv and `python3` fallback |
 | `PTC_EXECUTION_TIMEOUT_MS` | `270000` | Hard idle timeout for a Python execution (activity re-arms it) |
 | `PTC_DEBUG` | `false` | Debug logging; emits e.g. `Using subprocess runtime (no sandboxing substrate yet)` |
-| `PTC_SUBAGENTS_PROFILE` | *(unset)* | pi profile directory passed to subagent instances as `PI_SUBAGENTS_PROFILE` around each spawn |
 
 There are no sandbox-specific settings beyond these — no container image, network policy, or filesystem allowlist exists because no isolation substrate is implemented. VM-based kernel checkpointing is the planned direction (see the yolo-mode note at the top); until it lands, treat every kernel as your own host Python.
 
@@ -80,6 +79,6 @@ Several defaults encode the author's machine layout. None break execution — ke
 - **Hardcoded cache root `~/.cache/pi-ptc`** (`src/subagents-env.ts` `defaultCacheRoot()`). The venv `~/.cache/pi-ptc/python-env` is created by the subagents provisioner and preferred over `python3` by every kernel. If you don't want your kernels to silently switch interpreters when that venv appears, set `PTC_PYTHON_EXECUTABLE` explicitly.
 - **`pi_subagents` source**: the managed clone defaults to the public GitHub mirror `https://github.com/Quinntyx/pi-subagents` (`DEFAULT_REPO_URL`, `src/subagents-env.ts`) and clones anonymously. Point `PTC_SUBAGENTS_REPO_URL` at your own fork, or `PTC_SUBAGENTS_SOURCE` at a local checkout to install editable instead of cloning.
 - **Author-specific dev-checkout default**: when `PTC_SUBAGENTS_SOURCE` is unset, the provisioner probes `~/docs/src/pi-subagents` (`DEV_SOURCE_DEFAULT`) and installs it editable if it exists. On the author's machine this silently shadows the managed clone; elsewhere it just doesn't exist and the managed clone is used.
-- **pi profile assumptions**: `PTC_SUBAGENTS_PROFILE` / `PI_SUBAGENTS_PROFILE` assume a pi profiles layout like `~/.pi/agent/profiles/subagents`. If you don't use pi profiles, leave it unset — kernels spawn with the host environment unchanged and subagents use their own defaults.
+- **Subagent agent-dir selection**: subagents run under the orchestrator's own agent dir by default (`PI_CODING_AGENT_DIR` else `~/.pi/agent`); `PI_CODING_SUBAGENT_DIR` points them at any other directory with a pi config. No pi-profiles dependency either way.
 - **Sync stamp inside the extension clone**: `.ptc-subagents-sync.json` lives in the extension's own directory and is re-synced after every `pi update` (the stamp is wiped by the update). This only matters if you rely on the managed pi-subagents clone; the venv itself is untouched.
 - **No isolation to lean on**: execution is a plain host subprocess — no barrier exists between the Python process and your system, and no model-facing gate exists either. Don't use this extension in untrusted workspaces.

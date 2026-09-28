@@ -18,7 +18,7 @@ No environment variables are required — but note there is **no sandboxing**: k
 
 ### Do I need pi-profiles?
 
-No. There is no pi-profiles *package* dependency anywhere in pi-ptc-next. Kernels don't need profiles at all. Subagent spawning (via `pi_subagents`) needs a pi *profile directory* named `subagents` (`$PI_SUBAGENTS_PROFILE` or `~/.pi/agent/profiles/subagents`), which is resolved by pi-subagents itself, not by pi-profiles. The host only forwards `PI_SUBAGENTS_PROFILE` into the kernel env when `PTC_SUBAGENTS_PROFILE` is set (`src/python-session-manager.ts:1077-1104`); otherwise the child inherits the ambient env and pi-subagents uses its default path.
+No. There is no pi-profiles *package* dependency anywhere in pi-ptc-next, and kernels don't need profiles. Subagent spawning (via `pi_subagents`) runs spawned agents under the **orchestrator's own agent dir by default** (`PI_CODING_AGENT_DIR` else `~/.pi/agent`) — same config, extensions, and auth, zero setup. To give subagents a separate config, set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config (a pi-profiles-managed profile directory works). Resolution lives entirely in pi-subagents.
 
 ### Does it work without tmux?
 
@@ -115,9 +115,9 @@ All `PTC_*` vars (from `src/utils.ts:10-95` and `docs/configuration.md`):
 
 **Paths:** `PTC_LIBRARY_DIR` (default `$PI_CODING_AGENT_DIR/ptc-library`), `PTC_PYTHON_EXECUTABLE`, `PTC_EVALS_PATH` (`.pi/evals/ptc`), `PTC_SCRIPTS_DIR` (**parsed but never used** — no effect; script export hardcodes `./.pi/scripts`).
 
-**Subagents:** `PTC_SUBAGENTS_REPO_URL`, `PTC_SUBAGENTS_SOURCE`, `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` (24), `PTC_SUBAGENTS_PROFILE`.
+**Subagents:** `PTC_SUBAGENTS_REPO_URL`, `PTC_SUBAGENTS_SOURCE`, `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` (24).
 
-**Non-`PTC_` vars:** `PI_CODING_AGENT_DIR` (moves `ptc-library` and pi's own config), `PI_SUBAGENT_DEPTH` (set by pi on spawned subagents — skips provisioning and the `pi_subagents` autoimport; spawned agents can't spawn agents), and `PI_SUBAGENTS_PROFILE` (read by pi-subagents itself).
+**Non-`PTC_` vars:** `PI_CODING_AGENT_DIR` (moves `ptc-library` and pi's own config), `PI_SUBAGENT_DEPTH` (set by pi on spawned subagents — skips provisioning and the `pi_subagents` autoimport; spawned agents can't spawn agents), and `PI_CODING_SUBAGENT_DIR` (read by pi-subagents itself — separate agent dir for spawned subagents).
 
 ### What happens if I set a nonsense value for a `PTC_*` variable?
 
@@ -170,7 +170,7 @@ Remove all of these (tested paths):
 - The extension: `pi remove <pkg>` (e.g. `pi remove git:github.com/Quinntyx/pi-ptc-next`, ~0.3s), and the `"packages"` entry it wrote in `settings.json` for local-path installs.
 - `PI_CODING_AGENT_DIR` tree (e.g. `/tmp/.../pi-home`) if you used a throwaway one.
 - `$HOME/.cache/pi-ptc` — the venv, the managed pi-subagents clone, `subagents-sync.log`, and the lock file.
-- `$HOME/.pi/agent/profiles/subagents` if you created a subagents profile.
+- `$HOME/.pi/agent/profiles/subagents` if you gave subagents their own pi-profiles-managed profile via `PI_CODING_SUBAGENT_DIR`.
 - The repo copy, test notebooks, and `$HOME/.pi/pi-sock` sockets.
 
 Verified no orphans remained after cleanup (`ps aux` for `python-env/bin/python` came back empty).

@@ -21,7 +21,6 @@ export interface PtcSettings {
   scriptsDir?: string;
   /** Reusable notebook library; env fallback is PTC_LIBRARY_DIR. */
   libraryDir?: string;
-  subagentsProfile?: string;
   /** Whether the subagent status footer is shown in exec_cell results. */
   subagentFooter: boolean;
 }

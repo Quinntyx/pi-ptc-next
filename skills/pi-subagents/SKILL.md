@@ -18,8 +18,9 @@ metadata:
 - A live Jupyter-like kernel (`provision_kernel`), or the ability to provision
   one. Every kernel requires a notebook path (.ipynb); for throwaway scratch
   work pass a /tmp path — throwaway kernels work exactly like durable ones.
-- A tmux environment with the `subagents` pi profile (checked at import; the
-  API raises plainly when absent).
+- A tmux environment (checked at import; the API raises plainly when absent).
+   Spawned agents run under the orchestrator's own agent dir by default
+   (`PI_CODING_SUBAGENT_DIR` overrides).
 - Model or effort-level requests, when the user names them, resolved through
   the catalog helpers rather than guessed.
 

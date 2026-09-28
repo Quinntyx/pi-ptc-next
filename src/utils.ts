@@ -92,7 +92,6 @@ export function loadSettingsFromEnv(): PtcSettings {
     blockedTools: parseListEnv(process.env.PTC_BLOCKED_TOOLS),
     maxPythonSessions: parseClampedIntEnv(process.env.PTC_MAX_PYTHON_SESSIONS, 4, 1, 32),
     scriptsDir: emptyToUndefined(process.env.PTC_SCRIPTS_DIR),
-    subagentsProfile: emptyToUndefined(process.env.PTC_SUBAGENTS_PROFILE),
     subagentFooter: parseBooleanEnv(process.env.PTC_SUBAGENT_FOOTER, true),
   } satisfies PtcSettings;
 

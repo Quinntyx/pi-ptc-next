@@ -16,7 +16,7 @@ Syncs are throttled by a stamp file, `<extensionRoot>/.ptc-subagents-sync.json`,
 
 **Import and depth.** The kernel prelude auto-imports the module as both `pi_subagents` and `subagents` (`src/execution/session-prelude.ts:37-52`). When `PI_SUBAGENT_DEPTH` is set (pi's convention for spawned subagents), the autoimport is skipped; the import itself raises `NotImplementedError` at depth ≥ 1, and the extension adds a system-prompt note telling the agent that spawning is unavailable but `exec_cell` still works (`src/index.ts:1534-1544`). Spawned agents can never spawn agents.
 
-**Runtime.** Each `subagents.Task` becomes a real interactive pi process in a tmux window titled `pi - (subagent) <name> - <cwd>`, prompted over a per-agent unix socket. Spawned agents run with the `subagents` pi profile (see Configuration). Progress flows back as `subagent_state` frames over the kernel's RPC pipe (`src/python-runtime/session.py:32-36`), fans out through the session manager to:
+**Runtime.** Each `subagents.Task` becomes a real interactive pi process in a tmux window titled `pi - (subagent) <name> - <cwd>`, prompted over a per-agent unix socket. Spawned agents run under the orchestrator's agent dir by default, or `PI_CODING_SUBAGENT_DIR` when set (see Configuration). Progress flows back as `subagent_state` frames over the kernel's RPC pipe (`src/python-runtime/session.py:32-36`), fans out through the session manager to:
 
 - A **live panel** under the running cell, grouped by pool/stage (`src/execution/subagent-panel.ts`): ○ starting, ● running, ✓ settled, ✗ failed, with elapsed time, tool-call counts, context usage, and the current tool call. Queued rows are capped at 2 (`… N more queued`); group elapsed time freezes at the furthest completed endpoint when nothing is executing.
 - A **status footer** — `subagents: ● N running · ✓ M done` — filtered to agents relevant to the current exec (`src/index.ts:1459-1488`).
@@ -82,7 +82,6 @@ For long or destructive workflows, put the entire declared workflow in one cell 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PTC_SUBAGENTS_PROFILE` | unset | Name/path forwarded to the interpreter as `PI_SUBAGENTS_PROFILE`; selects the pi profile subagent instances run under (`src/utils.ts:90`, `src/python-session-manager.ts:1077-1102`) |
 | `PTC_SUBAGENT_FOOTER` | `true` | Set `false` to hide the `subagents:` status footer (for custom footers consuming the `pi-ptc:subagent-runtime` API) |
 | `PTC_SUBAGENTS_SOURCE` | `~/docs/src/pi-subagents` | Dev checkout to install `pi_subagents` from, preferred over the managed clone |
 | `PTC_SUBAGENTS_REPO_URL` | `https://github.com/Quinntyx/pi-subagents` | Git source for the managed clone |
@@ -95,11 +94,10 @@ For long or destructive workflows, put the entire declared workflow in one cell 
 | --- | --- | --- |
 | `PI_SUBAGENTS_MAX_CONCURRENT` | `8` | Global cap across all pools; stage `slots` are priorities, not hard limits |
 | `PI_SUBAGENTS_CATALOG_TTL` | `120` s | Model-catalog cache lifetime before a live re-check |
-| `PI_SUBAGENTS_PROFILE` | `~/.pi/agent/profiles/subagents` | pi profile directory subagent instances launch with |
+| `PI_CODING_SUBAGENT_DIR` | *(unset — subagents share the orchestrator's agent dir)* | Agent dir spawned subagent instances run under (env `PI_CODING_SUBAGENT_DIR`; the Task `profile` kwarg can override per task) |
 
 ### Settings
 
-- `subagentsProfile` (`src/contracts/settings.ts:22`) — the settings-file form of `PTC_SUBAGENTS_PROFILE`.
 - `subagentFooter` (`src/contracts/settings.ts:23`) — the settings-file form of `PTC_SUBAGENT_FOOTER` (default `true`).
 
 ## Standalone setup notes
@@ -108,7 +106,7 @@ This feature was built on the author's machine and several defaults only work th
 
 - **Source URL.** `PTC_SUBAGENTS_REPO_URL` defaults to the public GitHub mirror (`https://github.com/Quinntyx/pi-subagents`) and works anonymously. Point it at your own fork if you maintain one: `export PTC_SUBAGENTS_REPO_URL=https://github.com/<you>/pi-subagents`. The provisioner shells out to plain `git`, so the URL must be reachable by your credential helper.
 - **Author-specific dev-checkout path.** `PTC_SUBAGENTS_SOURCE` defaults to `~/docs/src/pi-subagents` (joined from your homedir, `src/subagents-env.ts:50`). If you don't have that directory nothing breaks — resolution falls through to the managed clone — but set `PTC_SUBAGENTS_SOURCE` if you keep a checkout elsewhere.
-- **tmux + the `subagents` pi profile are hard requirements.** The module checks at import that it is running under tmux with the `subagents` pi profile and raises plainly otherwise. You must have tmux installed and a pi profile directory named exactly `subagents` (default `~/.pi/agent/profiles/subagents`) configured with whatever the spawned instances need — the author's profile wires in extensions such as `pi-sock` (the prompt-delivery transport) and `pi-tool-tree`. If you keep sessions elsewhere set `PI_CODING_AGENT_DIR` accordingly and place `profiles/subagents` under it.
+- **tmux is the only hard requirement.** `pi_subagents` warns at import when not running under tmux (its API then raises `NotImplementedError`). Spawned agents run under the orchestrator's own agent dir by default, so your existing extensions (pi-sock for prompt delivery — required for spawning — and optionally pi-tool-tree) and auth carry over with zero setup. For a separate subagent environment set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config.
 - **`pi_subagents` is not on PyPI / npm.** It is fetched from git at sync time. Without network access to a valid repo, provisioning fails (stamped, and logged to `~/.cache/pi-ptc/subagents-sync.log`); a previous working checkout or dev source keeps working. You can also supply any checkout via `PTC_SUBAGENTS_SOURCE` — it must contain a `pyproject.toml` at its root or under a `main/` subdirectory.
 - **Machine cache layout.** The venv (`python-env/`), managed clone (`pi-subagents/`), sync log, and lock file all live under `~/.cache/pi-ptc/` (non-configurable in code). The venv is used for *all* PTC kernels, even if you never use subagents; delete it if you want kernels on a different interpreter.
 - **`uv` and `git` assumed.** `uv` is preferred for venv creation and editable installs (falls back to `python3 -m venv` / `pip`); `git` is required for the managed-clone path.

@@ -37,7 +37,7 @@ To remove: `pi remove git:github.com/Quinntyx/pi-ptc-next`.
 - **Node.js** and **Pi** (the host agent; tested with pi ≥ 0.87 and Node ≥ 20).
 - **Python ≥ 3.10** on PATH — or **`uv`**, which can fetch and manage Python for you (if `uv` is installed, `python3` on PATH is optional). `PTC_PYTHON_EXECUTABLE` pins a specific interpreter.
 - **`uv`** — optional but recommended; powers `provision_dependency` installs and the shared Python environment.
-- **Subagent orchestration only:** the terminal multiplexer **tmux** (`tmux -V` to check), a small relay helper called **pi-sock**, and the **pi_subagents** Python module (installed for you at session start), running in a dedicated pi settings folder (`subagents` profile — a directory pi-profiles manages for you). If that sounds like more setup than you want today, skip it: every other feature works without it.
+- **Subagent orchestration only:** the terminal multiplexer **tmux** (`tmux -V` to check), a small relay helper called **pi-sock** installed in your normal pi config, and the **pi_subagents** Python module (installed for you at session start). Subagents run under your own agent dir by default — no profiles or extra setup; `PI_CODING_SUBAGENT_DIR` gives them a separate config if you ever want one.
 
 ## Usage
 

@@ -780,27 +780,29 @@ test("session protocol: process exit rejects pending inspect and export calls", 
   }
 });
 
-test("session manager: spawn receives profile in explicit env without leaking process.env", async () => {
-  const original = process.env.PI_SUBAGENTS_PROFILE;
-  process.env.PI_SUBAGENTS_PROFILE = "host-profile";
+test("session manager: spawn env passes subagent agent-dir selection through untouched", async () => {
+  // Agent-dir selection is env-driven end to end now: whatever
+  // PI_CODING_SUBAGENT_DIR / PI_CODING_AGENT_DIR the host process carries is
+  // what the kernel (and its subagents) see. No PTC-side translation.
+  const original = process.env.PI_CODING_SUBAGENT_DIR;
+  process.env.PI_CODING_SUBAGENT_DIR = "/tmp/subagent-dir";
   let spawnedEnv;
   const { manager } = makeFakeManager({
     optionsApi: true,
-    settingsOverrides: { subagentsProfile: "session-profile" },
     onSpawn({ env }) {
       spawnedEnv = env;
     },
   });
   try {
     await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
-    assert.equal(spawnedEnv.PI_SUBAGENTS_PROFILE, "session-profile");
-    assert.equal(process.env.PI_SUBAGENTS_PROFILE, "host-profile");
+    assert.equal(spawnedEnv.PI_CODING_SUBAGENT_DIR, "/tmp/subagent-dir");
   } finally {
     await manager.disposeAll();
-    if (original === undefined) delete process.env.PI_SUBAGENTS_PROFILE;
-    else process.env.PI_SUBAGENTS_PROFILE = original;
+    if (original === undefined) delete process.env.PI_CODING_SUBAGENT_DIR;
+    else process.env.PI_CODING_SUBAGENT_DIR = original;
   }
 });
+
 
 test("session manager: background execution methods are removed", () => {
   const { manager } = makeFakeManager();

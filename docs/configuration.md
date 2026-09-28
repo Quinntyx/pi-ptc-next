@@ -127,7 +127,6 @@ optional `pi_subagents` package (`src/subagents-env.ts`). Provisioning runs only
 | `PTC_SUBAGENTS_REPO_URL` | URL | `https://github.com/Quinntyx/pi-subagents` | Where the provisioner clones pi-subagents from when no dev checkout is found. |
 | `PTC_SUBAGENTS_SOURCE` | path | `~/docs/src/pi-subagents` (if it exists) | Dev checkout installed editable instead of the managed clone; only used when the directory actually contains a `pyproject.toml`. |
 | `PTC_SUBAGENTS_SYNC_INTERVAL_HOURS` | number | `24` | Minimum interval between syncs; a younger sync stamp in the extension clone skips re-sync. |
-| `PTC_SUBAGENTS_PROFILE` | path | *(unset)* | Forwarded to kernels as `PI_SUBAGENTS_PROFILE` around each spawn (`src/python-session-manager.ts:1077-1096`), telling `pi_subagents` which pi profile to launch subagent instances with. |
 
 ### Fixed limits (not configurable)
 
@@ -153,11 +152,10 @@ Items that assume the author's machine layout, and the workaround for each:
   author's machine this silently wins over the managed clone. If you happen to have a
   directory there it will be used too — set the variable explicitly (or leave it pointing at
   a path that doesn't exist) to control which source is installed.
-- **`subagents` pi profile assumption.** When `PTC_SUBAGENTS_PROFILE` is set, subagents are
-  launched with that pi profile directory; the pi-subagents package itself defaults to
-  `~/.pi/agent/profiles/subagents`, which assumes you created a pi profile named exactly
-  `subagents` under the agent dir (`~/.pi/agent/profiles/`). If you don't use pi profiles, leave
-  `PTC_SUBAGENTS_PROFILE` unset — kernels spawn with your environment unchanged.
+- - **Subagent agent-dir selection.** Spawned subagents run under the orchestrator's own
+  agent dir by default (`PI_CODING_AGENT_DIR` else `~/.pi/agent`) — same config, extensions,
+  and auth, zero setup. Set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config
+  (a pi-profiles-managed profile directory works) to give them a separate environment.
 - **Venv and cache root under `~/.cache/pi-ptc`.** The provisioner creates
   `~/.cache/pi-ptc/python-env` (via `uv` if available, else `python3 -m venv`) and a managed
   `pi-subagents` clone there. Once that venv exists, every kernel prefers its interpreter

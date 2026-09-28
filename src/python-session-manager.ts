@@ -1167,10 +1167,10 @@ export class PythonSessionManager {
   }
 
   private spawnSession(code: string, cwd: string): ChildProcess {
+    // Subagent agent-dir selection is env-driven end to end: the kernel
+    // inherits PI_CODING_SUBAGENT_DIR / PI_CODING_AGENT_DIR from this process
+    // and pi_subagents resolves it — no PTC-side translation needed.
     const env: NodeJS.ProcessEnv = { ...process.env };
-    if (this.settings.subagentsProfile) {
-      env.PI_SUBAGENTS_PROFILE = this.settings.subagentsProfile;
-    }
 
     // The current sandbox API takes one options object. Keep a compatibility
     // path for older SandboxManager implementations while the contract migration
@@ -1182,20 +1182,7 @@ export class PythonSessionManager {
       return spawnWithOptions.call(this.sandboxManager, { code, cwd, env });
     }
 
-    if (!this.settings.subagentsProfile) {
-      return this.sandboxManager.spawn(code, cwd);
-    }
-    const previous = process.env.PI_SUBAGENTS_PROFILE;
-    try {
-      process.env.PI_SUBAGENTS_PROFILE = this.settings.subagentsProfile;
-      return this.sandboxManager.spawn(code, cwd);
-    } finally {
-      if (previous === undefined) {
-        delete process.env.PI_SUBAGENTS_PROFILE;
-      } else {
-        process.env.PI_SUBAGENTS_PROFILE = previous;
-      }
-    }
+    return this.sandboxManager.spawn(code, cwd);
   }
 
   /**
