@@ -35,7 +35,7 @@ This surfaces as a failed per-agent pool result, not a cell crash — the cell c
 
 ### What happens without pi-tool-tree?
 
-Everything functional works; only cosmetics degrade. `withActivityLabel()` looks up `globalThis[Symbol.for("pi-tool-tree:activity-api")]` and returns the tool unchanged if the wrapper is absent (`src/utils.ts:382-400`); the subagent-panel shimmer falls back to `theme.fg("muted", word)` (`src/execution/subagent-panel.ts:27-31`). Verified in both directions — without pi-tool-tree everything worked; with it installed, `ptc.read_tree(...)` ran fine with no conflicts. The only cost is the `activity` label on tool calls and the shimmer animation.
+Everything functional works; only cosmetics degrade. `withActivityLabel()` looks up `globalThis[Symbol.for("pi-tool-tree:activity-api")]` and returns the tool unchanged if the wrapper is absent (`src/utils.ts`), so tool rows render plainly. The shimmer animation is vendored into pi-pycells (`src/execution/shimmer.ts`) and works without pi-tool-tree — the only loss is the live activity labels/words on agent rows and tool calls.
 
 ### Do I need to run `npm install` or `npm run build` before installing?
 

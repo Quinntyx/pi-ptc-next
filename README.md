@@ -26,7 +26,7 @@ Fork of [`edxeth/pi-ptc-next`](https://github.com/edxeth/pi-ptc-next), which its
 
    Success looks like the cell returning `Out[2]: 2` (or similar) in a few seconds.
 
-3. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies)); everything else works without it. The Python half (`pi_subagents`) is provisioned automatically in the background on first use — provisioning problems are logged to `~/.cache/pi-pycells/subagents-sync.log` and never block the core extension.
+3. **Optional — subagent orchestration.** To let cells spawn parallel Pi subagents, install the `pi_subagents` stack in a tmux-capable environment (see [Optional dependencies](#optional-dependencies) for the pieces); everything else works without it. Subagents share your Pi configuration by default, and can get their own via `PI_CODING_SUBAGENT_DIR` (see the subagents section below). The Python half (`pi_subagents`) is provisioned automatically: **every time pi starts** with the extension loaded, a background job installs it into the shared Python venv (from the public GitHub mirror) — whether or not you ever use subagents. It's a one-time setup (re-checked daily after that), problems are logged to `~/.cache/pi-pycells/subagents-sync.log` with a single `[PTC]` startup warning, and they never block the core extension.
 
 To remove: `pi remove git:github.com/Quinntyx/pi-pycells`.
 
@@ -80,6 +80,8 @@ pool.close()   # tears down every spawned agent window
 
 Results come back in completion order, sessions can be reused for follow-ups, and a live progress panel renders in the chat while the cell runs.
 
+**Separate configuration for subagents (optional).** By default, subagents are full pi instances sharing your configuration — same extensions, same tools, same auth. That's the zero-setup path, and for most work it's what you want. You might want a dedicated subagent config when you want subagents to run *less* than you do: a leaner extension set (e.g. pi-sock plus pi-tool-tree only), a different default model, or simply a scratch config you can break freely without touching your daily driver. To do it, set `PI_CODING_SUBAGENT_DIR` to any directory with a pi configuration — [`pi-profiles`](https://github.com/chaychoong/pi-profiles) creates and manages those directories for you (`ppi create subagents`, `ppi use subagents`), and one of its profiles is exactly what `PI_CODING_SUBAGENT_DIR` points at.
+
 More: [docs/subagents.md](docs/subagents.md).
 
 ### Also in the box
@@ -96,7 +98,7 @@ More: [docs/output-and-code-view.md](docs/output-and-code-view.md), [docs/custom
 
 | Dependency | What it provides | Without it |
 |---|---|---|
-| [pi_subagents](https://github.com/Quinntyx/pi-subagents) + tmux + [pi-sock](https://github.com/Quinntyx/pi-sock) | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). `pi_subagents` is auto-provisioned at session start from git (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). By default, subagents run under your own Pi configuration; `PI_CODING_SUBAGENT_DIR` gives them a separate pi agent directory. | Everything else works; you just don't get subagents. |
+| [pi_subagents](https://github.com/Quinntyx/pi-subagents) + tmux + [pi-sock](https://github.com/Quinntyx/pi-sock) | The subagent orchestration stack (`import pi_subagents` in cells; one tmux window per agent). The `pi_subagents` module is installed into the shared Python venv automatically at every session start (see `PTC_SUBAGENTS_REPO_URL` / `PTC_SUBAGENTS_SOURCE`). By default, subagents are additional pi instances running under your own Pi configuration; `PI_CODING_SUBAGENT_DIR` gives them a separate pi agent directory. | Everything else works; you just don't get subagents. |
 | [pi-tool-tree](https://github.com/Quinntyx/pi-tool-tree) *(experimental)* | Nicer subagent activity display and tool-call activity labels. Currently unstable — known rendering bugs. | Plain rendering; the subagent panel, timers, and the vendored shimmer animation all work without it — you only lose live agent activity labels. |
 
 Note: kernels always run on the shared venv's interpreter; set `PTC_PYTHON_EXECUTABLE` to pin your own.
