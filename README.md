@@ -35,8 +35,7 @@ To remove: `pi remove git:github.com/Quinntyx/pi-ptc-next`.
 ## Requirements
 
 - **Node.js** and **Pi** (the host agent; tested with pi ≥ 0.87 and Node ≥ 20).
-- **Python ≥ 3.10** on PATH — or **`uv`**, which can fetch and manage Python for you (if `uv` is installed, `python3` on PATH is optional). `PTC_PYTHON_EXECUTABLE` pins a specific interpreter.
-- **`uv`** — optional but recommended; powers `provision_dependency` installs and the shared Python environment.
+- **[`uv`](https://docs.astral.sh/uv/) — required.** It provisions the Python environment (default CPython 3.14, downloaded automatically if missing) and powers on-demand package installs. You do not need Python on PATH; `PTC_PYTHON_EXECUTABLE` pins a specific interpreter if you want one.
 - **Subagent orchestration only:** the terminal multiplexer **tmux** (`tmux -V` to check), a small relay helper called **pi-sock** installed in your normal pi config, and the **pi_subagents** Python module (installed for you at session start). Subagents run under your own agent dir by default — no profiles or extra setup; `PI_CODING_SUBAGENT_DIR` gives them a separate config if you ever want one.
 
 ## Usage

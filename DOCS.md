@@ -186,7 +186,7 @@ Everything is configured through environment variables, read **once** at extensi
 | `PTC_OUTPUT_PREVIEW_CHARS` (alias `PTC_MAX_OUTPUT_CHARS`) | `12000` | Model-visible preview before head/tail collapsing; full output stays in the notebook. |
 | `PTC_MAX_SPOOL_CHARS` | `10000000` | Emergency per-cell capture ceiling; not a preview limit. |
 | `PTC_MAX_PARALLEL_TOOL_CALLS` | `8` | Default concurrency for `ptc.gather_limit()` / `read_many` / `read_tree`. |
-| `PTC_PYTHON_EXECUTABLE` | venv `~/.cache/pi-ptc/python-env` if present, else `python3` | Interpreter for all kernels; used verbatim, overrides the venv. Python ≥ 3.10 required. |
+| `PTC_PYTHON_EXECUTABLE` | shared venv (`~/.cache/pi-ptc/python-env-3.14`, legacy `python-env` on upgraded installs) | Interpreter for all kernels; used verbatim, overrides the venv. |
 
 ### Tool policy
 
@@ -231,8 +231,7 @@ More: [docs/configuration.md](docs/configuration.md) — the full per-variable r
 | Dependency | Required? | What it provides | What degrades without it |
 |---|---|---|---|
 | **pi-coding-agent** | Required | The host this extension plugs into. | Nothing works without it. |
-| **Python ≥ 3.10** | Required | Interpreter for kernels. Older interpreters fail fast at startup (PEP 604 unions and 3.12 AST features are load-bearing). Set `PTC_PYTHON_EXECUTABLE` if your `python3` is older. | No kernels at all. |
-| **`uv`** | Optional (but used opportunistically) | Preferred for creating the shared venv (`~/.cache/pi-ptc/python-env`) and for `provision_dependency` package installs. | Venv creation falls back to `python3 -m venv`; `provision_dependency` fails with an ENOENT error — there is **no pip fallback**; pre-install packages into the venv yourself instead. |
+| **`uv`** | Required | Provisions the Python environment (default CPython 3.14, fetched automatically if the host lacks it) and powers `provision_dependency` installs. | Extension fails to start kernels — there is no fallback interpreter. |
 | **`git`** | Optional | Required only for the managed-clone path of `pi_subagents` provisioning. | Subagents provisioning fails (logged, non-fatal) if there's no dev checkout to use instead. |
 | **`pi_subagents` + tmux + `pi-sock`** | Optional | The subagent orchestration stack: `pi_subagents` (installed into the shared venv from the public GitHub mirror at session start), tmux (each agent is a tmux window; the module refuses to spawn without tmux), and `pi-sock` (prompt-delivery transport — must be installed in your agent dir, which subagents share by default). Spawned agents run under your own agent dir; `PI_CODING_SUBAGENT_DIR` points them elsewhere. | All core features (kernels, tool bridge, routing, notebook library, benchmarks) work untouched. Only `import pi_subagents` in cells is unavailable — provisioning failure is logged as a warning, never fatal, and subagent pools/panels/footer simply don't appear. |
 | **pi-tool-tree** | Optional | Nicer subagent activity display: the subagent panel and shimmer integrate with it via a `globalThis` API (`pi-tool-tree:api` / `pi-tool-tree:activity-api`), and it labels tool calls with model-supplied activity words. | Everything degrades to plain rendering — panels/footers still work, just with less polish. No extra setup needed. |

@@ -14,7 +14,7 @@ import {
 import { normalizeToolResult } from "./tool-adapters";
 import { sectionize } from "./utils";
 import { existsSync } from "fs";
-import { venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
+import { ensurePythonForVersion, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
 import { buildSessionPrelude } from "./execution/session-prelude";
 import { loadPythonRuntimeSources } from "./execution/runtime-assets";
 import type {
@@ -808,6 +808,18 @@ interface PreparedSource {
   cells: NotebookCell[];
   pythonCode?: string;
   prefixCellCount: number;
+  /** Pinned Python major.minor from the notebook's language_info.version, if any. */
+  pythonVersion?: string;
+}
+
+/** Extract a pinned major.minor Python version from notebook metadata. */
+function notebookPinnedPythonVersion(document: Record<string, unknown>): string | undefined {
+  const metadata = document.metadata as Record<string, unknown> | undefined;
+  const languageInfo = metadata?.language_info as Record<string, unknown> | undefined;
+  const version = languageInfo?.version;
+  if (typeof version !== "string") return undefined;
+  const match = /^(\d+)\.(\d+)/.exec(version.trim());
+  return match ? `${match[1]}.${match[2]}` : undefined;
 }
 
 function notebookText(value: unknown): string {
@@ -1151,9 +1163,15 @@ export class PythonSessionManager {
     await fs.promises.mkdir(path.dirname(destination), { recursive: true });
 
     if (extension === ".ipynb") {
-      const { cells } = parseNotebookDocument(sourceText, sourcePath);
+      const { document, cells } = parseNotebookDocument(sourceText, sourcePath);
       await fs.promises.copyFile(sourcePath, destination);
-      return { path: sourcePath, kind: "notebook", cells, prefixCellCount: cells.length };
+      return {
+        path: sourcePath,
+        kind: "notebook",
+        cells,
+        prefixCellCount: cells.length,
+        pythonVersion: notebookPinnedPythonVersion(document),
+      };
     }
 
     await fs.promises.writeFile(destination, emptyNotebookDocument(), "utf8");
@@ -1166,7 +1184,21 @@ export class PythonSessionManager {
     };
   }
 
-  private spawnSession(code: string, cwd: string): ChildProcess {
+  /** Major.minor of the shared venv interpreter, or undefined when unknown. */
+  private async resolveSharedVenvVersion(): Promise<string | undefined> {
+    try {
+      const { execFile } = await import("child_process");
+      const result = await new Promise<{ stdout: string }>((resolve, reject) => {
+        execFile(venvPythonPath(), ["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+          { timeout: 10_000 }, (error, stdout) => (error ? reject(error) : resolve({ stdout })));
+      });
+      return result.stdout.trim();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private spawnSession(code: string, cwd: string, pythonExecutable?: string): ChildProcess {
     // Subagent agent-dir selection is env-driven end to end: the kernel
     // inherits PI_CODING_SUBAGENT_DIR / PI_CODING_AGENT_DIR from this process
     // and pi_subagents resolves it — no PTC-side translation needed.
@@ -1179,10 +1211,10 @@ export class PythonSessionManager {
       const spawnWithOptions = this.sandboxManager.spawn as unknown as (
         options: SessionSpawnOptions
       ) => ChildProcess;
-      return spawnWithOptions.call(this.sandboxManager, { code, cwd, env });
+      return spawnWithOptions.call(this.sandboxManager, { code, cwd, env, pythonExecutable });
     }
 
-    return this.sandboxManager.spawn(code, cwd);
+    return this.sandboxManager.spawn(code, cwd, pythonExecutable);
   }
 
   /**
@@ -1228,6 +1260,18 @@ export class PythonSessionManager {
     const { cwd } = options;
     const notebookPath = options.notebookPath ? path.resolve(cwd, options.notebookPath) : undefined;
     const preparedSource = await this.prepareSource(options.source, cwd, notebookPath);
+
+    // Honor a Python version pinned in the source notebook's metadata
+    // (language_info.version): provision a dedicated uv venv for that version
+    // so promoted skill workflows keep running on the interpreter they were
+    // recorded with, even after the default bump.
+    let pythonExecutable: string | undefined;
+    if (preparedSource?.pythonVersion && !process.env.PTC_PYTHON_EXECUTABLE) {
+      const sharedVersion = await this.resolveSharedVenvVersion();
+      if (sharedVersion !== preparedSource.pythonVersion) {
+        pythonExecutable = await ensurePythonForVersion(preparedSource.pythonVersion);
+      }
+    }
     const callableToolRuntime = this.toolRegistry.createCallableToolRuntime(cwd, this.settings, {
       ctx: options.ctx,
       signal: options.signal,

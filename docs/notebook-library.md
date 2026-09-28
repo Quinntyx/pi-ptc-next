@@ -36,6 +36,8 @@ If a source cell fails during provisioning, the error is recorded on that prefix
 
 The copy is complete: markdown, code cells, and outputs all survive, which is what makes the promoted notebook a self-describing recipe for the next run.
 
+**Python version pinning.** Every kernel stamps its interpreter version into the notebook's `metadata.language_info.version` (standard Jupyter field). Promoting carries that pin along, and `provision_kernel({ source })` honors it: if the pinned version differs from the shared venv, a dedicated uv venv (`~/.cache/pi-ptc/python-env-<X.Y>`) is provisioned and the kernel runs on it. So when the default bumps (say 3.14 → 3.15), older promoted workflows keep running on the interpreter they were recorded with instead of silently breaking.
+
 **Legacy export.** `PythonSessionManager.toScript()` (`src/python-session-manager.ts:1457-1516`) still exists as an AST-aware `.py` export with a host-side overwrite guard that appends `-2`, `-3`, … to avoid collisions (default directory `.pi/scripts`, relative to the caller's cwd). For library reuse, notebook promotion is preferred.
 
 ## Usage

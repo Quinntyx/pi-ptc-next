@@ -468,10 +468,18 @@ def _ptc_render_notebook_document() -> str:
     """
     import json as _nb_json
 
-    metadata_value = _ptc_notebook_metadata or {
+    # Pin the interpreter version into the notebook (standard
+    # language_info.version). Promoted notebooks keep this field, so a later
+    # default-version bump re-provisions the pinned interpreter instead of
+    # silently running old skill workflows on a different Python.
+    import platform as _nb_platform
+    metadata_value = dict(_ptc_notebook_metadata) if _ptc_notebook_metadata else {
         "kernelspec": {"display_name": "Python 3 (ptc kernel)", "language": "python", "name": "python3"},
-        "language_info": {"name": "python"},
     }
+    language_info = dict(metadata_value.get("language_info") or {})
+    language_info.setdefault("name", "python")
+    language_info["version"] = _nb_platform.python_version()
+    metadata_value["language_info"] = language_info
     metadata = _nb_json.dumps(metadata_value, ensure_ascii=False, indent=1)
     cells = ",\n".join(_ptc_indent_block(fragment, 2) for fragment in _ptc_notebook_cell_fragments)
     return (

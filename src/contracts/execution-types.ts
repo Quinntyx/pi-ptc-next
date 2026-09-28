@@ -4,7 +4,7 @@ import type { PtcExecutionTelemetry, PtcRecoveryDetails, PtcRecoveryState } from
 import type { ToolUpdateCallback } from "./tool-types";
 
 export interface SandboxManager {
-  spawn(code: string, cwd: string): ChildProcess;
+  spawn(code: string, cwd: string, pythonExecutable?: string): ChildProcess;
   /** Terminate one execution. Implementations may kill its whole process group. */
   terminate?(proc: ChildProcess, signal: NodeJS.Signals): boolean;
   getRuntimeWorkspaceRoot(cwd: string): string;

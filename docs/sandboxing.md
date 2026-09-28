@@ -20,7 +20,7 @@
 2. The shared venv at `~/.cache/pi-ptc/python-env/bin/python` (POSIX) or `...\python-env\Scripts\python.exe` (Windows) — via `venvPythonPath()` in `src/subagents-env.ts:163-170` — but only if that file exists.
 3. `python3` from `PATH`.
 
-The shared venv is the same one the pi_subagents provisioner creates (`uv venv` if `uv` is available, else `python3 -m venv`), so subagent support is available to every kernel without extra setup when it exists.
+The shared venv is the same one the pi_subagents provisioner creates (`uv venv --python 3.14`; uv is required), so subagent support is available to every kernel without extra setup.
 
 ### Process-group lifecycle and cleanup
 

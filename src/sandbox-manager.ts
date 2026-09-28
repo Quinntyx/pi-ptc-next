@@ -44,7 +44,15 @@ export function resolvePythonExecutable(): string {
   if (existsSync(venvPython)) {
     return venvPython;
   }
-  return "python3";
+  // Deliberately no system-python fallback: a silently-degraded interpreter
+  // (wrong version, missing provisioned packages) reads as "the plugin is
+  // broken". Fail with the actual cause instead.
+  throw new Error(
+    "PTC Python environment not found at " + venvPython +
+    ". The shared venv is created by provisioning (uv is required — " +
+    "https://docs.astral.sh/uv/). Install uv, restart pi, and check " +
+    "~/.cache/pi-ptc/subagents-sync.log; or point PTC_PYTHON_EXECUTABLE at an interpreter."
+  );
 }
 
 /**
@@ -59,8 +67,9 @@ class SubprocessSandbox implements SandboxManager {
     return resolvePythonExecutable();
   }
 
-  spawn(code: string, cwd: string): ChildProcess {
-    const pythonExe = resolvePythonExecutable();
+  spawn(code: string, cwd: string, pythonExecutable?: string): ChildProcess {
+    // An explicit interpreter (notebook-pinned version) wins over the shared venv.
+    const pythonExe = pythonExecutable ?? resolvePythonExecutable();
     const proc = spawn(pythonExe, ["-u", "-c", code], {
       cwd,
       env: { ...process.env },

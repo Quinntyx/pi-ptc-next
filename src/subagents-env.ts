@@ -174,9 +174,52 @@ export function defaultCacheRoot(): string {
  * layout); Windows venvs use `Scripts\python.exe`, so this is platform-aware.
  */
 export function venvPythonPath(cacheRoot: string = defaultCacheRoot()): string {
-  return process.platform === "win32"
+  return sharedVenvPythonPath(cacheRoot);
+}
+
+/**
+ * Interpreter of the shared venv, preferring the current version-pinned layout
+ * (python-env-<X.Y>) and falling back to the pre-pinning layout (python-env)
+ * for existing installs. Both are venvs this extension created — the legacy
+ * path is a managed artifact, not a system-python fallback. Never falls back
+ * to system python.
+ */
+export function sharedVenvPythonPath(cacheRoot: string = defaultCacheRoot()): string {
+  const versioned = versionedVenvPythonPath(DEFAULT_PYTHON_VERSION, cacheRoot);
+  if (existsSync(versioned)) return versioned;
+  const legacy = process.platform === "win32"
     ? join(cacheRoot, "python-env", "Scripts", "python.exe")
     : join(cacheRoot, "python-env", "bin", "python");
+  if (existsSync(legacy)) return legacy;
+  return versioned;
+}
+
+/** Python interpreter inside the per-version venv `python-env-<X.Y>`. */
+export function versionedVenvPythonPath(version: string, cacheRoot: string = defaultCacheRoot()): string {
+  return process.platform === "win32"
+    ? join(cacheRoot, `python-env-${version}`, "Scripts", "python.exe")
+    : join(cacheRoot, `python-env-${version}`, "bin", "python");
+}
+
+/**
+ * Ensure a venv exists for the given Python X.Y version and return its
+ * interpreter path. uv is required (it also fetches the managed CPython when
+ * the host lacks that version). Used to honor .ipynb python pins.
+ */
+export async function ensurePythonForVersion(version: string): Promise<string> {
+  const cacheRoot = defaultCacheRoot();
+  const python = versionedVenvPythonPath(version, cacheRoot);
+  if (existsSync(python)) return python;
+  if (!hasCommand("uv")) {
+    throw new Error("uv is required (https://docs.astral.sh/uv/) to provision Python environments");
+  }
+  mkdirSync(cacheRoot, { recursive: true });
+  const ok = await runLogged(join(cacheRoot, "subagents-sync.log"), "uv",
+    ["venv", "--python", version, join(cacheRoot, `python-env-${version}`)]);
+  if (!ok || !existsSync(python)) {
+    throw new Error(`could not create a Python ${version} venv via uv (see ~/.cache/pi-ptc/subagents-sync.log)`);
+  }
+  return python;
 }
 
 // --- process helpers ------------------------------------------------------------
@@ -335,6 +378,20 @@ function releaseLock(paths: Paths): void {
 let envPromise: Promise<SubagentsEnvResult> | undefined;
 
 /**
+ * Venv-only provisioning: create the shared CPython venv if missing, skipping
+ * the pi_subagents clone/install. Used in spawned subagent windows
+ * (PI_SUBAGENT_DEPTH set), where the full sync is skipped but kernels still
+ * need their interpreter — no system-python fallback exists anymore.
+ */
+export async function ensurePtcVenv(): Promise<boolean> {
+  const paths = resolvePaths({});
+  if (existsSync(paths.venvPython)) return true;
+  if (!hasCommand("uv")) return false;
+  mkdirSync(paths.cacheRoot, { recursive: true });
+  return createVenv(paths);
+}
+
+/**
  * Kick off provisioning once per process and share the promise. Returns the
  * same result for every caller; rejections are normalized to a failed result.
  */
@@ -445,9 +502,15 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
 
   // 1. venv
   if (!existsSync(paths.venvPython)) {
+    if (!hasCommand("uv")) {
+      return finish({
+        status: "failed",
+        reason: "uv is required (https://docs.astral.sh/uv/) — install it and restart pi",
+      });
+    }
     const ok = await createVenv(paths);
     if (!ok) {
-      return finish({ status: "failed", reason: "could not create the PTC venv" });
+      return finish({ status: "failed", reason: `could not create the PTC venv (uv venv --python ${DEFAULT_PYTHON_VERSION})` });
     }
   }
 
@@ -501,13 +564,15 @@ async function sync(options: SubagentsEnvOptions, paths: Paths): Promise<Subagen
   );
 }
 
-async function createVenv(paths: Paths): Promise<boolean> {
-  if (hasCommand("uv")) {
-    return runLogged(paths.logFile, "uv", ["venv", paths.venvDir]);
-  }
-  // Some systems ship only `python` (no `python3` alias); try both.
-  if (await runLogged(paths.logFile, "python3", ["-m", "venv", paths.venvDir])) return true;
-  return runLogged(paths.logFile, "python", ["-m", "venv", paths.venvDir]);
+/** The CPython version the shared venv pins. uv fetches it if the host lacks it. */
+export const DEFAULT_PYTHON_VERSION = "3.14";
+
+async function createVenv(paths: Paths, pythonVersion: string = DEFAULT_PYTHON_VERSION): Promise<boolean> {
+  // uv is REQUIRED, deliberately: a silent python3 -m venv fallback made first
+  // installs slower and differently-broken (no uv => no provision_dependency
+  // either), and users blamed the plugin for degraded runtime instead of their
+  // missing dependency. Fail loudly instead.
+  return runLogged(paths.logFile, "uv", ["venv", "--python", pythonVersion, paths.venvDir]);
 }
 
 async function pipEditableInstall(paths: Paths, pkgDir: string): Promise<boolean> {

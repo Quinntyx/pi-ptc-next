@@ -7,8 +7,8 @@ Answers grounded in clean-environment install tests (fresh `PI_CODING_AGENT_DIR`
 Distilled from a verified clean install (pi 0.87.1, node v26, python 3.14, no `pi-profiles`, no `pi-tool-tree`):
 
 1. **Install the extension:** `pi install git:github.com/Quinntyx/pi-ptc-next` (the normal way), or `pi install /path/to/repo` for a local checkout (clones to `<agent-dir>/git/github.com/Quinntyx/pi-ptc-next` and runs npm install there).
-2. **Have `python3` on PATH — unless `uv` is installed** (uv can fetch a managed CPython itself, downloading ~35 MB on first run); without uv the venv falls back to `python3 -m venv`; no `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps. `shiki` is only a dynamic import with a plain-text fallback, so its absence is invisible.
-3. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s; no-uv fallback ~7.0s.
+2. **Have `uv` on PATH — it is required.** uv provisions the Python environment (default CPython 3.14, downloaded automatically if missing) and powers on-demand package installs. No `npm install`/`npm run build` is needed for the extension itself — pi compiles the TypeScript at load and supplies its own runtime deps.
+3. **Run pi** (TUI or `pi -p`) and ask the model to provision a kernel and run a cell. Verified headless: `provision_kernel({notebook: "..."})` → kernel id; `exec_cell("print(1+1)")` → `2`. Fresh-cache full session (install → venv → kernel → cell, incl. LLM call) took ~7.7s; warm cache ~5.6s.
 
 No environment variables are required — but note there is **no sandboxing**: kernels run as plain host Python subprocesses (yolo mode only; VM-based checkpointing is planned).
 
@@ -47,7 +47,7 @@ No. `package.json` declares `pi.extensions: ["./src/index.ts"]` and pi compiles 
 
 ### Why won't Python run after I install the extension?
 
-The old `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` startup gate was removed — there is no required opt-in anymore, and the extension starts out of the box. If Python still fails to run, check `python3` is on PATH (see the ENOENT question below) and set `PTC_DEBUG=1` to see the `[PTC] Using subprocess runtime (no sandboxing substrate yet)` line at load.
+The old `PTC_ALLOW_UNSANDBOXED_SUBPROCESS` startup gate was removed — there is no required opt-in anymore, and the extension starts out of the box. If Python still fails to run, check `uv` is on PATH (see the question below) and set `PTC_DEBUG=1` to see the `[PTC] Using subprocess runtime (no sandboxing substrate yet)` line at load.
 
 ### Is there any sandboxing or cell-level confinement?
 
@@ -57,19 +57,21 @@ No. Python cells run as a local subprocess and can spawn arbitrary child process
 
 `bash` and mutating tools (`edit`/`write`) are bridged with no opt-in. Filtering them was dropped as futile — cells can run `os.system`/`subprocess` and edit files natively (yolo mode). Use `PTC_CALLABLE_TOOLS` / `PTC_BLOCKED_TOOLS` if you want to reshape the callable set.
 
-### `provision_kernel` fails with `spawn python3 ENOENT` — what's wrong?
+### `provision_kernel` fails with a "PTC Python environment not found" error — what's wrong?
 
-`python3` isn't on PATH. With both python3 and uv stripped from PATH, the background pi_subagents venv provisioning fails silently, and the first kernel fails with:
+**`uv` isn't installed** (or provisioning failed). There is deliberately no system-python fallback: a silently-degraded interpreter reads as "the plugin is broken" instead of "my dependency is missing". Install uv and restart pi:
 
 ```
-Failed to provision kernel: python session interpreter failed: spawn python3 ENOENT.
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Once `~/.cache/pi-ptc/python-env` exists, system python3 is no longer needed on PATH (the venv python wins); `uv` is additionally needed by `provision_dependency` (it shells out to `uv pip install --python <exe>`). `PTC_PYTHON_EXECUTABLE` overrides the whole resolution — but note it's used verbatim with no existence check, so a bad value gives a crisp `spawn /nonexistent/python-xyz ENOENT` on kernel provisioning.
+The startup `[PTC]` warning and `~/.cache/pi-ptc/subagents-sync.log` tell you exactly which step failed.
+
+`PTC_PYTHON_EXECUTABLE` overrides the whole resolution — but note it's used verbatim with no existence check, so a bad value gives a crisp `spawn /nonexistent/python-xyz ENOENT` on kernel provisioning.
 
 ### Why does installing pi_subagents fail with a git auth error?
 
-On first session start the extension creates `~/.cache/pi-ptc/python-env` (with `uv venv`, or `python3 -m venv` if uv is absent — the fallback is verified working, just slower) and clones pi-subagents from the default `https://github.com/Quinntyx/pi-subagents` into `~/.cache/pi-ptc/pi-subagents`, then editable-installs it. If you point `PTC_SUBAGENTS_REPO_URL` at a repo that needs credentials, non-interactive git can't prompt and the clone logs something like:
+On first session start the extension creates `~/.cache/pi-ptc/python-env-3.14` (`uv venv --python 3.14`; uv is required) and clones pi-subagents from the default `https://github.com/Quinntyx/pi-subagents` into `~/.cache/pi-ptc/pi-subagents`, then editable-installs it. If you point `PTC_SUBAGENTS_REPO_URL` at a repo that needs credentials, non-interactive git can't prompt and the clone logs something like:
 
 ```
 fatal: could not read Username for '<host>': No such device or address

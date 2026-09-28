@@ -8,6 +8,7 @@ const {
   sourceAvailable,
   defaultCacheRoot,
   venvPythonPath,
+  DEFAULT_PYTHON_VERSION,
   ensureSubagentsEnv,
   pidAlive,
   readLockPid,
@@ -130,9 +131,8 @@ test("ensureSubagentsEnv retries immediately after a failed initial clone", asyn
   const cacheRoot = tmpDir("ptc-retry-");
   const extensionRoot = tmpDir("ptc-retry-ext-");
   // Pretend the venv already exists so the retry path skips venv creation.
-  fs.mkdirSync(path.join(cacheRoot, "python-env", process.platform === "win32" ? "Scripts" : "bin"), {
-    recursive: true,
-  });
+  fs.mkdirSync(path.join(cacheRoot, `python-env-${DEFAULT_PYTHON_VERSION}`,
+    process.platform === "win32" ? "Scripts" : "bin"), { recursive: true });
   fs.writeFileSync(venvPythonPath(cacheRoot), "");
   try {
     // Fresh stamp recording a failed sync; no venv python, no clone → runtime missing.
@@ -310,8 +310,13 @@ test("readLockPid tolerates missing or non-numeric lock content", () => {
 
 test("defaultCacheRoot and venvPythonPath agree on the canonical layout", () => {
   const root = path.join("some", "cache");
-  assert.equal(venvPythonPath(root), path.join(root, "python-env", "bin", "python"));
-  assert.equal(venvPythonPath(), path.join(defaultCacheRoot(), "python-env", "bin", "python"));
+  // Preferred layout: version-pinned venv (DEFAULT_PYTHON_VERSION).
+  assert.equal(venvPythonPath(root), path.join(root, `python-env-${DEFAULT_PYTHON_VERSION}`, "bin", "python"));
+  // The no-root variant resolves the *effective* shared venv: the pinned one
+  // when present, else the legacy unversioned venv on upgraded installs.
+  const expected = ["", "-"].map((suffix) =>
+    path.join(defaultCacheRoot(), `python-env${suffix}`, "bin", "python")).find((p) => fs.existsSync(p));
+  assert.equal(venvPythonPath(), expected);
   if (process.platform === "win32") {
     assert.match(venvPythonPath(root), /Scripts[\\/]python\.exe$/);
   }

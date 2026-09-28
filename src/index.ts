@@ -26,7 +26,7 @@ import {
   type PtcRecoveryState,
 } from "./recovery-state";
 import { createSandbox } from "./sandbox-manager";
-import { startSubagentsEnv } from "./subagents-env";
+import { ensurePtcVenv, startSubagentsEnv } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
@@ -1889,6 +1889,17 @@ export default async function ptcExtension(pi: ExtensionAPI, context?: Extension
         console.warn(
           `[PTC] pi_subagents provisioning failed: ${result.reason}. ` +
           "Core Python kernels are unaffected; see ~/.cache/pi-ptc/subagents-sync.log for details."
+        );
+      }
+      });
+  } else {
+    // Spawned subagent window: the full pi_subagents sync is skipped, but
+    // kernels still need the shared venv (there is no system-python fallback).
+    void ensurePtcVenv().then((ok) => {
+      if (!ok) {
+        console.warn(
+          "[PTC] could not create the shared Python venv (uv is required — " +
+          "https://docs.astral.sh/uv/). Python kernels will fail to start here."
         );
       }
     });

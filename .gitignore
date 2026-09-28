@@ -7,3 +7,4 @@ package-lock.json
 .claude/
 
 .ptc-subagents-sync.json
+node_modules
