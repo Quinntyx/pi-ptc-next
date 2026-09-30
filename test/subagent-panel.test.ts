@@ -25,6 +25,28 @@ test("subagent fan panel renders groups, awaited arrow, and status lines", () =>
   assert.ok(!plain.some((l) => l.includes("╰ synthesizing · ") && l.includes("tool call")));
 });
 
+test("last-child detail rows nest under the status glyph, not the branch column", () => {
+  const now = Date.now();
+  const noopTheme = { fg: (_c, s) => s };
+  const snapshot = {
+    agents: [
+      { id: "a", name: "first", group: "audit", status: "running", startedAt: now - 60_000, elapsedMs: 60_000, label: "inspecting" },
+      { id: "b", name: "last", group: "audit", status: "closed", startedAt: now - 50_000, elapsedMs: 50_000, phase: "idle", label: null },
+    ],
+    totals: { running: 1, settled: 1, failed: 0 },
+    groups: { audit: now - 60_000 },
+    timestamp: now,
+  };
+  const plain = renderSubagentPanel(snapshot, noopTheme).map((l) => l.replace(/\x1b\[[0-9;]*m/g, ""));
+
+  // non-last detail: rail + connector, text aligned with the agent name
+  assert.ok(plain.some((l) => l === "    │ ╰ inspecting"), plain.join("\n"));
+  // last detail: same connector column (6) even though there is no rail —
+  // a "    ╰" would read as a sibling agent row
+  assert.ok(plain.some((l) => l === "      ╰ idle"), plain.join("\n"));
+  assert.ok(!plain.some((l) => l === "    ╰ idle"), plain.join("\n"));
+});
+
 test("the fan is scoped to the exec being streamed and settled rows freeze their runtime", () => {
   const now = Date.now();
   const hoursAgo = now - 1300 * 60_000;

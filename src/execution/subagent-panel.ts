@@ -208,17 +208,22 @@ function renderSubagentFan(
       const last = index === groupAgents.length - 1;
       const branch = last ? "╰" : "├";
       const gutter = agent.awaited ? theme.fg("accent", "  ▸ ") : "    ";
+      // Detail rows nest under the agent's status glyph (column 6), matching the
+      // non-last `│ ╰` rows. A last-child detail at the branch column reads as a
+      // sibling agent row instead of the agent's own detail line.
+      const detailGutter = last ? `${gutter}  ` : "    ";
+      const detailBranch = last ? "╰" : "│ ╰";
 
       if (agent.status === "queued") {
         lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", `… ${agent.name}`)}`);
-        lines.push(`${last ? gutter : "    "}${theme.fg("muted", last ? "╰" : "│ ╰")} ${theme.fg("muted", "waiting for a pool slot")}`);
+        lines.push(`${detailGutter}${theme.fg("muted", detailBranch)} ${theme.fg("muted", "waiting for a pool slot")}`);
         lines.push("");
         return;
       }
 
       if (agent.status === "starting") {
         lines.push(`${gutter}${theme.fg("muted", branch)} ${theme.fg("muted", `○ ${agent.name}`)}`);
-        lines.push(`${last ? gutter : "    "}${theme.fg("muted", last ? "╰" : "│ ╰")} ${theme.fg("muted", "starting…")}`);
+        lines.push(`${detailGutter}${theme.fg("muted", detailBranch)} ${theme.fg("muted", "starting…")}`);
         lines.push("");
         return;
       }
@@ -269,7 +274,7 @@ function renderSubagentFan(
         }
       }
       if (detailBits.length > 0) {
-        lines.push(`${last ? gutter : "    "}${theme.fg("muted", last ? "╰" : "│ ╰")} ${detailBits.join("")}`);
+        lines.push(`${detailGutter}${theme.fg("muted", detailBranch)} ${detailBits.join("")}`);
       }
       if (!last) lines.push(`    ${theme.fg("muted", "│")}`);
     });
