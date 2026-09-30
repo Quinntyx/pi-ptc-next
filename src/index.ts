@@ -51,6 +51,7 @@ import {
 } from "./execution/code-view";
 import { relevantAgents, renderSubagentNotification, renderSubagentPanel } from "./execution/subagent-panel";
 import { renderNestedToolTree } from "./execution/tool-subtree";
+import { FULLSCREEN_VIEWPORT_LINES, renderOutCell, type ViewportMode } from "./execution/cell-view";
 import { PythonSessionManager } from "./python-session-manager";
 import type {
   CodeExecutionResult,
@@ -79,6 +80,66 @@ ptcGlobal.__ptcTokensSaved = ptcTokensSaved;
 // partial updates (older installed types predate this argument).
 interface PartialRenderContext {
   state?: { viewStartLine?: number };
+}
+
+/**
+ * Live view of pi's fullscreen setting, captured at extension load.
+ * `pi.getSettings()` returns a live structured clone per call, and every
+ * regular↔fullscreen switch re-mounts and re-renders all tool rows, so each
+ * render observes the current mode (R1's recommended signal). Falls back to
+ * "normal" in RPC/non-interactive contexts where the call is unavailable.
+ */
+let tuiModeProvider: (() => "regular" | "fullscreen" | undefined) | undefined;
+
+/** Map pi's (expanded, tuiMode) pair onto the cell renderer's viewport mode. */
+function currentViewportMode(expanded: boolean): ViewportMode {
+  if (expanded) return "expanded";
+  let tuiMode: string | undefined;
+  try {
+    tuiMode = tuiModeProvider?.();
+  } catch {
+    tuiMode = undefined;
+  }
+  return tuiMode === "fullscreen" ? "fullscreen" : "normal";
+}
+
+/**
+ * Partial-frame component for exec-like tools: the static executing-code view
+ * (width-independent, as before) plus the LIVE Out box, which IS width-aware —
+ * the box is rebuilt at paint time from Component.render(width) so terminal
+ * resizes never leave a stale-width fence behind.
+ */
+class ExecPartialComponent implements Component {
+  constructor(
+    private readonly headerLines: string[],
+    private readonly liveText: string,
+    private readonly liveHidden: number,
+    private readonly mode: ViewportMode,
+    private readonly theme: Theme
+  ) {}
+
+  render(width: number): string[] {
+    const lines = [...this.headerLines];
+    if (this.liveText.length === 0 && this.liveHidden === 0) {
+      return lines;
+    }
+    lines.push("");
+    if (this.liveHidden > 0) {
+      lines.push(this.theme.fg("muted", `... ${this.liveHidden} earlier output lines`));
+    }
+    const mode = this.mode;
+    // While streaming, the newest output is at the bottom: tail-pin the
+    // fullscreen scroll window instead of starting at line 1.
+    const totalLines = this.liveText.length > 0 ? this.liveText.split("\n").length : 0;
+    const viewStart =
+      mode === "fullscreen" && totalLines > FULLSCREEN_VIEWPORT_LINES
+        ? totalLines - FULLSCREEN_VIEWPORT_LINES + 1
+        : undefined;
+    lines.push(...renderOutCell(this.liveText, { width, mode, viewStart, theme: this.theme }));
+    return lines;
+  }
+
+  invalidate(): void {}
 }
 
 /**
@@ -1582,7 +1643,19 @@ function renderCellResult(
       lines.push("");
       lines.push(...toolTreeLines);
     }
-    return new Text(lines.join("\n"), 0, 0);
+    // Live Out box below the executing-code view: details.liveOutput carries
+    // the emulated stdout screen (\r/EL/cursor moves already interpreted by
+    // the session manager's TerminalBuffer), so progress bars stream like
+    // Jupyter's inline bars. The box follows the same collapsed/expanded
+    // viewport rules as the In view; expanded (ctrl+o) shows the full live
+    // screen (tail-capped upstream at 200 lines).
+    return new ExecPartialComponent(
+      lines,
+      (details.liveOutput ?? []).join("\n"),
+      details.liveOutputHidden ?? 0,
+      currentViewportMode(expanded),
+      theme
+    );
   }
 
   const text = result.content
@@ -2449,6 +2522,16 @@ async function handleSessionShutdown(
 export default async function ptcExtension(pi: ExtensionAPI, context?: ExtensionContext) {
   const settings = loadSettingsFromEnv();
   const extensionRoot = getExtensionRoot();
+  // Capture the live settings view once: getSettings() structured-clones per
+  // call, so the resolver always reads the CURRENT tuiMode even after a
+  // regular↔fullscreen switch.
+  tuiModeProvider = () => {
+    try {
+      return pi.getSettings().tuiMode;
+    } catch {
+      return undefined; // RPC/non-interactive contexts: collapse to "normal"
+    }
+  };
   const toolRegistry = new ToolRegistry(pi);
   const sandboxManager = await createSandbox();
   const sessionState: PtcSessionState = {
