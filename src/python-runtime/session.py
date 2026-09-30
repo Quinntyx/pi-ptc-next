@@ -61,9 +61,9 @@ _ptc_builtins.PTC_STATE_EMIT = lambda snapshot: _emit_protocol({
 
 _cell_counter = 0
 # Live notebook artifact: provision_kernel passes the .ipynb path on every exec
-# frame; completed cells (including errored ones) are appended and the file is
-# rewritten atomically. Magic-rejected and approval-rejected cells never reach
-# the runtime, so they never pollute the notebook.
+# and doc frame; completed cells (including errored ones) are appended and the
+# file is rewritten atomically. Approval-rejected cells never reach the runtime,
+# so they never pollute the notebook.
 _ptc_notebook_path = None
 # Per-cell JSON fragments (serialized once at append time). The notebook file is
 # rebuilt by concatenating these cached fragments instead of re-serializing the
