@@ -858,6 +858,9 @@ def _ptc_doc_op(frame: dict) -> None:
     exec_id = frame.get("id") or "unknown"
     op = frame.get("op")
     try:
+        notebook_path = frame.get("notebook")
+        if notebook_path:
+            _ptc_bind_notebook(notebook_path)
         if not _ptc_notebook_path:
             raise RuntimeError("this kernel has no bound notebook")
         _ptc_notebook_reload()

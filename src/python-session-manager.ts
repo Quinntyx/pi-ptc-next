@@ -466,7 +466,17 @@ class PersistentSessionProtocol {
         resolveDoc?.({
           op: String(msg.op ?? ""),
           total: typeof msg.total === "number" ? msg.total : 0,
-          cells: Array.isArray(msg.cells) ? (msg.cells as DocumentOpResult["cells"]) : [],
+          cells: Array.isArray(msg.cells)
+            ? (msg.cells as Array<Record<string, unknown>>).map((cell) => ({
+                index: typeof cell.index === "number" ? cell.index : 0,
+                cellType: cell.cell_type === "markdown" ? "markdown" : "code",
+                executionCount:
+                  typeof cell.execution_count === "number" ? cell.execution_count : undefined,
+                source: typeof cell.source === "string" ? cell.source : "",
+                outputCount: typeof cell.output_count === "number" ? cell.output_count : 0,
+                outputText: typeof cell.output_text === "string" ? cell.output_text : "",
+              }))
+            : [],
         });
         return;
       }
@@ -818,7 +828,7 @@ class PersistentSessionProtocol {
     timeoutMs: number | undefined
   ): Promise<DocumentOpResult> {
     const docId = `doc_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
-    this.send({ type: "doc", id: docId, op, ...params });
+    this.send({ type: "doc", id: docId, op, notebook: this.notebookPath, ...params });
 
     this.docId = docId;
     const promise = new Promise<DocumentOpResult>((resolve, reject) => {
