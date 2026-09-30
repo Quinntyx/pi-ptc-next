@@ -29,7 +29,8 @@ metadata:
 - One or more `AgentPool` workflows that submit `Task`s, consume results in
   completion order, and terminate (cyclic workflows gated by a round limit).
 - Aggregated findings returned to the caller; the kernel's notebook file on
-  disk records every executed cell with its outputs.
+  disk records every durable cell (`exec_cell` / `run_cell`) with its outputs.
+  `scratch_run` exploration mutates the kernel but never lands in the notebook.
 - Every spawned pi window destroyed via `pool.close()` (or `finish()`), or by
   a `with` statement exiting cleanly, before the cell ends — unless results
   are deliberately kept for follow-ups. End
@@ -56,10 +57,16 @@ metadata:
    with `session_handle=...`) or close: `pool.close()` kills every window,
    invalidates handles, and echoes the workflow summary (PoolSummary).
    `subagents.finish()` closes all live pools.
-6. Keep workflow code in cells: every executed cell is appended to the
-   notebook on disk, which is already the durable, re-runnable record — do
-   not write .py files for reuse or editability unless the user asks for a
-   script file.
+6. Keep workflow code in cells, not `.py` files (unless the user asks for a
+   script). Use `scratch_run` to probe throwaway snippets — it runs in the
+   kernel but is never appended — then make the working version durable with
+   `write_cell` + `run_cell`, or with `exec_cell` when one call should both
+   run and append it. The notebook on disk is the durable, re-runnable record.
+7. Guard the pool-creation cell so re-running the notebook cannot spawn a
+   second set of agents: load a recorded result if one exists, otherwise run
+   the workflow once and write the result out, and never let the cell end with
+   a pool still open. `run_all()` re-executes the cell, so an unguarded
+   `AgentPool` starts the whole fan-out over.
 
 Do not split one workflow across parallel `exec_cell` calls: a kernel runs one
 cell at a time, so the calls serialize and each sees stale state. One cell per
