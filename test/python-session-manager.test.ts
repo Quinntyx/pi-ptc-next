@@ -1456,3 +1456,88 @@ test("kernel: produced notebook validates against nbformat", { skip: !RUN_REAL |
 		execFileSync("trash", ["--", tempDir]);
 	}
 });
+
+test("session manager: stdout frames stream the emulated screen to onUpdate", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-live-"));
+  const onFrame = (frame: { type: string; id?: string }, proc: {
+    emitFrame: (frame: Record<string, unknown>) => void;
+  }) => {
+    if (frame.type !== "exec") return;
+    // tqdm-style \r-overwrite updates plus a completed line, then settle.
+    setTimeout(() => proc.emitFrame({ type: "stdout", text: "\r  0%\r 50%\n" }), 0);
+    setTimeout(() => proc.emitFrame({ type: "stdout", text: "\r100%\n" }), 150);
+    setTimeout(() => proc.emitFrame({
+      type: "exec_done",
+      id: frame.id,
+      output: "ok",
+      cell: 1,
+      total_output_chars: 12,
+    }), 320);
+  };
+  const { manager } = makeFakeManager({ onFrame });
+  try {
+    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const updates: Array<{ details?: { liveOutput?: string[]; liveOutputHidden?: number } }> = [];
+    const result = await manager.execForeground(id, "for _ in range(3): pass", {
+      cwd: tempDir,
+      onUpdate: (update: { details?: { liveOutput?: string[]; liveOutputHidden?: number } }) => {
+        updates.push(update);
+      },
+    });
+
+    // Each stdout frame produced a partial frame whose details carry the
+    // EMULATED screen: \r overwrites collapsed, complete lines kept.
+    const live = updates.filter((u) => (u.details?.liveOutput ?? []).length > 0);
+    assert.ok(live.length >= 2, `expected >= 2 live frames, got ${updates.length}`);
+    assert.deepEqual(live[0].details?.liveOutput, [" 50%", ""]);
+    assert.equal(live[0].details?.liveOutputHidden, 0);
+    assert.deepEqual(live.at(-1)?.details?.liveOutput, [" 50%", "100%", ""],
+      "completed lines persist as scrollback; the last row holds the newest line");
+
+    // The settled result reverts to the model-facing output: no liveOutput on
+    // final frames, and the raw stdout transcript is preserved for the model.
+    assert.equal(result.details.liveOutput, undefined);
+    assert.match(result.output, /50%/);
+  } finally {
+    await manager.disposeAll();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("session manager: live screen resets between cells", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-live2-"));
+  const onFrame = (frame: { type: string; id?: string }, proc: {
+    emitFrame: (frame: Record<string, unknown>) => void;
+  }) => {
+    if (frame.type !== "exec") return;
+    const execId = frame.id;
+    setTimeout(() => proc.emitFrame({ type: "stdout", text: "second\n" }), 0);
+    setTimeout(() => proc.emitFrame({
+      type: "exec_done",
+      id: execId,
+      output: "ok2",
+      cell: 2,
+      total_output_chars: 25,
+    }), 60);
+  };
+  const { manager } = makeFakeManager({ onFrame });
+  try {
+    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx() });
+    const secondCellUpdates: Array<{ details?: { liveOutput?: string[] } }> = [];
+    await manager.execForeground(id, "first", { cwd: tempDir, onUpdate: () => {} });
+    const result2 = await manager.execForeground(id, "second", {
+      cwd: tempDir,
+      onUpdate: (update: { details?: { liveOutput?: string[] } }) => secondCellUpdates.push(update),
+    });
+    const live2 = secondCellUpdates.filter((u) => (u.details?.liveOutput ?? []).length > 0);
+    assert.ok(live2.length > 0, "second cell should stream live output");
+    for (const update of live2) {
+      assert.deepEqual(update.details?.liveOutput, ["second", ""],
+        "live screen must not leak the previous cell's output");
+    }
+    assert.match(result2.output, /ok2|second/);
+  } finally {
+    await manager.disposeAll();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
