@@ -949,7 +949,7 @@ test("kernel: sourcing errors mark the failed prefix cell and leave the kernel u
   }
 });
 
-test("kernel: trailing expression echoes, digest footer, magic guard, notebook", { skip: !RUN_REAL }, async () => {
+test("kernel: trailing expression echoes, digest footer, magics run, notebook", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	try {
 		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
@@ -964,16 +964,12 @@ test("kernel: trailing expression echoes, digest footer, magic guard, notebook",
 		assert.doesNotMatch(silent.output, /Out\[/);
 		assert.match(silent.output, /kernel:\n  cell 2 · \+x/);
 
-		// Magic guard: rejected before execution, counter not advanced.
-		await assert.rejects(
-			manager.execForeground(id, "%timeit sum(range(10))", {}),
-			(error: unknown) => {
-				const message = error instanceof Error ? error.message : String(error);
-				return /MagicError/.test(message) && /not written to the notebook/.test(message);
-			},
-		);
+		// Jupyter parity: IPython magics execute instead of being rejected, and
+		// (unlike the old pre-execution guard) they advance the counter.
+		const magic = await manager.execForeground(id, "%timeit sum(range(10))", {});
+		assert.match(magic.output, /\nkernel:\n  cell 3\b/);
 		const afterMagic = await manager.execForeground(id, "pass", {});
-		assert.match(afterMagic.output, /kernel:\n  cell 3\b/, "rejected cells must not advance the counter");
+		assert.match(afterMagic.output, /kernel:\n  cell 4\b/);
 
 		// ModuleNotFoundError carries the provision_dependency hint.
 		await assert.rejects(
@@ -990,6 +986,45 @@ test("kernel: trailing expression echoes, digest footer, magic guard, notebook",
 	}
 });
 
+test("kernel: Jupyter parity (shared namespace, Out/_, magics, display)", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-jupyter-"));
+	const notebookPath = path.join(tempDir, "rich.ipynb");
+	try {
+		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+
+		// One persistent namespace, and `_` carries the previous Out[] value.
+		await manager.execForeground(id, "seed = 21", {});
+		const doubled = await manager.execForeground(id, "seed * 2", {});
+		assert.match(doubled.output, /Out\[2\]: 42/);
+		const viaUnderscore = await manager.execForeground(id, "_ + 1", {});
+		assert.match(viaUnderscore.output, /Out\[3\]: 43/);
+
+		// Magics are allowed (the old runtime rejected them pre-execution); a
+		// cell magic captures stdout instead of leaking it.
+		const captured = await manager.execForeground(id, "%%capture caught\nprint('hidden')", {});
+		assert.doesNotMatch(captured.output, /hidden/);
+
+		// Top-level return still works, distinct from the echo.
+		const returned = await manager.execForeground(id, "k = 7\nreturn k * 3", {});
+		assert.match(returned.output, /Out\[\d+\]\):\n  21/);
+
+		// Rich display(...) mime bundles are recorded as nbformat display_data.
+		await manager.execForeground(
+			id,
+			"from IPython.display import Markdown, display\ndisplay(Markdown('# title'))",
+			{ notebookPath },
+		);
+		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf-8"));
+		const last = notebook.cells[notebook.cells.length - 1];
+		const kinds = last.outputs.map((o: { output_type: string }) => o.output_type);
+		assert.ok(kinds.includes("display_data"), "display() mime bundle is recorded");
+	} finally {
+		await manager.disposeAll();
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
 test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-nb-"));
@@ -1001,16 +1036,15 @@ test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async ()
 			manager.execForeground(id, "raise ValueError('boom')", { notebookPath }),
 			(error: unknown) => /ValueError/.test(error instanceof Error ? error.message : String(error)),
 		);
-		await assert.rejects(
-			manager.execForeground(id, "%magic garbage", { notebookPath }),
-			(error: unknown) => /MagicError/.test(error instanceof Error ? error.message : String(error)),
-		);
+		// Jupyter parity: magics execute and are recorded like any other cell.
+		const magic = await manager.execForeground(id, "%timeit sum(range(10))", { notebookPath });
+		assert.match(magic.output, /per loop/);
 
 		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf-8"));
 		assert.equal(notebook.nbformat, 4);
-		assert.equal(notebook.cells.length, 2, "magic-rejected cells must not be written");
+		assert.equal(notebook.cells.length, 3, "completed cells, magics included, are written");
 
-		const [ok, failed] = notebook.cells;
+		const [ok, failed, magicCell] = notebook.cells;
 		assert.equal(ok.cell_type, "code");
 		assert.equal(ok.execution_count, 1);
 		const kinds = ok.outputs.map((o: { output_type: string }) => o.output_type);
@@ -1022,6 +1056,12 @@ test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async ()
 		assert.doesNotMatch(ok.metadata.ptc_full_output, /\[kernel\]/, "kernel footer is host-owned, not part of the durable record");
 		assert.equal(failed.outputs[0].output_type, "error");
 		assert.equal(failed.outputs[0].ename, "ValueError");
+		assert.equal(magicCell.execution_count, 3);
+		const magicText = magicCell.outputs
+			.filter((o: { output_type: string }) => o.output_type === "stream")
+			.map((o: { text: string[] }) => o.text.join(""))
+			.join("");
+		assert.match(magicText, /per loop/, "magic stdout is recorded in the notebook");
 	} finally {
 		await manager.disposeAll();
 	}
@@ -1070,14 +1110,15 @@ test("kernel: rebinding an existing notebook preserves cells and continues numbe
 		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		const result = await manager.execForeground(id, "'new output'", { notebookPath });
 		assert.equal(result.details.cellIdx, 5);
-		assert.match(result.output, /Out\[5\]: new output/);
+		// Jupyter parity: a string literal's Out[] uses IPython's repr (quotes).
+		assert.match(result.output, /Out\[5\]: 'new output'/);
 
 		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
 		assert.equal(notebook.cells.length, 2);
 		assert.equal(notebook.cells[0].metadata.ptc_full_output, "old durable output");
 		assert.equal(notebook.cells[1].execution_count, 5);
 		const durable = await manager.readCellOutput(5);
-		assert.match(durable.text, /Out\[5\]: new output/);
+		assert.match(durable.text, /Out\[5\]: 'new output'/);
 	} finally {
 		await manager.disposeAll();
 		execFileSync("trash", ["--", tempDir]);
