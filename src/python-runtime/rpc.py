@@ -104,8 +104,8 @@ class RpcClient:
         self.disconnected = _ptc_rpc_asyncio.Event()
 
     def set_exec_handler(self, handler) -> None:
-        """Register the callback that receives host "exec"/"export_script"/"inspect"
-        frames (persistent-session mode)."""
+        """Register the callback that receives host "exec"/"export_script"/"inspect"/
+        "doc" frames (persistent-session mode)."""
         self.exec_handler = handler
 
     async def start_reader(self) -> None:
@@ -185,7 +185,7 @@ class RpcClient:
         """Dispatch one decoded frame: exec-family frames go to the handler;
         anything else resolves the pending call with the matching id (an `error`
         dict becomes ToolCallError)."""
-        if response.get("type") in ("exec", "export_script", "inspect"):
+        if response.get("type") in ("exec", "export_script", "inspect", "doc"):
             handler = self.exec_handler
             if handler is not None:
                 handler(response)
