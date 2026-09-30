@@ -51,8 +51,9 @@ namespace actually holds. Never assume the kernel matches the notebook.
 | `read_cells` / `read_cell` | Curate: read cell sources and current outputs. | None. | None. |
 | `inspect_kernel` | See what the namespace actually holds (names, types, funcs). | None. | None. |
 
-Some builds expose `edit_cell` as the in-place source editor; `write_cell` may
-only insert. Both only change the document — neither executes.
+If your build also exposes `edit_cell`, it is the in-place source editor;
+`write_cell` inserts a new cell or replaces the one at `at`. Both only change
+the document — neither executes.
 
 **Canonical flows**
 
