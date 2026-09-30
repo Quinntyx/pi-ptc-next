@@ -33,9 +33,12 @@ metadata:
   `scratch_run` exploration mutates the kernel but never lands in the notebook.
 - Every spawned pi window destroyed via `pool.close()` (or `finish()`), or by
   a `with` statement exiting cleanly, before the cell ends — unless results
-  are deliberately kept for follow-ups. End
-  workflows with `pool.close()` as the cell's last line — its echoed
-  PoolSummary is the workflow report.
+  are deliberately kept for follow-ups. **`pool.close()` runs in its own
+  dedicated cell after the workflow cell has settled and its results were
+  reviewed — never as a trailing line of the workflow cell** (an unexpected
+  normal-exit path must not be able to fall through to the teardown that
+  kills every other agent's window). The close cell's echoed PoolSummary is
+  the workflow report.
 - No orphaned tmux windows, no unclosed pools, no silently ignored failures
   (failed results are reported, not dropped).
 
@@ -47,16 +50,33 @@ metadata:
    its round cap) before writing code.
 2. `provision_kernel(notebook=...)` once per task — a durable notebook inside
    the project, or a /tmp path for scratch.
-3. In ONE `exec_cell` cell: define the tasks, build the pool, submit, and
-   consume. Blocking is intended: a live subagent viewer renders under the
-   code view while the cell runs. For long-running or destructive workflows
-   set `confirm=true` on that cell (see Confirmation and autonomy).
+3. **Cell discipline — workflows always run in three cells, never in scratch
+   calls.** Running a workflow through `scratch_run` is disallowed: it never
+   lands in the notebook, is invisible to review, and its state is lost to the
+   record. The structure:
+
+   - **Cell 1 — constants**: agent prompts, task lists, models, schemas —
+     everything the workflow reads. No orchestration runs here.
+   - **Cell 2 — the workflow cell**: pool + stages + submit + the consume
+     loop. This is the cell submitted to the user for review (`confirm=true`
+     per Confirmation and autonomy). It does NOT call `pool.close()`; it ends
+     with the pool alive.
+   - **Cell 3 — teardown**: `await pool.close()` (echoes the PoolSummary
+     report) plus any other cleanup. Run it only after the results were
+     inspected; before that, the pool stays alive and every agent's tmux
+     window remains steerable.
+
+   Probing snippets with `scratch_run` is fine; declaring and running a
+   workflow is not. The workflow cell may `exec_cell`-append itself
+   (`exec_cell` with the workflow code) so the durable notebook carries it —
+   the point is it must be a real, reviewable notebook cell, not a scratch
+   call.
 4. Consume with `while (result := await pool.pop(timeout=...)) is not None:`
    and route by `result.stage`; submit follow-ups inside the loop.
-5. After the loop, either keep specific settled sessions for follow-ups (submit
-   with `session_handle=...`) or close: `pool.close()` kills every window,
-   invalidates handles, and echoes the workflow summary (PoolSummary).
-   `subagents.finish()` closes all live pools.
+5. After the consume loop ends (quiescence or a handled failure), leave the
+   pool open and move to the teardown cell (rule 3). `pool.close()` kills
+   every window, invalidates handles, and echoes the workflow summary
+   (PoolSummary). `subagents.finish()` closes all live pools.
 6. Keep workflow code in cells, not `.py` files (unless the user asks for a
    script). Use `scratch_run` to probe throwaway snippets — it runs in the
    kernel but is never appended — then make the working version durable with
@@ -96,34 +116,43 @@ the next cell resumes with `pool.pop()`.
   behavior: edit this skill to change how workflows request approval instead
   of modifying ptc tool descriptions.
 
-# Convenience: the `with` statement
+# The `with` statement: trivial fixtures only
 
-For simple workflows (roughly ≤2 linear stages, no cyclic requeuing), a `with`
-statement is the cleanest lifecycle:
+`with AgentPool(...)` closes the pool inside the workflow cell, which violates
+the teardown-cell discipline above. Reserve it for genuinely trivial one-shot
+fan-outs and test fixtures (a clean block exit can never leak a window): no
+steering, no user review between submit and close, nothing worth keeping
+alive. Any workflow with real prompts, stages, or review needs goes through
+the three-cell structure (constants → workflow → teardown).
 
-```python
-with subagents.AgentPool(concurrency=4, name="fanout") as pool:
-    stage = pool.stage("work", slots=4)
-    stage.submit_all(tasks)
-    while (result := await pool.pop(timeout=600)) is not None:
-        handle(result)
-# clean exit here ran pool.close() for you — report available as pool.last_summary
-```
+A `with` block's exception semantics are worth knowing regardless: an
+exception inside the block leaves the pool fully alive (windows, queued
+results, scheduler intact) so a follow-up cell can inspect state or continue
+the run; the exception propagates normally.
 
-Semantics:
-- **Clean exit** → the pool closes automatically (windows destroyed, report in
-  `pool.last_summary`).
-- **Exception inside the block** → the pool is deliberately left fully alive
-  (windows, queued results, scheduler intact) so you can inspect state or
-  continue the run from a follow-up cell; the exception propagates normally.
-  Close explicitly once you're actually done.
+# Failure semantics: abnormal ends bubble, fail_fast crashes the cell
 
-Prefer explicit `await`-style `pool.close()` for complex orchestration —
-multi-stage fan-outs, review/fix cycles, anything where you keep settled
-sessions for follow-ups — because leaving the tmux windows in place is
-valuable for inspecting and auditing a run. Simple test fixtures and one-shot
-fan-outs should use `with` (it is also why the pi-subagents test suite
-converts to `with`: a clean block exit can never leak a window).
+Abnormal subagent ends surface as errors, not silent settles:
+
+- The subagent's pi process exits or is terminated (user kills the window,
+  crash) → the wait raises `PiSockSessionEnded` immediately; the task fails
+  with that error.
+- The user interrupts the agent (Esc → idle, turn aborted) → the settle
+  check detects `stopReason: "aborted"` and the task fails with
+  "interrupted".
+- The run fails at the provider (quota exhausted, rate limit, API error —
+  session entry `stopReason: "error"`) → the task fails carrying the
+  session's `errorMessage`, even when the failure produced no text content.
+
+`AgentPool(..., fail_fast=True)` makes `pool.pop()` raise
+`AgentPoolFailureError` (carrying the failed result) instead of returning it:
+an unhandled failure crashes the workflow cell. That is usually the right
+choice for orchestration — crashing is not destructive, because the other
+agents' tmux windows stay alive and the model can reattach from a follow-up
+cell (the pool survives in the namespace; `pool.pop()` resumes it) with no
+lost work. Without `fail_fast`, failed results are returned like any other
+and the workflow must inspect `result.ok` itself — every failure path must be
+handled explicitly, or use `fail_fast`.
 
 # Feeding results forward: never paste raw JSON into the next prompt
 
@@ -220,6 +249,12 @@ Result fields: `task`, `stage`, `handle`, `body` (str or dict response),
 # Rules
 
 - Top-level `await` is available in `exec_cell`; never `asyncio.run(...)`.
+- **Never run a workflow through `scratch_run`.** Workflows live in real
+  notebook cells in the three-cell structure (constants → workflow →
+  teardown) — scratch calls bypass review and leave no durable record.
+- **`pool.close()` runs in a teardown cell of its own**, never at the end of
+  the workflow cell — an unnoticed failure path must not be able to fall
+  through into killing every other agent's window.
 - Gate every cyclic workflow on `metadata["rounds"] >= N` unless the user
   explicitly says unbounded; `pop()` returning None means quiescent, so an
   ungated cycle never terminates.
