@@ -1,5 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 // These are host-extension tests, not nested-agent behavior tests. A depth of
 // zero also suppresses unrelated background subagent-environment provisioning.
@@ -1140,5 +1143,84 @@ test("subagentsProvisioningEnabled: opt-in via PI_SUBAGENTS_MAX_CONCURRENT", asy
   } finally {
     if (original === undefined) delete process.env.PI_SUBAGENTS_MAX_CONCURRENT;
     else process.env.PI_SUBAGENTS_MAX_CONCURRENT = original;
+  }
+});
+
+test("provision_dependency targets the requested kernel's venv and bootstraps pi_subagents into pinned envs", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ptc-provision-"));
+  const binDir = path.join(tmp, "bin");
+  const logFile = path.join(tmp, "uv-calls.log");
+  fs.mkdirSync(binDir);
+  fs.writeFileSync(
+    path.join(binDir, "uv"),
+    '#!/bin/sh\necho "ARGV: $@" >> "' + logFile + '"\necho "Installed 1 package"\n',
+  );
+  fs.chmodSync(path.join(binDir, "uv"), 0o755);
+  // fixture: a pi_subagents source dir the pinned bootstrap can install from
+  const subagentsSource = path.join(tmp, "subagents-src", "main");
+  fs.mkdirSync(subagentsSource, { recursive: true });
+  fs.writeFileSync(path.join(subagentsSource, "pyproject.toml"), "[project]\nname='pi-subagents'\n");
+
+  const previousPath = process.env.PATH;
+  const previousSource = process.env.PTC_SUBAGENTS_SOURCE;
+  process.env.PATH = binDir + path.delimiter + previousPath;
+  process.env.PTC_SUBAGENTS_SOURCE = path.join(tmp, "subagents-src");
+
+  const sharedPython = "/shared/venv/python";
+  const pinnedPython = "/pinned/venv/python";
+  const sandbox = { resolvePythonExecutable() { return sharedPython; } };
+  const restore = restoreInjectedModules(sandbox);
+  const { provisionDependencyTool } = require("../dist/index.js");
+
+  try {
+    // unknown session id → error listing live sessions
+    const unknownManager = {
+      get: () => false,
+      list: () => [{ id: "live-1" }],
+      getPythonExecutable: () => undefined,
+    };
+    const unknown = await provisionDependencyTool(unknownManager, sandbox)
+      .execute("t", { package: "numpy", session_id: "nope" }, undefined);
+    assert.match(unknown.content[0].text, /Unknown python session: nope/);
+    assert.match(unknown.content[0].text, /live-1/);
+
+    // pinned kernel → installs into the pinned venv AND bootstraps pi_subagents
+    const pinnedManager = {
+      get: (id) => id === "k1",
+      list: () => [{ id: "k1" }],
+      getPythonExecutable: (id) => (id === "k1" ? pinnedPython : undefined),
+    };
+    const pinned = await provisionDependencyTool(pinnedManager, sandbox)
+      .execute("t", { package: "numpy", session_id: "k1" }, undefined);
+    assert.match(pinned.content[0].text, /pinned venv/);
+    assert.match(pinned.content[0].text, /pi_subagents bootstrapped/);
+
+    // unpinned kernel → shared python, no pi_subagents bootstrap
+    fs.rmSync(logFile, { force: true });
+    const sharedManager = {
+      get: (id) => id === "k2",
+      list: () => [{ id: "k2" }],
+      getPythonExecutable: () => undefined,
+    };
+    const shared = await provisionDependencyTool(sharedManager, sandbox)
+      .execute("t", { package: "numpy", session_id: "k2" }, undefined);
+    assert.match(shared.content[0].text, /shared environment/);
+    assert.doesNotMatch(shared.content[0].text, /pi_subagents bootstrapped/);
+
+    // no session_id → most recently used kernel's env
+    fs.rmSync(logFile, { force: true });
+    await provisionDependencyTool(pinnedManager, sandbox).execute("t", { package: "numpy" }, undefined);
+    const logged = fs.readFileSync(logFile, "utf8");
+    assert.match(logged, new RegExp(`--python ${pinnedPython.replace(/\//g, "\\/")} numpy`));
+    assert.match(logged, /--editable/);
+    const pinnedCalls = (logged.match(new RegExp(`--python ${pinnedPython.replace(/\//g, "\\/")}`, "g")) || []).length;
+    assert.equal(pinnedCalls, 2, "package + pi_subagents both target the pinned venv");
+    assert.ok(!logged.includes(sharedPython), "shared python untouched for a pinned kernel");
+  } finally {
+    process.env.PATH = previousPath;
+    if (previousSource === undefined) delete process.env.PTC_SUBAGENTS_SOURCE;
+    else process.env.PTC_SUBAGENTS_SOURCE = previousSource;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    delete require.cache[require.resolve("../dist/index.js")];
   }
 });

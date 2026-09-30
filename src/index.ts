@@ -26,7 +26,7 @@ import {
   type PtcRecoveryState,
 } from "./recovery-state";
 import { createSandbox } from "./sandbox-manager";
-import { ensurePtcVenv, startSubagentsEnv } from "./subagents-env";
+import { ensurePtcVenv, resolvePiSubagentsSource, startSubagentsEnv } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
@@ -418,10 +418,11 @@ const PROMOTE_DESCRIPTION = `Promote a polished notebook into the reusable PTC w
 - overwrite (optional): false by default. Existing library notebooks are never replaced unless explicitly true.
 - The notebook is copied intact, preserving interleaved markdown, code cells, and outputs. Prefer this over legacy script export after a successful nontrivial workflow.`;
 
-const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into the kernel environment shared by all kernels (uv-backed, fast).
+const PROVISION_DEPENDENCY_DESCRIPTION = `Install a Python distribution into a kernel's environment (uv-backed, fast).
 
 - package (required): the distribution name as pip knows it (e.g. "opencv-python", "scikit-learn") — not the import name.
-- Already-installed packages are a cheap no-op. If an install changes a distribution the running kernel already loaded, the result says so — a fresh kernel picks it up cleanly.
+- session_id (optional): the kernel to install into. Defaults to the most recently used kernel; with no live kernels, the shared environment is used. A kernel with a pinned Python version gets the package in its own venv (and pi_subagents is bootstrapped there too, so pinned kernels can orchestrate subagents).
+- Already-installed packages are a cheap no-op. If an install changes a distribution the running kernel already loaded, the result says so — a fresh kernel (or reset_kernel) picks it up cleanly.
 - After installing, import the module in a cell as usual. ModuleNotFoundError in a cell usually means you need this tool.`;
 
 
@@ -589,8 +590,12 @@ function inspectKernelTool(sessionManager: PythonSessionManager, toolDescription
   });
 }
 
-/** provision_dependency tool: uv pip install a distribution into the shared kernel environment. */
-function provisionDependencyTool(
+/** provision_dependency tool: uv pip install a distribution into a kernel's environment. */
+function resolveTargetPython(sandboxManager: SandboxManager): string {
+  return sandboxManager.resolvePythonExecutable ? sandboxManager.resolvePythonExecutable() : "python3";
+}
+
+export function provisionDependencyTool(
   sessionManager: PythonSessionManager,
   sandboxManager: SandboxManager
 ): PtcToolDefinition {
@@ -602,32 +607,86 @@ function provisionDependencyTool(
       package: Type.String({
         description: 'Distribution name as pip/uv knows it (e.g. "opencv-python", "scikit-learn") — not the import name.',
       }),
+      session_id: Type.Optional(Type.String({
+        description: "Kernel to install into. Defaults to the most recently used kernel; with no live kernels, the shared environment is used.",
+      })),
     }),
     execute: async (_toolCallId, params, signal) => {
-      const { package: packageName } = params as { package?: string };
+      const { package: packageName, session_id: sessionId } = params as {
+        package?: string;
+        session_id?: string;
+      };
       if (!packageName || !packageName.trim()) {
         return { content: [{ type: "text", text: "provision_dependency requires a package name." }], details: {} };
       }
-      const pythonExecutable = sandboxManager.resolvePythonExecutable
-        ? sandboxManager.resolvePythonExecutable()
-        : "python3";
+
+      // Target resolution: explicit kernel → its env (pinned venv or shared);
+      // no id → most recently used kernel; no live kernels → shared env.
+      let targetPython: string;
+      let pinned = false;
+      let targetLabel: string;
+      if (sessionId) {
+        if (!sessionManager.get(sessionId)) {
+          const live = sessionManager.list().map((s) => s.id).join(", ");
+          return {
+            content: [{
+              type: "text",
+              text: `Unknown python session: ${sessionId}. Live sessions: ${live || "(none)"}.`,
+            }],
+            details: { package: packageName.trim(), session_id: sessionId, error: "unknown-session" },
+          };
+        }
+        const pinnedPython = sessionManager.getPythonExecutable(sessionId);
+        pinned = Boolean(pinnedPython);
+        targetPython = pinnedPython ?? resolveTargetPython(sandboxManager);
+        targetLabel = pinned ? `pinned venv ${pinnedPython}` : "shared environment";
+      } else {
+        const mru = sessionManager.list()[0];
+        const pinnedPython = mru ? sessionManager.getPythonExecutable(mru.id) : undefined;
+        pinned = Boolean(pinnedPython);
+        targetPython = pinnedPython ?? resolveTargetPython(sandboxManager);
+        targetLabel = pinned
+          ? `pinned venv ${pinnedPython} (kernel ${mru!.id})`
+          : mru
+            ? `shared environment (kernel ${mru.id})`
+            : "shared environment";
+      }
+
       try {
-        const result = await execFilePtc("uv", ["pip", "install", "--python", pythonExecutable, packageName.trim()], {
+        const result = await execFilePtc("uv", ["pip", "install", "--python", targetPython, packageName.trim()], {
           timeoutMs: 180_000,
           signal,
         });
         const output = (result.stdout + result.stderr).trim();
         const changed = /installed|uninstalled/i.test(output);
         const lines = [
-          `provision_dependency ${packageName.trim()}: ${changed ? "installed/updated" : "already satisfied"}.`,
+          `provision_dependency ${packageName.trim()} → ${targetLabel}: ${changed ? "installed/updated" : "already satisfied"}.`,
           output ? output.slice(-2000) : "",
+        ];
+        // Pinned venvs are created bare: bootstrap pi_subagents so pinned
+        // kernels can orchestrate subagents just like the shared env.
+        if (pinned) {
+          const subagentsSource = resolvePiSubagentsSource();
+          if (subagentsSource) {
+            const bootstrap = await execFilePtc(
+              "uv",
+              ["pip", "install", "--python", targetPython, "--editable", subagentsSource],
+              { timeoutMs: 180_000, signal },
+            );
+            lines.push(`pi_subagents bootstrapped into the pinned venv (editable from ${subagentsSource}).`);
+            if (/error|failed/i.test(bootstrap.stderr)) lines.push(bootstrap.stderr.trim().slice(-1000));
+          } else {
+            lines.push("Note: pi_subagents source not found — pinned kernel cannot orchestrate subagents until it is installed into this venv.");
+          }
+        }
+        lines.push(
           changed
-            ? "Note: kernels already running keep their loaded versions; a fresh kernel picks up the new ones."
+            ? "Note: kernels already running keep their loaded versions; a fresh kernel (or reset_kernel) picks up the new ones."
             : "",
-        ].filter(Boolean);
+        );
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { package: packageName.trim(), changed },
+          content: [{ type: "text", text: lines.filter(Boolean).join("\n") }],
+          details: { package: packageName.trim(), changed, session_id: sessionId, target: targetPython, pinned },
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

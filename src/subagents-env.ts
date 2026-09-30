@@ -125,6 +125,11 @@ export function resolveSourceDir(
   return undefined;
 }
 
+/** The pi_subagents package dir a venv bootstrap should install from. */
+export function resolvePiSubagentsSource(devSource?: string): string | undefined {
+  return resolveSourceDir(devSource ?? process.env.PTC_SUBAGENTS_SOURCE ?? DEV_SOURCE_DEFAULT);
+}
+
 /** Pure: stamps older than the interval (or missing) trigger a sync. */
 export function isStampStale(
   stamp: Stamp | undefined,

@@ -1048,6 +1048,8 @@ interface SessionRecord {
   killed: boolean;
   /** Serializes the python-side exec loop: one chunk runs at a time. */
   queue: Promise<void>;
+  /** Pinned interpreter (version-specific venv); undefined = the shared venv. */
+  pythonExecutable?: string;
   /** Foreground jobs accepted but not yet settled (queued-call detection). */
   pendingJobs: number;
   latestSnapshot: SubagentRuntimeSnapshot | null;
@@ -1187,6 +1189,11 @@ export class PythonSessionManager {
   /** Latest subagent snapshot recorded for one session, or null. */
   getSubagentSnapshot(sessionId: string): SubagentRuntimeSnapshot | null {
     return this.sessions.get(sessionId)?.latestSnapshot ?? null;
+  }
+
+  /** The pinned interpreter this kernel runs on, or undefined for the shared venv. */
+  getPythonExecutable(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.pythonExecutable;
   }
 
   /** Most recent non-null subagent snapshot across all sessions (MRU order). */
@@ -1411,6 +1418,8 @@ export class PythonSessionManager {
     ctx: ExtensionToolContext;
     signal?: AbortSignal;
     parentToolCallId?: string;
+    /** Pinned interpreter; undefined spawns the shared venv's python. */
+    pythonExecutable?: string;
   }): { proc: ChildProcess; protocol: PersistentSessionProtocol } {
     const { sessionId, cwd } = params;
     const callableToolRuntime = this.toolRegistry.createCallableToolRuntime(cwd, this.settings, {
@@ -1432,7 +1441,7 @@ export class PythonSessionManager {
       autoimportSubagents: !process.env.PI_SUBAGENT_DEPTH,
     });
 
-    const proc = this.spawnSession(prelude, cwd);
+    const proc = this.spawnSession(prelude, cwd, params.pythonExecutable);
     const protocol = new PersistentSessionProtocol(proc, callableToolRuntime.runTool, {
       terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
       sendSignal: (signal) => {
@@ -1521,6 +1530,7 @@ export class PythonSessionManager {
       ctx: options.ctx,
       signal: options.signal,
       parentToolCallId: options.parentToolCallId,
+      pythonExecutable,
     });
 
     const record: SessionRecord = {
@@ -1534,6 +1544,7 @@ export class PythonSessionManager {
       queue: Promise.resolve(),
       pendingJobs: 0,
       latestSnapshot: null,
+      pythonExecutable,
       notebookPath,
       prefixCellCount: preparedSource?.prefixCellCount ?? 0,
       prefixChunkCount: 0,
@@ -1818,6 +1829,9 @@ export class PythonSessionManager {
         ctx: options.ctx,
         signal: options.signal,
         parentToolCallId: options.parentToolCallId,
+        // A pinned kernel resets onto its own pinned interpreter, never the
+        // shared venv — otherwise reset silently de-pins the kernel.
+        pythonExecutable: record.pythonExecutable,
       });
       record.proc = proc;
       record.protocol = protocol;
