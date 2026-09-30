@@ -16,6 +16,7 @@ import { sectionize } from "./utils";
 import { existsSync } from "fs";
 import { ensurePythonForVersion, venvPythonPath, waitForSubagentsEnv } from "./subagents-env";
 import { buildSessionPrelude } from "./execution/session-prelude";
+import { TerminalBuffer } from "./execution/terminal-emulator";
 import { loadPythonRuntimeSources } from "./execution/runtime-assets";
 import type {
   CodeExecutionResult,
@@ -102,6 +103,23 @@ interface PersistentProtocolOptions {
 /** How long to wait for the interrupted chunk to report back before forcing it. */
 const INTERRUPT_GRACE_MS = 5_000;
 
+/**
+ * Host-side coalescing window for live stdout updates. The interpreter emits
+ * one stdout frame per completed line with no backpressure; without a window,
+ * a chatty cell would re-render the transcript per line. Updates are emitted
+ * immediately when the window is idle (leading edge) and once more at the end
+ * of a burst (trailing edge), so the live Out box never lags more than one
+ * window behind the interpreter.
+ */
+const LIVE_STDOUT_EMIT_INTERVAL_MS = 100;
+
+/**
+ * Maximum number of emulated screen lines shipped in partial-frame details.
+ * The tail is what matters while streaming (newest output is at the bottom);
+ * the count of hidden head lines travels alongside so the renderer can say so.
+ */
+const LIVE_OUTPUT_TAIL_LINES = 200;
+
 type InterruptKind = "abort" | "timeout";
 
 /**
@@ -157,6 +175,12 @@ class PersistentSessionProtocol {
   private docResolve?: (result: DocumentOpResult) => void;
   private docReject?: (error: Error) => void;
   private pendingInterrupt?: { kind: InterruptKind; message: string };
+  /** Live stdout screen for the running exec: raw frames interpreted (\r, EL,
+   *  cursor moves) into display lines so the Out box shows the current screen
+   *  state instead of control-sequence soup. One buffer per exec. */
+  private liveScreen = new TerminalBuffer();
+  private liveEmitTimer?: NodeJS.Timeout;
+  private liveLastEmitAt = 0;
   private interruptGraceTimer?: NodeJS.Timeout;
 
   constructor(
@@ -288,6 +312,7 @@ class PersistentSessionProtocol {
     this.execResolve = undefined;
     this.execReject = undefined;
     this.clearExecTimeout();
+    this.clearLiveEmitTimer();
     if (this.interruptGraceTimer) {
       clearTimeout(this.interruptGraceTimer);
       this.interruptGraceTimer = undefined;
@@ -377,6 +402,8 @@ class PersistentSessionProtocol {
 
       case "stdout":
         this.appendStdout(msg.text as string);
+        this.liveScreen.feed(msg.text as string);
+        this.scheduleLiveEmit();
         return;
 
       case "exec_done": {
@@ -615,8 +642,55 @@ class PersistentSessionProtocol {
   private emitUpdate(extra?: Partial<ExecutionDetails>): void {
     this.updateHandler?.({
       content: [{ type: "text", text: this.describeProgress() }],
-      details: this.buildDetails(extra),
+      details: this.buildDetails({ ...extra, ...this.liveOutputDetails() }),
     });
+  }
+
+  /**
+   * Live Out-box payload for partial frames: the emulated screen (tail-capped)
+   * plus the count of head lines hidden by the cap. Absent from final frames —
+   * the completed render path uses the model-facing output, not the screen.
+   */
+  private liveOutputDetails(): Partial<ExecutionDetails> {
+    const lines = this.liveScreen.getLines();
+    if (lines.length <= LIVE_OUTPUT_TAIL_LINES) {
+      return { liveOutput: lines, liveOutputHidden: 0 };
+    }
+    return {
+      liveOutput: lines.slice(lines.length - LIVE_OUTPUT_TAIL_LINES),
+      liveOutputHidden: lines.length - LIVE_OUTPUT_TAIL_LINES,
+    };
+  }
+
+  /**
+   * Coalesce stdout-driven renders: immediate on a quiet channel, otherwise
+   * once per window (trailing edge), so a burst of lines costs one update per
+   * window instead of one per line.
+   */
+  private scheduleLiveEmit(): void {
+    if (this.liveEmitTimer) return; // a trailing emit is already scheduled
+    const wait = Math.max(0, LIVE_STDOUT_EMIT_INTERVAL_MS - (Date.now() - this.liveLastEmitAt));
+    if (wait === 0) {
+      this.emitLiveUpdate();
+      return;
+    }
+    this.liveEmitTimer = setTimeout(() => {
+      this.liveEmitTimer = undefined;
+      this.emitLiveUpdate();
+    }, wait);
+    this.liveEmitTimer.unref?.();
+  }
+
+  private emitLiveUpdate(): void {
+    this.liveLastEmitAt = Date.now();
+    this.emitUpdate();
+  }
+
+  private clearLiveEmitTimer(): void {
+    if (this.liveEmitTimer) {
+      clearTimeout(this.liveEmitTimer);
+      this.liveEmitTimer = undefined;
+    }
   }
 
   private describeProgress(): string {
@@ -707,6 +781,9 @@ class PersistentSessionProtocol {
     this.execStartedAt = Date.now();
     this.chunkLines = code.split("\n");
     this.stdout = "";
+    this.liveScreen.reset();
+    this.clearLiveEmitTimer();
+    this.liveLastEmitAt = 0;
     this.currentLine = undefined;
     this.totalLines = undefined;
     this.activeTool = undefined;
@@ -883,6 +960,7 @@ class PersistentSessionProtocol {
    */
   async dispose(): Promise<void> {
     this.clearExecTimeout();
+    this.clearLiveEmitTimer();
     try {
       this.proc.stdin?.end();
     } catch {
