@@ -15,9 +15,15 @@ It verifies, on the real process shape we will ship:
 3. SIGINT under our bootstrap loop (``loop.run_until_complete``, NOT
    ``asyncio.run``) lands as ``KeyboardInterrupt`` for blocking code and as a
    cancelled task for ``await``-based code, and the shell stays usable after.
-4. A cell can ``await`` a host-tool coroutine.
+4. A cell can ``await`` a host-tool coroutine. NOTE: this spike uses a
+   stand-in coroutine; the real async RPC client path is verified shipped by
+   the gated real-runtime suite instead.
 5. Magics (``%time``, ``%pip``) parse and run.
 6. Mime bundles carry the same data a kernel would publish.
+
+Also note: the ``input()`` fail-fast requirement from the migration brief is
+not exercised here — it is covered shipped by ``_ptc_blocked_input`` and the
+gated suite.
 """
 import asyncio
 import os
