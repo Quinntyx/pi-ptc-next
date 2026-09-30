@@ -73,6 +73,11 @@ export interface CellRenderOptions {
   highlightLines?: string[];
   /** Active pi theme; undefined renders fully unstyled text. */
   theme?: Theme;
+  /**
+   * Uniform style for Out-box rows (renderOutCell only). `error` turns the
+   * whole output red for failed executions.
+   */
+  outputStyle?: BodyStyle;
 }
 
 /** A single logical row of a cell body, before viewport slicing. */
@@ -85,10 +90,10 @@ export interface BodyRow {
   num?: number | null;
 }
 
-export type BodyStyle = "plain" | "muted" | "added" | "removed" | "error" | "warning";
+export type BodyStyle = "plain" | "muted" | "added" | "removed" | "error" | "warning" | "success";
 
 interface StyleAttrs {
-  fg?: "muted" | "toolDiffAdded" | "toolDiffRemoved" | "error" | "warning";
+  fg?: "muted" | "toolDiffAdded" | "toolDiffRemoved" | "error" | "warning" | "success";
   strike?: boolean;
 }
 
@@ -99,6 +104,7 @@ const STYLE_ATTRS: Record<BodyStyle, StyleAttrs> = {
   removed: { fg: "toolDiffRemoved", strike: true },
   error: { fg: "error" },
   warning: { fg: "warning" },
+  success: { fg: "success" },
 };
 
 // ---------------------------------------------------------------------------
@@ -454,7 +460,10 @@ export function renderInCell(code: string, opts: CellRenderOptions): string[] {
  * apply so a chatty cell cannot blow up the collapsed view.
  */
 export function renderOutCell(output: string, opts: CellRenderOptions): string[] {
-  const rows = splitBodyLines(output).map((line) => ({ text: line, style: "plain" as const }));
+  const rows = splitBodyLines(output).map((line) => ({
+    text: line,
+    style: (opts.outputStyle ?? "plain") as BodyStyle,
+  }));
   return buildBox(rows, opts, "out", { showLineNumbers: false });
 }
 
@@ -494,6 +503,36 @@ export function renderDeletedCell(code: string, opts: CellRenderOptions): string
  */
 export function renderClearedCell(code: string, opts: CellRenderOptions): string[] {
   return buildBox(codeBodyRows(code, opts), opts, "in", { contentError: true });
+}
+
+/**
+ * Render a generically labeled box (no `In[N]:`/`Out[N]:` semantics) for ops
+ * that are not a single cell — e.g. the run_to/run_all per-cell status list
+ * (`Run:` box). No line numbers unless `showLineNumbers` is set. Viewport
+ * rules and the collapsed `... N more lines >...` hint apply as usual.
+ */
+export function renderLabeledBox(
+  label: string,
+  rows: BodyRow[],
+  opts: {
+    width: number;
+    mode: ViewportMode;
+    theme?: Theme;
+    viewStart?: number;
+    showLineNumbers?: boolean;
+  },
+): string[] {
+  const viewport = applyViewport(rows, opts.mode, opts.viewStart);
+  return renderBox({
+    label,
+    labelWidth: visibleWidth(label),
+    lineNumberWidth: opts.showLineNumbers ? lineNumberWidthFor(rows.length) : 0,
+    rows: viewport.rows,
+    hidden: viewport.hidden,
+    width: opts.width,
+    theme: opts.theme,
+    showMoreHint: opts.mode === "normal",
+  });
 }
 
 /**

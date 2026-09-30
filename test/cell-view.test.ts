@@ -306,3 +306,36 @@ test("viewport rules apply to the Out box too, so chatty output stays bounded", 
   assert.equal(lines.length, 2 + NORMAL_VIEWPORT_LINES + 1);
   assert.match(lines.at(-1), /more lines/);
 });
+
+// ---------------------------------------------------------------------------
+// Error output + success rows + generic labeled box (I1 core extensions)
+// ---------------------------------------------------------------------------
+
+test("renderOutCell outputStyle=error styles only the content, fences stay normal", () => {
+  const lines = renderOutCell("boom", { ...OPTS, outputStyle: "error", theme: stubTheme() });
+  assert.ok(lines[1].includes("\u0001error\u0002boom\u0003"), JSON.stringify(lines[1]));
+  assert.ok(lines[0].includes("\u0001muted\u0002"), "top fence stays gutter-styled");
+  assert.ok(!lines[0].includes("\u0001error"), "top fence is not error-styled");
+});
+
+test("BodyStyle success maps to the success theme token", () => {
+  const { renderLabeledBox } = require("../dist/execution/cell-view.js");
+  const lines = renderLabeledBox(
+    "Run:",
+    [{ text: "ok cell", style: "success" }],
+    { width: 40, mode: "expanded", theme: stubTheme() },
+  );
+  assert.ok(lines[1].includes("\u0001success\u0002ok cell\u0003"), JSON.stringify(lines[1]));
+});
+
+test("renderLabeledBox: generic label, square fence, viewport + hint in normal mode", () => {
+  const { renderLabeledBox } = require("../dist/execution/cell-view.js");
+  const rows = codeOf(20).split("\n").map((text, i) => ({ text, num: i + 1 }));
+  const lines = renderLabeledBox("Run:", rows, { width: 40, mode: "normal" });
+  assert.equal(lines.length, 2 + NORMAL_VIEWPORT_LINES + 1);
+  assert.match(lines[0], /^Run: ┌─+┐$/);
+  assert.match(lines.at(-1), /more lines/);
+  // Box rows share one visible width (the hint line below the box is exempt).
+  const boxRows = lines.slice(0, -1).map(visibleWidth);
+  assert.deepEqual([...new Set(boxRows)], [40]);
+});
