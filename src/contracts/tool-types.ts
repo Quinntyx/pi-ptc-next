@@ -1,6 +1,6 @@
 import type {
   AgentToolUpdateCallback,
-  ExtensionContext,
+  ExtensionToolContext,
   ToolDefinition,
   ToolInfo as ExtensionToolInfo,
 } from "@earendil-works/pi-coding-agent";
@@ -82,7 +82,12 @@ export interface CallerMetadata {
 }
 
 export interface ExecuteToolContext {
-  ctx: ExtensionContext;
+  /**
+   * The context pi hands to an extension tool's `execute()`. Since pi 0.99 it
+   * is an {@link ExtensionToolContext} (it carries `tools` + `executeTool`),
+   * which is exactly what the nested bridge dispatches with.
+   */
+  ctx: ExtensionToolContext;
   signal?: AbortSignal;
   caller?: CallerMetadata;
 }

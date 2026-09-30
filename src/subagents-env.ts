@@ -125,6 +125,11 @@ export function resolveSourceDir(
   return undefined;
 }
 
+/** The pi_subagents package dir a venv bootstrap should install from. */
+export function resolvePiSubagentsSource(devSource?: string): string | undefined {
+  return resolveSourceDir(devSource ?? process.env.PTC_SUBAGENTS_SOURCE ?? DEV_SOURCE_DEFAULT);
+}
+
 /** Pure: stamps older than the interval (or missing) trigger a sync. */
 export function isStampStale(
   stamp: Stamp | undefined,
@@ -219,7 +224,17 @@ export async function ensurePythonForVersion(version: string): Promise<string> {
   if (!ok || !existsSync(python)) {
     throw new Error(`could not create a Python ${version} venv via uv (see ~/.cache/pi-pycells/subagents-sync.log)`);
   }
+  // The embedded-IPython runtime hard-requires IPython; a bare `uv venv` would
+  // produce a kernel that cannot start. Unpinned: uv resolves the newest
+  // IPython compatible with the requested interpreter (9.x for modern
+  // CPythons, 8.x for older pins).
+  await installRuntimeDependencies(python, join(cacheRoot, "subagents-sync.log"));
   return python;
+}
+
+/** Install the Python runtime's hard third-party dependency into a venv. */
+async function installRuntimeDependencies(venvPython: string, logFile: string): Promise<boolean> {
+  return runLogged(logFile, "uv", ["pip", "install", "--python", venvPython, "ipython"]);
 }
 
 // --- process helpers ------------------------------------------------------------
@@ -572,7 +587,11 @@ async function createVenv(paths: Paths, pythonVersion: string = DEFAULT_PYTHON_V
   // installs slower and differently-broken (no uv => no provision_dependency
   // either), and users blamed the plugin for degraded runtime instead of their
   // missing dependency. Fail loudly instead.
-  return runLogged(paths.logFile, "uv", ["venv", "--python", pythonVersion, paths.venvDir]);
+  const ok = await runLogged(paths.logFile, "uv", ["venv", "--python", pythonVersion, paths.venvDir]);
+  if (!ok) return false;
+  // The runtime hard-requires IPython (embedded shell); without this a fresh
+  // install provisions venvs whose kernels die on first start.
+  return installRuntimeDependencies(paths.venvPython, paths.logFile);
 }
 
 async function pipEditableInstall(paths: Paths, pkgDir: string): Promise<boolean> {

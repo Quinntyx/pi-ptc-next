@@ -168,23 +168,39 @@ def _report_execution_progress(lineno: int, force: bool = False) -> None:
 
 
 def _trace_lines(frame, event, arg):
-    """sys.settrace callback: map `user_main`/`_ptc_cell` frame lines to 1-based
-    user line numbers and report progress; other frames are ignored."""
+    """sys.settrace callback: report progress for user frames only.
+
+    Two shapes reach us: the legacy one-shot ``user_main`` wrapper, and cells
+    executed by the embedded IPython shell, whose code objects carry the cell's
+    filename (``_PTC_ACTIVE_FILENAME``). Returning None for every other 'call'
+    event keeps IPython's own machinery out of the per-line hook — tracing all of
+    it line-by-line was pure overhead.
+    """
     global _current_line
+
+    if event == "call":
+        if frame.f_code.co_name == "user_main":
+            return _trace_lines
+        if frame.f_code.co_filename == globals().get("_PTC_ACTIVE_FILENAME"):
+            return _trace_lines
+        return None
 
     if event != "line":
         return _trace_lines
 
-    if frame.f_code.co_name in ("user_main", "_ptc_cell"):
+    if frame.f_code.co_name == "user_main":
         # f_lineno is offset from co_firstlineno, which points at the `def` line.
         # The first body line therefore maps to user line 1, not 2.
         # _PTC_LINENO_OFFSET shifts the mapping when the wrapper's def line is
         # placed ON the first user statement (persistent session cells), where
         # the raw delta starts at 0 for the first body line.
         lineno = frame.f_lineno - frame.f_code.co_firstlineno + globals().get("_PTC_LINENO_OFFSET", 0)
-        _current_line = lineno
-        _report_execution_progress(lineno)
-
+    else:
+        # IPython compiles the cell with the original line numbers, so f_lineno
+        # is already the 1-based user line.
+        lineno = frame.f_lineno
+    _current_line = lineno
+    _report_execution_progress(lineno)
     return _trace_lines
 
 
@@ -419,6 +435,29 @@ def _traceback_with_help(error: BaseException) -> str:
     """Format the current exception's traceback, appending a recovery hint when
     _python_error_help has one for it."""
     traceback_text = _ptc_traceback.format_exc().rstrip()
+    hint = _python_error_help(error)
+    return f"{traceback_text}\n{hint}" if hint else traceback_text
+
+
+def _format_exception_with_help(error: BaseException) -> str:
+    """Like _traceback_with_help, but for an exception object captured earlier
+    (IPython's ExecutionResult), when no exception is active on the stack.
+
+    IPython's own execution frames (interactiveshell.run_code etc.) are dropped:
+    they are the embedded equivalent of the old wrapper frames and only add
+    noise to the model-facing traceback.
+    """
+    tb = getattr(error, "__traceback__", None)
+    if tb is not None:
+        frames = [
+            entry for entry in _ptc_traceback.extract_tb(tb)
+            if "/IPython/" not in entry.filename
+        ]
+        parts = ["Traceback (most recent call last):\n"] + _ptc_traceback.format_list(frames)
+    else:
+        parts = []
+    parts += _ptc_traceback.format_exception_only(type(error), error)
+    traceback_text = "".join(parts).rstrip()
     hint = _python_error_help(error)
     return f"{traceback_text}\n{hint}" if hint else traceback_text
 

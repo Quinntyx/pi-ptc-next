@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   createBashTool,
   createEditTool,
@@ -124,6 +124,9 @@ export class ToolRegistry {
       description: tool.description,
       parameters: tool.parameters,
       execute: tool.execute,
+      // Custom tools are ordinary model-facing tools unless the author says
+      // otherwise; the host requires an explicit exposure now.
+      exposure: tool.exposure ?? "direct",
       ptc,
       source: "extension",
       isReadOnly: classification.isReadOnly,
@@ -168,6 +171,7 @@ export class ToolRegistry {
           parameters: tool.parameters,
           source: "builtin",
           isReadOnly: classification.isReadOnly,
+          exposure: "direct",
           execute: async (toolCallId, params, signal, onUpdate, ctx) =>
             await executeBuiltin(toolCallId, params, signal, onUpdate, ctx),
         });
@@ -228,6 +232,8 @@ export class ToolRegistry {
         execute: async () => {
           throw new Error(`Tool ${piTool.name} execute function not available`);
         },
+        // Preserve whatever the host declared for this tool.
+        exposure: piTool.exposure,
         source: "extension",
         isReadOnly: classification.isReadOnly,
       });
@@ -318,7 +324,7 @@ export class ToolRegistry {
             parentToolCallId: execution.parentToolCallId,
             nestedCallId: toolCallId,
           } satisfies CallerMetadata,
-        }) as ExtensionContext & { caller?: CallerMetadata };
+        }) as ExtensionToolContext & { caller?: CallerMetadata };
 
         return await tool.execute(toolCallId, params, execution.signal, undefined, ctxWithCaller);
       },

@@ -606,6 +606,105 @@ test("session manager: configured session limit is parsed but no longer enforced
   }
 });
 
+test("session manager: document ops and scoped runs frame the interpreter correctly", async () => {
+  const { execFileSync } = require("node:child_process");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-docops-"));
+  const notebookPath = path.join(tempDir, "doc.ipynb");
+  fs.writeFileSync(notebookPath, JSON.stringify({
+    cells: [{ cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: ["x = 1\n"] }],
+    metadata: {},
+    nbformat: 4,
+    nbformat_minor: 5,
+  }));
+
+  const frames = [];
+  let failDelete = false;
+  const onFrame = (frame, proc) => {
+    frames.push(frame);
+    if (frame.type === "exec") {
+      setImmediate(() => proc.emitFrame({
+        type: "exec_done",
+        id: frame.id,
+        output: "ok",
+        echo: null,
+        cell: (frame.target_cell_index ?? 0) + 1,
+        total_output_chars: frame.code.length,
+        digest: { cells: 1, imports: [], defs: [], classes: [], vars: [] },
+      }));
+    } else if (frame.type === "doc") {
+      if (failDelete && frame.op === "delete_cell") {
+        setImmediate(() => proc.emitFrame({ type: "doc_error", id: frame.id, message: "cell 9 does not exist" }));
+        return;
+      }
+      const reads = frame.op === "read_cells" || frame.op === "read_cell";
+      setImmediate(() => proc.emitFrame({
+        type: "doc_done",
+        id: frame.id,
+        op: frame.op,
+        total: 2,
+        cells: reads
+          ? [{ index: 1, cell_type: "markdown", execution_count: null, source: "# hi", output_count: 0, output_text: "" }]
+          : [],
+      }));
+    }
+  };
+  const { manager, processes } = makeFakeManager({ onFrame });
+  try {
+    const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+
+    // scratch_run executes without appending a cell.
+    await manager.scratchRun(id, "y = 2", { cwd: tempDir });
+    const scratch = frames.find((f) => f.type === "exec" && f.code === "y = 2");
+    assert.equal(scratch.append, false);
+    assert.equal(scratch.target_cell_index, undefined);
+
+    // write_cell upserts and never executes.
+    await manager.writeCell(id, { at: 1, source: "# hi", cellType: "markdown" });
+    const write = frames.find((f) => f.type === "doc" && f.op === "write_cell");
+    assert.deepEqual(
+      { at: write.at, source: write.source, cell_type: write.cell_type },
+      { at: 1, source: "# hi", cell_type: "markdown" }
+    );
+
+    // read ops use the position (n) / window (offset,limit) params the runtime reads.
+    const readCells = await manager.readCells(id, { offset: 1, limit: 5 });
+    assert.equal(readCells.cells.length, 1);
+    const readCellsFrame = frames.find((f) => f.type === "doc" && f.op === "read_cells");
+    assert.deepEqual({ offset: readCellsFrame.offset, limit: readCellsFrame.limit }, { offset: 1, limit: 5 });
+    await manager.readCell(id, 2);
+    assert.equal(frames.find((f) => f.type === "doc" && f.op === "read_cell").n, 2);
+    await manager.deleteCell(id, 1);
+    assert.equal(frames.find((f) => f.type === "doc" && f.op === "delete_cell").n, 1);
+
+    // run_cell/run_to/run_all execute the on-disk cell in place (0-based target).
+    await manager.runCell(id, 1, { cwd: tempDir });
+    const runCell = frames.filter((f) => f.type === "exec" && f.code === "x = 1\n").at(-1);
+    assert.equal(runCell.target_cell_index, 0);
+    assert.equal(runCell.append, true);
+    await manager.runTo(id, 1, { cwd: tempDir });
+    assert.equal(frames.filter((f) => f.type === "exec" && f.code === "x = 1\n").at(-1).target_cell_index, 0);
+    await manager.runAll(id, { cwd: tempDir });
+    assert.equal(frames.filter((f) => f.type === "exec" && f.code === "x = 1\n").at(-1).target_cell_index, 0);
+
+    // A doc_error rejects with the runtime message.
+    failDelete = true;
+    await assert.rejects(manager.deleteCell(id, 9), /cell 9 does not exist/);
+
+    // reset_kernel replaces the interpreter under the same session id and makes
+    // the next exec restart execution numbering at 0 -> Out[1].
+    const summary = await manager.resetKernel(id, { cwd: tempDir, ctx: fakeCtx() });
+    assert.equal(summary.id, id);
+    assert.equal(processes.length, 2);
+    assert.equal(manager.list().length, 1);
+    await manager.execForeground(id, "z = 3", {});
+    const afterReset = frames.filter((f) => f.type === "exec" && f.code === "z = 3").at(-1);
+    assert.equal(afterReset.initial_cell_count, 0);
+  } finally {
+    await manager.disposeAll();
+    execFileSync("trash", ["--", tempDir]);
+  }
+});
+
 test("readCellOutput reads durable notebook cells by execution number with offset/limit", async () => {
   const { execFileSync } = require("node:child_process");
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-output-"));
@@ -949,7 +1048,7 @@ test("kernel: sourcing errors mark the failed prefix cell and leave the kernel u
   }
 });
 
-test("kernel: trailing expression echoes, digest footer, magic guard, notebook", { skip: !RUN_REAL }, async () => {
+test("kernel: trailing expression echoes, digest footer, magics run, notebook", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	try {
 		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
@@ -964,16 +1063,12 @@ test("kernel: trailing expression echoes, digest footer, magic guard, notebook",
 		assert.doesNotMatch(silent.output, /Out\[/);
 		assert.match(silent.output, /kernel:\n  cell 2 · \+x/);
 
-		// Magic guard: rejected before execution, counter not advanced.
-		await assert.rejects(
-			manager.execForeground(id, "%timeit sum(range(10))", {}),
-			(error: unknown) => {
-				const message = error instanceof Error ? error.message : String(error);
-				return /MagicError/.test(message) && /not written to the notebook/.test(message);
-			},
-		);
+		// Jupyter parity: IPython magics execute instead of being rejected, and
+		// (unlike the old pre-execution guard) they advance the counter.
+		const magic = await manager.execForeground(id, "%timeit sum(range(10))", {});
+		assert.match(magic.output, /\nkernel:\n  cell 3\b/);
 		const afterMagic = await manager.execForeground(id, "pass", {});
-		assert.match(afterMagic.output, /kernel:\n  cell 3\b/, "rejected cells must not advance the counter");
+		assert.match(afterMagic.output, /kernel:\n  cell 4\b/);
 
 		// ModuleNotFoundError carries the provision_dependency hint.
 		await assert.rejects(
@@ -990,6 +1085,45 @@ test("kernel: trailing expression echoes, digest footer, magic guard, notebook",
 	}
 });
 
+test("kernel: Jupyter parity (shared namespace, Out/_, magics, display)", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-jupyter-"));
+	const notebookPath = path.join(tempDir, "rich.ipynb");
+	try {
+		const { id } = await manager.provision({ cwd: process.cwd(), ctx: fakeCtx() });
+
+		// One persistent namespace, and `_` carries the previous Out[] value.
+		await manager.execForeground(id, "seed = 21", {});
+		const doubled = await manager.execForeground(id, "seed * 2", {});
+		assert.match(doubled.output, /Out\[2\]: 42/);
+		const viaUnderscore = await manager.execForeground(id, "_ + 1", {});
+		assert.match(viaUnderscore.output, /Out\[3\]: 43/);
+
+		// Magics are allowed (the old runtime rejected them pre-execution); a
+		// cell magic captures stdout instead of leaking it.
+		const captured = await manager.execForeground(id, "%%capture caught\nprint('hidden')", {});
+		assert.doesNotMatch(captured.output, /hidden/);
+
+		// Top-level return still works, distinct from the echo.
+		const returned = await manager.execForeground(id, "k = 7\nreturn k * 3", {});
+		assert.match(returned.output, /Out\[\d+\]\):\n  21/);
+
+		// Rich display(...) mime bundles are recorded as nbformat display_data.
+		await manager.execForeground(
+			id,
+			"from IPython.display import Markdown, display\ndisplay(Markdown('# title'))",
+			{ notebookPath },
+		);
+		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf-8"));
+		const last = notebook.cells[notebook.cells.length - 1];
+		const kinds = last.outputs.map((o: { output_type: string }) => o.output_type);
+		assert.ok(kinds.includes("display_data"), "display() mime bundle is recorded");
+	} finally {
+		await manager.disposeAll();
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
 test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async () => {
 	const manager = makeManager();
 	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ptc-nb-"));
@@ -1001,16 +1135,15 @@ test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async ()
 			manager.execForeground(id, "raise ValueError('boom')", { notebookPath }),
 			(error: unknown) => /ValueError/.test(error instanceof Error ? error.message : String(error)),
 		);
-		await assert.rejects(
-			manager.execForeground(id, "%magic garbage", { notebookPath }),
-			(error: unknown) => /MagicError/.test(error instanceof Error ? error.message : String(error)),
-		);
+		// Jupyter parity: magics execute and are recorded like any other cell.
+		const magic = await manager.execForeground(id, "%timeit sum(range(10))", { notebookPath });
+		assert.match(magic.output, /per loop/);
 
 		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf-8"));
 		assert.equal(notebook.nbformat, 4);
-		assert.equal(notebook.cells.length, 2, "magic-rejected cells must not be written");
+		assert.equal(notebook.cells.length, 3, "completed cells, magics included, are written");
 
-		const [ok, failed] = notebook.cells;
+		const [ok, failed, magicCell] = notebook.cells;
 		assert.equal(ok.cell_type, "code");
 		assert.equal(ok.execution_count, 1);
 		const kinds = ok.outputs.map((o: { output_type: string }) => o.output_type);
@@ -1022,6 +1155,12 @@ test("kernel: live .ipynb artifact records cells", { skip: !RUN_REAL }, async ()
 		assert.doesNotMatch(ok.metadata.ptc_full_output, /\[kernel\]/, "kernel footer is host-owned, not part of the durable record");
 		assert.equal(failed.outputs[0].output_type, "error");
 		assert.equal(failed.outputs[0].ename, "ValueError");
+		assert.equal(magicCell.execution_count, 3);
+		const magicText = magicCell.outputs
+			.filter((o: { output_type: string }) => o.output_type === "stream")
+			.map((o: { text: string[] }) => o.text.join(""))
+			.join("");
+		assert.match(magicText, /per loop/, "magic stdout is recorded in the notebook");
 	} finally {
 		await manager.disposeAll();
 	}
@@ -1070,14 +1209,15 @@ test("kernel: rebinding an existing notebook preserves cells and continues numbe
 		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
 		const result = await manager.execForeground(id, "'new output'", { notebookPath });
 		assert.equal(result.details.cellIdx, 5);
-		assert.match(result.output, /Out\[5\]: new output/);
+		// Jupyter parity: a string literal's Out[] uses IPython's repr (quotes).
+		assert.match(result.output, /Out\[5\]: 'new output'/);
 
 		const notebook = JSON.parse(fs.readFileSync(notebookPath, "utf8"));
 		assert.equal(notebook.cells.length, 2);
 		assert.equal(notebook.cells[0].metadata.ptc_full_output, "old durable output");
 		assert.equal(notebook.cells[1].execution_count, 5);
 		const durable = await manager.readCellOutput(5);
-		assert.match(durable.text, /Out\[5\]: new output/);
+		assert.match(durable.text, /Out\[5\]: 'new output'/);
 	} finally {
 		await manager.disposeAll();
 		execFileSync("trash", ["--", tempDir]);
@@ -1117,5 +1257,202 @@ test("kernel: inspect returns the user-created namespace", { skip: !RUN_REAL }, 
 		assert.ok(inspected.cells >= 1);
 	} finally {
 		await manager.disposeAll();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Stage B: document ops, scoped runs, and kernel reset (real interpreter).
+// ---------------------------------------------------------------------------
+
+function makeNotebookDir(prefix: string) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return { tempDir, notebookPath: path.join(tempDir, "doc.ipynb") };
+}
+
+function readNotebook(notebookPath: string) {
+  return JSON.parse(fs.readFileSync(notebookPath, "utf8"));
+}
+
+test("kernel: scratch_run mutates the namespace but records no cell", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-scratch-");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		const result = await manager.scratchRun(id, "seed = 41\nreturn seed + 1", { cwd: tempDir });
+		assert.match(result.output, /^return \(Out\[1\]\):\n  42/);
+		// The artifact is not even created: scratch runs record nothing at all.
+		assert.equal(fs.existsSync(notebookPath) ? readNotebook(notebookPath).cells.length : 0, 0);
+
+		// The namespace survived; the following exec_cell records exactly one cell.
+		const later = await manager.execForeground(id, "return seed", {});
+		assert.match(later.output, /^return \(Out\[2\]\):\n  41/);
+		assert.equal(readNotebook(notebookPath).cells.length, 1);
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: write_cell creates markdown/code cells; read and delete round-trip", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-writecell-");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		assert.equal((await manager.writeCell(id, { at: 1, source: "# Title", cellType: "markdown" })).total, 1);
+		assert.equal((await manager.writeCell(id, { at: 2, source: "value = 7", cellType: "code" })).total, 2);
+
+		const read = await manager.readCells(id, { offset: 1, limit: 10 });
+		assert.deepEqual(
+			read.cells.map((cell: { index: number; cellType: string; source: string }) => [cell.index, cell.cellType, cell.source]),
+			[[1, "markdown", "# Title"], [2, "code", "value = 7"]]
+		);
+		assert.equal((await manager.readCell(id, 1)).cells[0].cellType, "markdown");
+		assert.deepEqual(readNotebook(notebookPath).cells.map((cell: { cell_type: string }) => cell.cell_type), ["markdown", "code"]);
+
+		// Running a cell records its output; replacing the cell clears it.
+		await manager.writeCell(id, { at: 2, source: "value = 7\nvalue" });
+		await manager.runCell(id, 2, { cwd: tempDir });
+		assert.equal(readNotebook(notebookPath).cells[1].outputs.length, 1);
+		await manager.writeCell(id, { at: 2, source: "value = 8" });
+		assert.equal(readNotebook(notebookPath).cells[1].outputs.length, 0);
+
+		await manager.deleteCell(id, 1);
+		const remaining = await manager.readCells(id);
+		assert.equal(remaining.cells.length, 1);
+		assert.equal(remaining.cells[0].index, 1);
+		assert.equal(remaining.cells[0].cellType, "code");
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: run_cell executes the on-disk cell and replaces its stored output", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-runcell-");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		await manager.writeCell(id, { at: 1, source: "counter = 1\ncounter", cellType: "code" });
+		const first = await manager.runCell(id, 1, { cwd: tempDir });
+		assert.match(first.output, /Out\[1\]/);
+
+		await manager.writeCell(id, { at: 1, source: "counter = 2\ncounter" });
+		const second = await manager.runCell(id, 1, { cwd: tempDir });
+		assert.match(second.output, /Out\[2\]/);
+
+		const notebook = readNotebook(notebookPath);
+		assert.equal(notebook.cells.length, 1);
+		assert.equal(notebook.cells[0].execution_count, 2);
+		assert.equal(notebook.cells[0].outputs.length, 1);
+		assert.equal(notebook.cells[0].outputs[0].output_type, "execute_result");
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: run_all executes cells in order and stops at the first error", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-runall-");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		await manager.writeCell(id, { at: 1, source: "a = 1", cellType: "code" });
+		await manager.writeCell(id, { at: 2, source: "b = a + 1", cellType: "code" });
+		await manager.writeCell(id, { at: 3, source: "raise ValueError('boom')", cellType: "code" });
+		await manager.writeCell(id, { at: 4, source: "c = 99", cellType: "code" });
+
+		const result = await manager.runAll(id, { cwd: tempDir });
+		assert.deepEqual(result.steps.map((step: { index: number; ok: boolean }) => [step.index, step.ok]), [[1, true], [2, true], [3, false]]);
+		assert.equal(result.failedIndex, 3);
+		assert.match(result.output, /cell 3/);
+		assert.match(result.lastOutput, /ValueError/);
+
+		// Cell 4 never ran: a and b are defined, c is not.
+		const check = await manager.scratchRun(id, "return (a, b, 'c' in dir())", { cwd: tempDir });
+		assert.match(check.output, /\[\s*1,\s*2,\s*false\s*\]/);
+
+		// run_to(2) re-runs only cells 1..2.
+		const partial = await manager.runTo(id, 2, { cwd: tempDir });
+		assert.deepEqual(partial.steps.map((step: { index: number }) => step.index), [1, 2]);
+		assert.equal(partial.failedIndex, undefined);
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: external notebook edits survive a scoped run", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-external-");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		await manager.writeCell(id, { at: 1, source: "a = 1", cellType: "code" });
+
+		// Simulate a Jupyter/editor write: append a markdown cell behind the kernel's back.
+		const notebook = readNotebook(notebookPath);
+		notebook.cells.push({ cell_type: "markdown", id: "ext", metadata: {}, source: ["external\n"] });
+		fs.writeFileSync(notebookPath, JSON.stringify(notebook));
+
+		await manager.runCell(id, 1, { cwd: tempDir });
+		const after = readNotebook(notebookPath);
+		assert.equal(after.cells.length, 2);
+		assert.equal(after.cells[1].cell_type, "markdown");
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+test("kernel: reset_kernel clears the namespace, restarts numbering, keeps the notebook", { skip: !RUN_REAL }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-reset-");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		await manager.writeCell(id, { at: 1, source: "x = 123", cellType: "code" });
+		await manager.runCell(id, 1, { cwd: tempDir });
+		await manager.execForeground(id, "return x", {});
+
+		const summary = await manager.resetKernel(id, { cwd: tempDir, ctx: fakeCtx() });
+		assert.equal(summary.id, id);
+		assert.equal(manager.list().length, 1);
+		const inspected = await manager.inspectKernel(id);
+		assert.ok(!inspected.vars.some((entry: { name: string }) => entry.name === "x"));
+
+		// The notebook file survived reset; run_all replaces cells and restarts at 1.
+		assert.equal(readNotebook(notebookPath).cells.length, 2);
+		await manager.runAll(id, { cwd: tempDir });
+		assert.equal(readNotebook(notebookPath).cells[0].execution_count, 1);
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
+	}
+});
+
+// Optional cross-validation with the real Jupyter notebook toolchain. Requires
+// network (uv fetches nbformat), so it is opt-in via PTC_TEST_NBFORMAT=true.
+test("kernel: produced notebook validates against nbformat", { skip: !RUN_REAL || process.env.PTC_TEST_NBFORMAT !== "true" }, async () => {
+	const manager = makeManager();
+	const { execFileSync } = require("node:child_process");
+	const { tempDir, notebookPath } = makeNotebookDir("pi-ptc-nbformat-");
+	try {
+		const { id } = await manager.provision({ cwd: tempDir, ctx: fakeCtx(), notebookPath });
+		await manager.writeCell(id, { at: 1, source: "# Heading", cellType: "markdown" });
+		await manager.writeCell(id, { at: 2, source: "import math\nmath.pi", cellType: "code" });
+		await manager.runCell(id, 2, { cwd: tempDir });
+
+		const script = "import sys, nbformat\nnb = nbformat.read(sys.argv[1], as_version=4)\nnbformat.validate(nb)\nprint('VALID', len(nb.cells))";
+		const output = execFileSync("uv", ["run", "--quiet", "--with", "nbformat", "python", "-c", script, notebookPath], {
+			encoding: "utf8",
+		});
+		assert.match(output, /VALID 2/);
+	} finally {
+		await manager.disposeAll();
+		execFileSync("trash", ["--", tempDir]);
 	}
 });

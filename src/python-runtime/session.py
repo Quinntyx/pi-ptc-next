@@ -6,8 +6,13 @@ JSONL frames on stdin:
 
     {"type": "exec", "id": "exec_1", "code": "...", "user_code_line_count": N,
      "notebook": "/path/to/notebook.ipynb",          # live notebook artifact
-     "source_path": "/path/to/cell.py"}              # optional file mode
+     "source_path": "/path/to/cell.py",                # optional file mode
+     "target_cell_index": 2,                            # run_cell: replace this cell
+     "append": true,                                    # false for scratch_run
+     "source_cell_index": 1}                            # sourcing: position-based
     {"type": "inspect", "id": "inspect_1"}
+    {"type": "doc", "id": "doc_1", "op": "write_cell", "at": 2, "source": "...",
+     "cell_type": "code"}                              # or delete_cell/read_cells/read_cell
     {"type": "export_script", "id": "export_1", "path": "...", "cells": ["..."]}
 
 and the runtime answers:
@@ -16,6 +21,8 @@ and the runtime answers:
      "total_output_chars": N, "cell": N, "digest": {...}}
     {"type": "exec_error", "id": ..., "message": ..., "traceback": "..."}
     {"type": "kernel_inspected", "id": ..., "digest": {...}}
+    {"type": "doc_done", "id": ..., "op": ..., "total": N, "cells": [...]}
+    {"type": "doc_error", "id": ..., "op": ..., "message": ...}
     {"type": "script_exported", "id": ..., "path": ..., "cells": N, "wrapped_async": bool}
 
 interspersed with the usual execution_progress / stdout frames, plus
@@ -24,17 +31,18 @@ pi_subagents bridge and {"type": "session_ready"} once the loop is live.
 
 Kernel semantics:
 
-- Each cell compiles as a function body (sync `def` or `async def` when it uses
-  top-level await), so `return` keeps working, and the function's locals are
-  merged back into the shared namespace afterwards so imports and definitions
-  persist across cells.
-- A trailing bare expression is echoed automatically (Out[n] semantics) via
-  str() so libraries opt into readable display through __str__.
-- Line-leading `%`/`!` (IPython magics) are rejected before execution: the cell
-  neither runs nor reaches the notebook. The magic scan only runs when the cell
-  fails to parse, so a leading `%`/`!` (which can never be valid Python) gets a
-  MagicError while valid Python that merely contains `%` or `!` inside
-  triple-quoted strings or after backslash joins is executed normally.
+- Cells run on one embedded IPython ``InteractiveShell`` whose user namespace
+  IS this script's globals: one persistent namespace, native top-level ``await``,
+  ``In[n]``/``Out[n]`` history, and real magics. There is no per-cell function
+  wrapper, no locals merge, and no trailing-expression rewrite.
+- A trailing bare expression is echoed by IPython's displayhook and travels as
+  the frame's ``echo`` field; its ``Out[n]`` lines up with the notebook's
+  execution_count.
+- Top-level ``return`` is kept for compatibility via a small AST transformer: it
+  becomes a private ``_PtcReturn`` signal that stops the cell early without
+  copying the namespace.
+- Magics (``%time``, ``%%capture``, ``%pip`` ...) and ``!`` shell escapes are
+  executed by IPython instead of being rejected.
 - Completed cells — including errored and interrupted ones — are appended to the
   live .ipynb artifact and the file is rewritten atomically.
 - File mode executes a file's contents inside this kernel (IPython %run
@@ -43,7 +51,6 @@ Kernel semantics:
 
 import ast as _ptc_ast
 import builtins as _ptc_builtins
-import re as _ptc_re
 
 # The subagent bridge: pi_subagents detects PTC_STATE_EMIT in builtins and
 # forwards its runtime snapshots through the RPC pipe as subagent_state frames.
@@ -54,9 +61,9 @@ _ptc_builtins.PTC_STATE_EMIT = lambda snapshot: _emit_protocol({
 
 _cell_counter = 0
 # Live notebook artifact: provision_kernel passes the .ipynb path on every exec
-# frame; completed cells (including errored ones) are appended and the file is
-# rewritten atomically. Magic-rejected and approval-rejected cells never reach
-# the runtime, so they never pollute the notebook.
+# and doc frame; completed cells (including errored ones) are appended and the
+# file is rewritten atomically. Approval-rejected cells never reach the runtime,
+# so they never pollute the notebook.
 _ptc_notebook_path = None
 # Per-cell JSON fragments (serialized once at append time). The notebook file is
 # rebuilt by concatenating these cached fragments instead of re-serializing the
@@ -65,6 +72,9 @@ _ptc_notebook_cell_fragments = []
 # The document text last written to disk: a rebuild that yields identical bytes
 # (e.g. a duplicate completion for the same cell) skips the file rewrite.
 _ptc_notebook_last_document = None
+# (mtime_ns, size) of the notebook as this kernel last saw it; a mismatch means
+# another writer (Jupyter, an editor) changed the file and it must be re-read.
+_ptc_notebook_stat_value = None
 # Preserve source notebook-level metadata/version while cells are re-rendered.
 _ptc_notebook_metadata = {}
 _ptc_notebook_nbformat = 4
@@ -73,53 +83,219 @@ _ptc_notebook_nbformat_minor = 5
 # plumbing from user-created state in digests and inspect_kernel.
 _ptc_baseline = None
 # Names injected by the runtime/prelude that are plumbing, not user state.
-_PTC_DIGEST_SKIP_NAMES = {"ptc", "PTC_MODE", "subagents_autoimport_note"}
-# Line-leading % or ! is never valid Python: it is an IPython magic trying to
-# sneak in. Caught before execution so hallucinated magics cost one cheap turn
-# and never touch the notebook.
-_PTC_MAGIC_RE = _ptc_re.compile(r"\s*[%!]")
-_PTC_MAGIC_EQUIVALENTS = (
-    ("%timeit", "time.perf_counter() around a loop, or the timeit module"),
-    ("%%time", "time.perf_counter() before and after the work"),
-    ("%time", "time.perf_counter()"),
-    ("%pip", 'provision_dependency("<distribution>")'),
-    ("%who", "inspect_kernel"),
-    ("%whos", "inspect_kernel"),
-    ("%%capture", "contextlib.redirect_stdout"),
-    ("%matplotlib", "figures are captured automatically; no setup needed"),
-    ("%load_ext", "no equivalent — this runtime needs no extensions"),
-    ("%run", "exec_cell(file=...) runs a file inside this kernel"),
-    ("!", "the bash tool"),
-)
+# IPython adds its own namespace entries (In/Out/exit/quit/get_ipython/open) when
+# the shell is created; they are also captured by the pre-first-cell baseline, but
+# listing them here keeps digests clean even if the baseline is missing.
+_PTC_DIGEST_SKIP_NAMES = {
+    "ptc", "PTC_MODE", "subagents_autoimport_note",
+    "In", "Out", "exit", "quit", "get_ipython", "open", "input",
+}
+# The embedded IPython shell (created lazily by _ptc_setup_ipython).
+_PTC_SHELL = None
+# The filename the shell should compile the current cell as (set per exec; the
+# runtime tracer matches this to report progress for user frames only).
+_PTC_ACTIVE_FILENAME = None
+_PTC_PENDING_FILENAME = None
 # The chunk currently executing, so a SIGINT can cancel it without killing the
 # session (Ctrl-C semantics: stop the chunk, keep the interpreter interactive).
 _ptc_current_chunk_task = None
 _ptc_loop = None
-_PTC_MERGE_SKIP_NAMES = {"ptc_cell_storage", "__builtins__"}
-# The session wrapper's `def _ptc_cell` is placed on the chunk's first user
-# line, so raw trace deltas start at 0; shift to 1-based like the one-shot path.
-_PTC_LINENO_OFFSET = 1
 
 
-def _ptc_merge_cell_locals(storage: dict) -> None:
-    """Merge user-visible cell locals into the persistent namespace.
+def _ptc_blocked_input(*_args, **_kwargs):
+    """Replace builtin ``input`` inside the kernel: stdin is the RPC pipe, so a
+    read would steal protocol frames and hang. Fail fast with a clear hint."""
+    raise RuntimeError(
+        "input() is not available in the PTC kernel: stdin carries the host RPC "
+        "protocol. Pass data as function arguments, or read it with "
+        "read(path=...) / ptc.read_text(...)."
+    )
 
-    Names reserved by the runtime (leading "_ptc_", "PTC_", "__") are skipped so
-    the plumbing cannot be clobbered by user code.
+
+class _PtcReturn(BaseException):
+    """Signal raised by a rewritten top-level ``return`` to stop the cell early.
+
+    Subclasses BaseException so user ``except Exception`` handlers do not swallow
+    it. IPython's run_code catches it via ``shell.custom_exceptions`` and stores
+    it on the ExecutionResult, so _ptc_exec_chunk can recover the value.
     """
-    if not isinstance(storage, dict):
-        return
-    for key, value in storage.items():
-        if key in _PTC_MERGE_SKIP_NAMES:
-            continue
-        if key.startswith("_ptc_") or key.startswith("PTC_") or key.startswith("__"):
-            continue
-        globals()[key] = value
+
+    def __init__(self, value=None):
+        self.value = value
+        super().__init__(value)
+
+
+class _PtcReturnTransformer(_ptc_ast.NodeTransformer):
+    """Rewrite cell-level ``return`` into ``raise _PtcReturn(...)``.
+
+    Only returns outside any function/lambda scope are touched, so the
+    compatibility shim never changes ordinary function bodies. Raising rather
+    than merging locals keeps the single shared namespace intact: nothing is
+    copied or restored.
+    """
+
+    def __init__(self):
+        self._depth = 0
+
+    def _visit_scope(self, node):
+        self._depth += 1
+        try:
+            return self.generic_visit(node)
+        finally:
+            self._depth -= 1
+
+    visit_FunctionDef = _visit_scope
+    visit_AsyncFunctionDef = _visit_scope
+    visit_Lambda = _visit_scope
+
+    def visit_Return(self, node):
+        if self._depth:
+            return node
+        value = node.value if node.value is not None else _ptc_ast.Constant(value=None)
+        raised = _ptc_ast.Raise(
+            exc=_ptc_ast.Call(
+                func=_ptc_ast.Name(id="_PtcReturn", ctx=_ptc_ast.Load()),
+                args=[value],
+                keywords=[],
+            ),
+            cause=None,
+        )
+        _ptc_ast.copy_location(raised, node)
+        _ptc_ast.fix_missing_locations(raised)
+        return raised
+
+
+def _ptc_setup_ipython():
+    """Create (once) the embedded IPython shell that executes cells.
+
+    The shell's user namespace is this module's globals, so tool wrappers, the
+    ``ptc`` helpers and the lazy ``np``/``pd``/``plt`` proxies are visible to
+    cells and everything a cell defines persists for the next one. The display
+    hook is silenced (the host owns the output sections); tracebacks and syntax
+    errors are formatted by the runtime, not printed by IPython; history is
+    disabled so a long-lived daemon never touches ~/.ipython.
+    """
+    global _PTC_SHELL
+    if _PTC_SHELL is not None:
+        return _PTC_SHELL
+
+    import linecache as _ptc_linecache
+    from IPython.core.display_trap import DisplayTrap
+    from IPython.core.displayhook import DisplayHook
+    from IPython.core.interactiveshell import InteractiveShell
+
+    # __name__ is "__main__" for the -c combined script; fall back to the
+    # globals' own module if the script is executed from a file.
+    user_module = _ptc_sys.modules.get(__name__)
+    shell = InteractiveShell.instance(user_module=user_module, user_ns=globals())
+    shell.autocall = 0
+    try:
+        shell.history_manager.enabled = False
+    except Exception:
+        pass
+    # IPython would otherwise print tracebacks/syntax errors on their own; the
+    # runtime formats them into the exec_error frame instead.
+    shell.showtraceback = lambda *a, **k: None
+    shell.showsyntaxerror = lambda *a, **k: None
+    shell.showindentationerror = lambda *a, **k: None
+    shell.CustomTB = lambda *a, **k: None
+
+    # Top-level return (compatibility shim): the transformer emits _PtcReturn and
+    # IPython's run_code hands it back on the result instead of erroring.
+    shell.custom_exceptions = tuple(shell.custom_exceptions) + (_PtcReturn,)
+    shell.ast_transformers.append(_PtcReturnTransformer())
+
+    class _PtcDisplayHook(DisplayHook):
+        """Silence the printed ``Out[n]:`` prompt; keep the computed text/plain
+        bundle so the frame can carry the echo (no string rewriting here)."""
+
+        last_format = None
+
+        def write_output_prompt(self):
+            return None
+
+        def write_format_data(self, format_dict, md_dict=None):
+            self.last_format = dict(format_dict or {})
+
+    shell.displayhook = _PtcDisplayHook(shell=shell)
+    # init_displayhook() built the trap around the ORIGINAL hook, so rebuild it.
+    shell.display_trap = DisplayTrap(hook=shell.displayhook)
+
+    # A cell that calls sys.exit()/exit() is a normal cell error; IPython's
+    # interactive hint is noise on the host's stderr in a daemon kernel.
+    import warnings as _ptc_warnings
+
+    _ptc_warnings.filterwarnings("ignore", message=r"To exit: use 'exit'")
+
+    # Give every cell the filename the runtime wants (file mode: the real path)
+    # and register its source with linecache so tracebacks can show it.
+    original_cache = shell.compile.cache
+
+    def _ptc_cache(code, number=0, raw_code=None):
+        name = _PTC_PENDING_FILENAME
+        if name is None:
+            return original_cache(code, number, raw_code=raw_code)
+        _ptc_linecache.cache[name] = (len(code), None, code.splitlines(True), name)
+        return name
+
+    shell.compile.cache = _ptc_cache
+
+    # input() must not consume RPC frames.
+    shell.user_ns["input"] = _ptc_blocked_input
+
+    _PTC_SHELL = shell
+    return shell
+
+
+async def _ptc_run_shell_cell(shell, code: str, cell_name: str, exec_count: int):
+    """Run one cell on the embedded shell with capture_output.
+
+    Returns ``(result, cap.outputs, echo_text)``. stdout is intentionally NOT
+    captured here: the session keeps ``_stdout_proxy`` installed so complete
+    lines still stream to the host, while capture_output collects the rich
+    display outputs (e.g. ``display(...)`` calls). The trailing expression's
+    text/plain comes from the silenced displayhook.
+    """
+    global _PTC_PENDING_FILENAME, _PTC_ACTIVE_FILENAME
+
+    from IPython.utils.capture import capture_output
+
+    try:
+        transformed = shell.transform_cell(code)
+        preprocessing = None
+    except Exception:
+        transformed = code
+        preprocessing = _ptc_sys.exc_info()
+
+    _PTC_PENDING_FILENAME = cell_name
+    _PTC_ACTIVE_FILENAME = cell_name
+    # run_cell_async increments execution_count when store_history=True; seed it
+    # so In[n]/Out[n] equal the notebook's execution_count.
+    shell.execution_count = max(0, exec_count - 1)
+    shell.displayhook.last_format = None
+    try:
+        with capture_output(stdout=False, stderr=False, display=True) as captured:
+            result = await shell.run_cell_async(
+                code,
+                store_history=True,
+                transformed_cell=transformed,
+                preprocessing_exc_tuple=preprocessing,
+            )
+        outputs = list(captured.outputs)
+    finally:
+        _PTC_PENDING_FILENAME = None
+        _PTC_ACTIVE_FILENAME = None
+        shell.execution_count = exec_count
+    fmt = getattr(shell.displayhook, "last_format", None) or {}
+    echo_text = fmt.get("text/plain")
+    return result, outputs, (str(echo_text) if echo_text is not None else None)
 
 
 def _ptc_stmt_has_top_level_await(node) -> bool:
     """True when the statement contains await/async-for/async-with outside any
-    nested function or lambda scope."""
+    nested function or lambda scope. Used by script export to decide the
+    async-def wrapping of the standalone script (the live kernel defers to
+    IPython's own await handling)."""
     if isinstance(node, (_ptc_ast.Await, _ptc_ast.AsyncFor, _ptc_ast.AsyncWith)):
         return True
     for child in _ptc_ast.iter_child_nodes(node):
@@ -128,107 +304,6 @@ def _ptc_stmt_has_top_level_await(node) -> bool:
         if _ptc_stmt_has_top_level_await(child):
             return True
     return False
-
-
-def _ptc_build_cell(code: str, cell_name: str):
-    """Compile a chunk as a function body; returns (compiled, is_async).
-
-    The function body is wrapped in try/finally whose finally block stores the
-    cell's locals into ``globals()["ptc_cell_storage"]`` — so the merge happens
-    even when the user code returns early or raises.
-
-    A trailing bare expression (Jupyter's Out[] semantics) is stored into
-    ``_ptc_last_value`` instead of being discarded; the exec chunk reads it for
-    the auto-echo. The rewrite happens at the AST level so original line
-    numbers (viewer arrow, tracebacks) are preserved.
-    """
-    tree = _ptc_ast.parse(code, cell_name, mode="exec")
-    is_async = any(_ptc_stmt_has_top_level_await(stmt) for stmt in tree.body)
-    body = tree.body or [_ptc_ast.Pass()]
-    if isinstance(body[-1], _ptc_ast.Expr):
-        trailing = body[-1]
-        store = _ptc_ast.Assign(
-            targets=[_ptc_ast.Name(id="_ptc_last_value", ctx=_ptc_ast.Store())],
-            value=trailing.value,
-        )
-        _ptc_ast.copy_location(store, trailing)
-        body[-1] = store
-
-    storage = _ptc_ast.Assign(
-        targets=[
-            _ptc_ast.Subscript(
-                value=_ptc_ast.Call(func=_ptc_ast.Name(id="globals", ctx=_ptc_ast.Load()), args=[], keywords=[]),
-                slice=_ptc_ast.Constant(value="ptc_cell_storage"),
-                ctx=_ptc_ast.Store(),
-            )
-        ],
-        value=_ptc_ast.Call(
-            func=_ptc_ast.Name(id="locals", ctx=_ptc_ast.Load()), args=[], keywords=[]
-        ),
-    )
-    # Borrow the last user statement's location: the wrapper's own bookkeeping must
-    # not be reported as a line (it otherwise inherits line 1 and makes the viewer's
-    # arrow jump back to the top at the end of every chunk).
-    _ptc_ast.copy_location(storage, body[-1])
-    guarded = _ptc_ast.Try(
-        body=body,
-        handlers=[],
-        orelse=[],
-        finalbody=[storage],
-    )
-
-    func = _ptc_ast.AsyncFunctionDef() if is_async else _ptc_ast.FunctionDef()
-    func.name = "_ptc_cell"
-    func.args = _ptc_ast.arguments(
-        posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]
-    )
-    func.body = [guarded]
-    func.decorator_list = []
-    func.returns = None
-    func.type_params = []
-    _ptc_ast.copy_location(func, body[0])
-    _ptc_ast.fix_missing_locations(func)
-    module = _ptc_ast.Module(body=[func], type_ignores=[])
-    _ptc_ast.fix_missing_locations(module)
-    return compile(module, cell_name, "exec"), is_async
-
-
-def _ptc_find_magics(code: str) -> list[tuple[int, str]]:
-    """Return (1-based line number, stripped line) pairs for lines starting with
-    `%` or `!` (candidate IPython magics). Only consulted for cells that fail to parse."""
-    offending = []
-    for lineno, line in enumerate(code.split("\n"), 1):
-        if _PTC_MAGIC_RE.match(line):
-            offending.append((lineno, line.strip()))
-    return offending
-
-
-def _ptc_code_parses(code: str) -> bool:
-    """True when `code` is syntactically valid Python.
-
-    The magic guard (L8) is only consulted when this fails: a leading `%`/`!` is
-    always a SyntaxError, so a parse failure triggers the friendly MagicError
-    scan — while `%`/`!` inside triple-quoted strings or after backslash joins
-    parse fine and must execute untouched.
-    """
-    try:
-        _ptc_ast.parse(code, "<ptc-magic-check>", mode="exec")
-        return True
-    except (SyntaxError, ValueError):
-        return False
-
-
-def _ptc_magic_error(offending: list[tuple[int, str]]) -> str:
-    """Build the MagicError text for the offending magic lines (first three shown)
-    plus a table of native equivalents; the text states the cell was not executed
-    and not written to the notebook."""
-    shown = "; ".join(f"line {n}: `{text[:60]}`" for n, text in offending[:3])
-    equivalents = " · ".join(f"{magic} → {hint}" for magic, hint in _PTC_MAGIC_EQUIVALENTS)
-    return (
-        f"MagicError: IPython magics are not supported by this runtime ({shown}). "
-        f"This cell was not executed and was not written to the notebook. "
-        f"Native equivalents: {equivalents}"
-    )
 
 
 def _ptc_preview_value(value) -> str:
@@ -254,7 +329,6 @@ def _ptc_namespace_fingerprint() -> dict:
         for key, value in globals().items()
         if not key.startswith("_")
         and not key.startswith("PTC_")
-        and key not in _PTC_MERGE_SKIP_NAMES
         and key not in _PTC_DIGEST_SKIP_NAMES
     }
 
@@ -278,7 +352,6 @@ def _ptc_kernel_state(baseline: dict | None) -> dict:
         if (
             key.startswith("_")
             or key.startswith("PTC_")
-            or key in _PTC_MERGE_SKIP_NAMES
             or key in _PTC_DIGEST_SKIP_NAMES
         ):
             continue
@@ -410,18 +483,44 @@ def _ptc_indent_block(text: str, amount: int, skip_first_line: bool = False) -> 
     return "\n".join(pad + line for line in lines)
 
 
-def _ptc_bind_notebook(notebook_path: str) -> None:
-    """Bind an artifact and preserve its existing cells/execution numbering."""
+def _ptc_notebook_fragment(cell: dict) -> str:
+    """Serialize one notebook cell to the cached JSON fragment form."""
+    import json as _nb_json
+
+    return _nb_json.dumps(cell, ensure_ascii=False, indent=1)
+
+
+def _ptc_notebook_stat():
+    """(mtime_ns, size) of the bound notebook, or None when it cannot be stat'd."""
+    import os as _nb_os
+
+    if not _ptc_notebook_path:
+        return None
+    try:
+        stat = _nb_os.stat(_ptc_notebook_path)
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _ptc_bind_notebook(notebook_path: str, force: bool = False) -> None:
+    """Bind an artifact and preserve its existing cells/execution numbering.
+
+    ``force`` re-reads the file even when the path is already bound; used to
+    pick up cells another writer (Jupyter, an editor, the host) changed since
+    our last write.
+    """
     global _ptc_notebook_path, _ptc_notebook_cell_fragments
-    global _ptc_notebook_last_document, _ptc_notebook_metadata
+    global _ptc_notebook_last_document, _ptc_notebook_metadata, _ptc_notebook_stat_value
     global _ptc_notebook_nbformat, _ptc_notebook_nbformat_minor, _cell_counter
 
-    if notebook_path == _ptc_notebook_path:
+    if notebook_path == _ptc_notebook_path and not force:
         return
     _ptc_notebook_path = notebook_path
     _ptc_notebook_cell_fragments = []
     _ptc_notebook_last_document = None
     _ptc_notebook_metadata = {}
+    _ptc_notebook_stat_value = _ptc_notebook_stat()
     _ptc_notebook_nbformat = 4
     _ptc_notebook_nbformat_minor = 5
     _cell_counter = 0
@@ -446,9 +545,7 @@ def _ptc_bind_notebook(notebook_path: str) -> None:
         for cell in cells:
             if not isinstance(cell, dict):
                 continue
-            _ptc_notebook_cell_fragments.append(
-                _nb_json.dumps(cell, ensure_ascii=False, indent=1)
-            )
+            _ptc_notebook_cell_fragments.append(_ptc_notebook_fragment(cell))
             execution_count = cell.get("execution_count")
             if isinstance(execution_count, int):
                 _cell_counter = max(_cell_counter, execution_count)
@@ -457,6 +554,59 @@ def _ptc_bind_notebook(notebook_path: str) -> None:
         # running; the next completed cell will produce a fresh valid notebook.
         _ptc_notebook_cell_fragments = []
         _cell_counter = 0
+        _ptc_notebook_stat_value = None
+
+
+def _ptc_notebook_reload() -> None:
+    """Re-read the bound notebook when it changed on disk (external edits).
+
+    The stat guard keeps the cached fragments when this kernel is the only
+    writer. The execution counter never regresses: a scratch run that advanced
+    it but recorded nothing is still remembered.
+    """
+    global _cell_counter
+
+    if not _ptc_notebook_path:
+        return
+    if _ptc_notebook_stat_value == _ptc_notebook_stat():
+        return
+    saved_counter = _cell_counter
+    _ptc_bind_notebook(_ptc_notebook_path, force=True)
+    _cell_counter = max(saved_counter, _cell_counter)
+
+
+def _ptc_notebook_store_fragment(fragment: str, target_cell_index: int | None) -> None:
+    """Replace the cell at ``target_cell_index`` (0-based) or append a new one."""
+    if target_cell_index is not None and 0 <= target_cell_index < len(_ptc_notebook_cell_fragments):
+        _ptc_notebook_cell_fragments[target_cell_index] = fragment
+    else:
+        _ptc_notebook_cell_fragments.append(fragment)
+
+
+def _ptc_notebook_write_document() -> bool:
+    """Render the cached fragments and atomically rewrite the .ipynb.
+
+    Skips the write when the rendered bytes are unchanged. Returns whether the
+    file was (re)written. Best-effort: a write failure never fails the cell.
+    """
+    global _ptc_notebook_last_document, _ptc_notebook_stat_value
+
+    if not _ptc_notebook_path:
+        return False
+    import os as _nb_os
+
+    document = _ptc_render_notebook_document()
+    if document == _ptc_notebook_last_document:
+        return False
+    directory = _nb_os.path.dirname(_ptc_notebook_path) or "."
+    _nb_os.makedirs(directory, exist_ok=True)
+    tmp_path = _ptc_notebook_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(document)
+    _nb_os.replace(tmp_path, _ptc_notebook_path)
+    _ptc_notebook_last_document = document
+    _ptc_notebook_stat_value = _ptc_notebook_stat()
+    return True
 
 
 def _ptc_render_notebook_document() -> str:
@@ -498,24 +648,40 @@ def _ptc_render_notebook_document() -> str:
 def _ptc_notebook_write(exec_count: int, code: str, *, stdout_text: str, echo_text: str | None,
                         full_output: str, images: list | None, error: dict | None = None,
                         source_path: str | None = None,
-                        source_cell_index: int | None = None) -> None:
-    """Append the completed cell and atomically rewrite the .ipynb.
+                        target_cell_index: int | None = None,
+                        append: bool = True,
+                        rich_outputs: list | None = None) -> None:
+    """Record the completed cell and atomically rewrite the .ipynb.
 
+    Appends a new cell, or replaces the one at ``target_cell_index`` (0-based)
+    for run_cell/sourcing. ``append=False`` (scratch runs) records nothing.
     Best-effort host artifact plumbing: a write failure never fails the cell.
     Each cell is serialized to a JSON fragment exactly once; the document is
     reassembled from fragments and only rewritten when its bytes change.
+
+    The file is re-read first when it changed underneath us, so cells edited in
+    Jupyter while the session runs are preserved rather than clobbered.
     """
-    global _ptc_notebook_last_document
-    if not _ptc_notebook_path:
+    if not _ptc_notebook_path or not append:
         return
     try:
         import json as _nb_json
-        import os as _nb_os
         import uuid as _nb_uuid
 
+        _ptc_notebook_reload()
         outputs = []
         if stdout_text:
             outputs.append({"output_type": "stream", "name": "stdout", "text": stdout_text.splitlines(True)})
+        # Rich display(...) outputs (IPython mime bundles), in capture order.
+        for rich in (rich_outputs or []):
+            data = getattr(rich, "data", None) or {}
+            if not data:
+                continue
+            outputs.append({
+                "output_type": "display_data",
+                "data": data,
+                "metadata": getattr(rich, "metadata", None) or {},
+            })
         if echo_text is not None:
             outputs.append({
                 "output_type": "execute_result",
@@ -548,22 +714,186 @@ def _ptc_notebook_write(exec_count: int, code: str, *, stdout_text: str, echo_te
             "source": code.splitlines(True),
         }
         fragment = _nb_json.dumps(cell_record, ensure_ascii=False, indent=1)
-        if source_cell_index is not None and 0 <= source_cell_index < len(_ptc_notebook_cell_fragments):
-            _ptc_notebook_cell_fragments[source_cell_index] = fragment
-        else:
-            _ptc_notebook_cell_fragments.append(fragment)
-        document = _ptc_render_notebook_document()
-        if document == _ptc_notebook_last_document:
-            return  # nothing changed on disk-worthy content; skip the rewrite
-        _ptc_notebook_last_document = document
-        directory = _nb_os.path.dirname(_ptc_notebook_path) or "."
-        _nb_os.makedirs(directory, exist_ok=True)
-        tmp_path = _ptc_notebook_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as handle:
-            handle.write(document)
-        _nb_os.replace(tmp_path, _ptc_notebook_path)
+        _ptc_notebook_store_fragment(fragment, target_cell_index)
+        _ptc_notebook_write_document()
     except Exception:
         pass  # artifact plumbing must never break the kernel
+
+
+def _ptc_join_text(value) -> str:
+    """NBFormat text fields are either a string or a list of string chunks."""
+    if isinstance(value, list):
+        return "".join(str(part) for part in value)
+    return value if isinstance(value, str) else ""
+
+
+def _ptc_output_text(outputs, execution_count) -> str:
+    """Human-readable preview of a cell's outputs for read_cells (not the
+    durable record; metadata.ptc_full_output remains canonical)."""
+    parts: list[str] = []
+    for output in outputs or []:
+        if not isinstance(output, dict):
+            continue
+        kind = output.get("output_type")
+        if kind == "stream":
+            parts.append(_ptc_join_text(output.get("text")))
+        elif kind == "execute_result":
+            text = _ptc_join_text((output.get("data") or {}).get("text/plain"))
+            if text:
+                count = output.get("execution_count", execution_count)
+                parts.append(f"Out[{count}]: {text}")
+        elif kind == "display_data":
+            text = _ptc_join_text((output.get("data") or {}).get("text/plain"))
+            if text:
+                parts.append(text)
+        elif kind == "error":
+            traceback_text = _ptc_join_text(output.get("traceback"))
+            parts.append(traceback_text or f"{output.get('ename', 'Error')}: {output.get('evalue', '')}")
+    return "\n".join(part for part in parts if part).rstrip()
+
+
+def _ptc_cell_summary(cell: dict, index: int) -> dict:
+    """One read_cells entry: position, type, source, and an output preview."""
+    source = _ptc_join_text(cell.get("source"))
+    outputs = cell.get("outputs") if isinstance(cell.get("outputs"), list) else []
+    execution_count = cell.get("execution_count")
+    return {
+        "index": index,
+        "cell_type": cell.get("cell_type") or "code",
+        "execution_count": execution_count if isinstance(execution_count, int) else None,
+        "source": source,
+        "output_count": len(outputs),
+        "output_text": _ptc_output_text(outputs, execution_count),
+    }
+
+
+def _ptc_doc_write(frame: dict) -> None:
+    """write_cell: upsert a code/markdown cell at a 1-based position (no execution)."""
+    import uuid as _nb_uuid
+
+    at = frame.get("at")
+    if not isinstance(at, int) or at < 1:
+        raise RuntimeError("write_cell needs a 1-based position (at >= 1)")
+    source = frame.get("source")
+    if not isinstance(source, str):
+        source = "" if source is None else str(source)
+    cell_type = frame.get("cell_type") or "code"
+    if cell_type not in ("code", "markdown"):
+        raise RuntimeError("cell type must be 'code' or 'markdown'")
+
+    index = at - 1
+    existing_id = None
+    if 0 <= index < len(_ptc_notebook_cell_fragments):
+        try:
+            import json as _nb_json
+            existing = _nb_json.loads(_ptc_notebook_cell_fragments[index])
+            if isinstance(existing, dict):
+                existing_id = existing.get("id")
+        except Exception:
+            existing_id = None
+    cell_id = existing_id or _nb_uuid.uuid4().hex[:8]
+    source_lines = source.splitlines(True)
+    if cell_type == "markdown":
+        cell = {"cell_type": "markdown", "id": cell_id, "metadata": {}, "source": source_lines}
+    else:
+        cell = {
+            "cell_type": "code",
+            "execution_count": None,
+            "id": cell_id,
+            "metadata": {},
+            "outputs": [],
+            "source": source_lines,
+        }
+    _ptc_notebook_store_fragment(_ptc_notebook_fragment(cell), index)
+    _ptc_notebook_write_document()
+
+
+def _ptc_doc_delete(frame: dict) -> None:
+    """delete_cell: remove a 1-based position from the notebook."""
+    n = frame.get("n")
+    total = len(_ptc_notebook_cell_fragments)
+    if not isinstance(n, int) or n < 1:
+        raise RuntimeError("delete_cell needs a 1-based position (n >= 1)")
+    if n > total:
+        raise RuntimeError(f"cell {n} does not exist (the notebook has {total} cell{'s' if total != 1 else ''})")
+    del _ptc_notebook_cell_fragments[n - 1]
+    _ptc_notebook_write_document()
+
+
+def _ptc_doc_read(frame: dict) -> list:
+    """read_cells/read_cell: return cell sources and current output previews."""
+    import json as _nb_json
+
+    total = len(_ptc_notebook_cell_fragments)
+    if frame.get("op") == "read_cell":
+        n = frame.get("n")
+        if not isinstance(n, int) or n < 1 or n > total:
+            raise RuntimeError(f"cell {n} does not exist (the notebook has {total} cell{'s' if total != 1 else ''})")
+        indices = [n]
+    else:
+        offset = frame.get("offset")
+        limit = frame.get("limit")
+        if not isinstance(offset, int) or offset < 1:
+            offset = 1
+        if not isinstance(limit, int) or limit < 1:
+            limit = max(total, 1)
+        indices = list(range(offset, min(total, offset + limit - 1) + 1))
+    cells = []
+    for n in indices:
+        try:
+            cell = _nb_json.loads(_ptc_notebook_cell_fragments[n - 1])
+        except Exception:
+            continue
+        if isinstance(cell, dict):
+            cells.append(_ptc_cell_summary(cell, n))
+    return cells
+
+
+def _ptc_doc_op(frame: dict) -> None:
+    """Handle a document frame (write_cell/delete_cell/read_cells/read_cell).
+
+    Document ops never execute code and never touch the kernel namespace; they
+    mutate the notebook model and persist it immediately.
+    """
+    exec_id = frame.get("id") or "unknown"
+    op = frame.get("op")
+    try:
+        notebook_path = frame.get("notebook")
+        if notebook_path:
+            _ptc_bind_notebook(notebook_path)
+        if not _ptc_notebook_path:
+            raise RuntimeError("this kernel has no bound notebook")
+        _ptc_notebook_reload()
+        if op == "write_cell":
+            _ptc_doc_write(frame)
+        elif op == "delete_cell":
+            _ptc_doc_delete(frame)
+        elif op in ("read_cells", "read_cell"):
+            cells = _ptc_doc_read(frame)
+            _emit_protocol({
+                "type": "doc_done",
+                "id": exec_id,
+                "op": op,
+                "total": len(_ptc_notebook_cell_fragments),
+                "cells": cells,
+            })
+            return
+        else:
+            raise RuntimeError(f"unknown document op: {op!r}")
+        _emit_protocol({
+            "type": "doc_done",
+            "id": exec_id,
+            "op": op,
+            "total": len(_ptc_notebook_cell_fragments),
+            "cells": [],
+        })
+    except Exception as error:
+        _emit_protocol({
+            "type": "doc_error",
+            "id": exec_id,
+            "op": op,
+            "message": str(error) or type(error).__name__,
+        })
 
 
 def _ptc_emit_kernel_inspect(frame: dict) -> None:
@@ -576,14 +906,85 @@ def _ptc_emit_kernel_inspect(frame: dict) -> None:
     })
 
 
+def _ptc_error_location(error, cell_name: str, code: str, fallback_line: int = 0):
+    """Best-effort (1-based line, source text) for where a cell failed.
+
+    SyntaxErrors carry a lineno directly; runtime errors are located by walking
+    the traceback for the frame compiled under the cell's filename.
+    """
+    line = 0
+    if isinstance(error, SyntaxError) and getattr(error, "lineno", None):
+        line = int(error.lineno)
+    if not line:
+        tb = getattr(error, "__traceback__", None)
+        if tb is not None:
+            for frame in reversed(_ptc_traceback.extract_tb(tb)):
+                if frame.filename == cell_name:
+                    line = frame.lineno or 0
+                    break
+    if not line:
+        line = fallback_line or 0
+    source_lines = code.split("\n")
+    source = source_lines[line - 1].strip() if 0 < line <= len(source_lines) else ""
+    return line, source
+
+
+def _ptc_cell_error_record(error):
+    """(ename, evalue, model_message) for a cell-raising exception."""
+    if isinstance(error, SystemExit):
+        message = str(error) or "SystemExit"
+        return "SystemExit", message, (f"SystemExit: {message}" if message else "SystemExit")
+    message = str(error) or type(error).__name__
+    return type(error).__name__, message, message
+
+
+def _ptc_report_cell_error(exec_id: str, exec_count: int, code: str, cell_name: str,
+                           source_path, target_cell_index, error, append: bool = True) -> None:
+    """Persist an errored/interrupted cell and emit the terminal exec_error frame.
+
+    Errored cells executed, so they are recorded (Jupyter-faithful) before the
+    terminal frame lets the host/model continue; the kernel stays alive. A
+    scratch run (``append=False``) records nothing.
+    """
+    interrupted = isinstance(error, (_ptc_asyncio.CancelledError, KeyboardInterrupt))
+    ename, evalue, message = _ptc_cell_error_record(error)
+    if interrupted:
+        ename = "CancelledError" if isinstance(error, _ptc_asyncio.CancelledError) else "KeyboardInterrupt"
+        evalue = "chunk execution was interrupted"
+        message = f"{ename}: chunk execution was interrupted"
+    traceback_text = _format_exception_with_help(error)
+    stdout_text = _stdout_proxy.cell_text
+    full_output = (stdout_text + traceback_text).strip() if stdout_text else traceback_text
+    _ptc_notebook_write(
+        exec_count,
+        code,
+        stdout_text=stdout_text,
+        echo_text=None,
+        full_output=full_output,
+        images=None,
+        error={"ename": ename, "evalue": evalue, "traceback": traceback_text},
+        source_path=source_path,
+        target_cell_index=target_cell_index,
+        append=append,
+    )
+    _stdout_proxy.cell_text = ""
+    frame = {"type": "exec_error", "id": exec_id, "message": message, "traceback": traceback_text}
+    if interrupted:
+        line, source = _ptc_error_location(error, cell_name, code, _current_line)
+        frame["interrupted"] = True
+        frame["line"] = line
+        frame["source"] = source
+    _emit_protocol(frame)
+
+
 async def _ptc_exec_chunk(frame: dict) -> None:
     """Execute one "exec" frame end to end and emit the terminal frame.
 
-    Handles file mode (source_path), the parse-failed magic guard, notebook
-    recording (errored and interrupted cells included), the local-namespace
-    merge, auto-echo of the trailing expression, and figure capture. On success
-    emits exec_done whose `output`/`echo` are spool-capped cell text; the
-    kernel/subagent/tool sections travel as separate fields (`kernel_text`,
+    Handles file mode (source_path), runs the cell on the embedded IPython shell
+    (single shared namespace; magics allowed; native top-level await), and
+    records the cell — errored and interrupted included — in the notebook. On
+    success emits exec_done whose `output`/`echo` are spool-capped cell text;
+    the kernel/subagent/tool sections travel as separate fields (`kernel_text`,
     `subagents_text`, `tools_text`) that the host composes into the model text.
     Cell errors emit exec_error and keep the kernel alive; only host teardown
     re-raises."""
@@ -596,8 +997,17 @@ async def _ptc_exec_chunk(frame: dict) -> None:
     globals().get("cell_tool_calls", []).clear()
     source_path = frame.get("source_path") or None
     notebook_path = frame.get("notebook") or None
+    # Sourcing uses source_cell_index (position-based execution counts);
+    # run_cell uses target_cell_index (position) with execution-order counts.
     source_cell_index = frame.get("source_cell_index")
-    source_exec_count = source_cell_index + 1 if isinstance(source_cell_index, int) and source_cell_index >= 0 else None
+    target_cell_index = frame.get("target_cell_index")
+    append = frame.get("append") is not False
+    if isinstance(source_cell_index, int) and source_cell_index >= 0:
+        if target_cell_index is None:
+            target_cell_index = source_cell_index
+        source_exec_count = source_cell_index + 1
+    else:
+        source_exec_count = None
     initial_cell_count = frame.get("initial_cell_count")
     if notebook_path:
         _ptc_bind_notebook(notebook_path)
@@ -620,46 +1030,13 @@ async def _ptc_exec_chunk(frame: dict) -> None:
                     images=None,
                     error={"ename": type(error).__name__, "evalue": str(error), "traceback": message},
                     source_path=source_path,
-                    source_cell_index=source_cell_index,
+                    target_cell_index=target_cell_index,
+                    append=append,
                 )
             _emit_protocol({
                 "type": "exec_error",
                 "id": exec_id,
                 "message": message,
-            })
-            return
-
-    # L8: only consult the magic guard when the code does not parse. A leading
-    # %/! is always a SyntaxError, so this still rejects IPython magics with the
-    # friendly error (before execution: the counter does not advance and nothing
-    # is written to the notebook), while % or ! inside triple-quoted strings or
-    # after backslash joins parses fine and runs untouched. A genuine syntax
-    # error with no magic involvement falls through and is reported as such.
-    if not _ptc_code_parses(code):
-        offending = _ptc_find_magics(code)
-        if offending:
-            message = _ptc_magic_error(offending)
-            if source_exec_count is not None:
-                message = message.replace(
-                    "This cell was not executed and was not written to the notebook.",
-                    "This sourced cell was not executed and was recorded as failed in the notebook.",
-                )
-                _ptc_notebook_write(
-                    source_exec_count,
-                    code,
-                    stdout_text="",
-                    echo_text=None,
-                    full_output=message,
-                    images=None,
-                    error={"ename": "MagicError", "evalue": message, "traceback": message},
-                    source_path=source_path,
-                    source_cell_index=source_cell_index,
-                )
-            _emit_protocol({
-                "type": "exec_error",
-                "id": exec_id,
-                "message": message,
-                "magic": True,
             })
             return
 
@@ -679,233 +1056,108 @@ async def _ptc_exec_chunk(frame: dict) -> None:
     _PTC_USER_CODE_LINE_COUNT = len(code.splitlines())
 
     _setup_matplotlib()
-    try:
-        _ptc_sys.settrace(_trace_lines)
-        _ptc_sys.stdout = _stdout_proxy
-        try:
-            cell_code, is_async = _ptc_build_cell(code, cell_name)
-            before_fingerprint = _ptc_namespace_fingerprint()
-            if _ptc_baseline is None:
-                _ptc_baseline = dict(before_fingerprint)
-            scope: dict = {}
-            exec(cell_code, globals(), scope)
-            cell = scope.get("_ptc_cell")
-            result = await cell() if is_async else cell()
-        except BaseException as error:
-            _ptc_merge_cell_locals(globals().pop("ptc_cell_storage", None))
-            _stdout_proxy.flush()
-            _ptc_sys.stdout = _ORIGINAL_STDOUT
-            _ptc_sys.settrace(None)
-            if isinstance(error, (_ptc_asyncio.CancelledError, KeyboardInterrupt)):
-                # Ctrl-C semantics: report where the chunk stopped and stay
-                # interactive, so the caller can inspect state and retry.
-                kind = "CancelledError" if isinstance(error, _ptc_asyncio.CancelledError) else "KeyboardInterrupt"
-                # The traceback is authoritative: the tracer's last line can be the
-                # wrapper's own bookkeeping statement rather than the user's line.
-                line = 0
-                for frame in reversed(_ptc_traceback.extract_tb(error.__traceback__)):
-                    if frame.filename == cell_name:
-                        line = frame.lineno or 0
-                        break
-                if not line:
-                    line = _current_line or 0
-                source_lines = code.split("\n")
-                source = source_lines[line - 1].strip() if 0 < line <= len(source_lines) else ""
-                _stdout_proxy.flush()
-                traceback_text = _traceback_with_help(error)
-                full_output = (
-                    (_stdout_proxy.cell_text + traceback_text).strip()
-                    if _stdout_proxy.cell_text else traceback_text
-                )
-                _ptc_notebook_write(
-                    exec_count,
-                    code,
-                    stdout_text=_stdout_proxy.cell_text,
-                    echo_text=None,
-                    full_output=full_output,
-                    images=None,
-                    error={"ename": kind, "evalue": "chunk execution was interrupted", "traceback": traceback_text},
-                    source_path=source_path,
-                    source_cell_index=source_cell_index,
-                )
-                _stdout_proxy.cell_text = ""
-                _emit_protocol({
-                    "type": "exec_error",
-                    "id": exec_id,
-                    "message": f"{kind}: chunk execution was interrupted",
-                    "traceback": traceback_text,
-                    "interrupted": True,
-                    "line": line,
-                    "source": source,
-                })
-                return
-            if isinstance(error, GeneratorExit):
-                raise
-            if isinstance(error, SystemExit):
-                # sys.exit() (or a raised SystemExit) is a cell error, not a
-                # kernel fatal: report it like any other exception so the
-                # persistent kernel stays alive for the next cell.
-                message = str(error) or "SystemExit"
-                traceback_text = _traceback_with_help(error)
-                _stdout_proxy.flush()
-                full_output = (
-                    (_stdout_proxy.cell_text + traceback_text).strip()
-                    if _stdout_proxy.cell_text else traceback_text
-                )
-                _ptc_notebook_write(
-                    exec_count,
-                    code,
-                    stdout_text=_stdout_proxy.cell_text,
-                    echo_text=None,
-                    full_output=full_output,
-                    images=None,
-                    error={
-                        "ename": "SystemExit",
-                        "evalue": message,
-                        "traceback": traceback_text,
-                    },
-                    source_path=source_path,
-                    source_cell_index=source_cell_index,
-                )
-                _stdout_proxy.cell_text = ""
-                _emit_protocol({
-                    "type": "exec_error",
-                    "id": exec_id,
-                    "message": f"SystemExit: {message}" if message else "SystemExit",
-                    "traceback": traceback_text,
-                })
-                return
-            message = str(error)
-            traceback_text = _traceback_with_help(error)
-            # Errored cells executed, so they are recorded (Jupyter-faithful)
-            # before the terminal frame lets the host/model continue.
-            _stdout_proxy.flush()
-            full_output = (
-                (_stdout_proxy.cell_text + traceback_text).strip()
-                if _stdout_proxy.cell_text else traceback_text
-            )
-            _ptc_notebook_write(
-                exec_count,
-                code,
-                stdout_text=_stdout_proxy.cell_text,
-                echo_text=None,
-                full_output=full_output,
-                images=None,
-                error={
-                    "ename": type(error).__name__,
-                    "evalue": message,
-                    "traceback": traceback_text,
-                },
-                source_path=source_path,
-                source_cell_index=source_cell_index,
-            )
-            _stdout_proxy.cell_text = ""
-            _emit_protocol({
-                "type": "exec_error",
-                "id": exec_id,
-                "message": message,
-                "traceback": traceback_text,
-            })
-            return
+    shell = _ptc_setup_ipython()
+    before_fingerprint = _ptc_namespace_fingerprint()
+    if _ptc_baseline is None:
+        _ptc_baseline = dict(before_fingerprint)
 
-        storage = globals().pop("ptc_cell_storage", None)
-        _ptc_merge_cell_locals(storage)
-        echo_value = (storage or {}).get("_ptc_last_value")
+    _ptc_sys.stdout = _stdout_proxy
+    _ptc_sys.settrace(_trace_lines)
+    try:
+        result, rich_outputs, echo_text = await _ptc_run_shell_cell(shell, code, cell_name, exec_count)
+    except BaseException as error:
+        if isinstance(error, GeneratorExit):
+            raise
+        # A signal landing outside the user code (teardown, transform, capture)
+        # reaches us directly rather than through IPython's ExecutionResult.
+        _ptc_report_cell_error(exec_id, exec_count, code, cell_name, source_path, target_cell_index, error, append)
+        return
+    finally:
+        _ptc_sys.settrace(None)
         _stdout_proxy.flush()
         _ptc_sys.stdout = _ORIGINAL_STDOUT
-        _ptc_sys.settrace(None)
-        try:
-            if _current_line:
-                _report_execution_progress(_current_line, force=True)
-            _cancel_progress_flush()
-            images = _capture_figures()
-            stdout_text = _stdout_proxy.cell_text
-            result_text = _stringify_output(result)
 
-            # Auto-echo (Out[n] semantics): the trailing bare expression's value,
-            # str()-first so libraries opt into readable display via __str__.
-            echo_text = None
-            if echo_value is not None:
-                try:
-                    echo_text = echo_value if isinstance(echo_value, str) else str(echo_value)
-                except Exception:
-                    try:
-                        echo_text = repr(echo_value)
-                    except Exception:
-                        echo_text = "<unrepresentable value>"
+    error = result.error_before_exec or result.error_in_exec
+    return_value = None
+    if isinstance(result.error_in_exec, _PtcReturn):
+        # Compatibility shim: a top-level `return` surfaced as our private
+        # BaseException; it is a successful cell whose `output` is the value.
+        return_value = result.error_in_exec.value
+        error = None
+    if error is not None:
+        _ptc_report_cell_error(exec_id, exec_count, code, cell_name, source_path, target_cell_index, error, append)
+        return
 
-            # Segments travel as separate frame fields; the HOST composes the
-            # sectioned model text (column-0 markers, cell content indented),
-            # so provenance is structural. `output` carries only the cell's
-            # own produced result text.
-            digest = _ptc_kernel_digest(before_fingerprint)
-            kernel_text = _ptc_format_digest(digest)
-            subagents_text = _ptc_subagents_summary()
-            tools_text = _ptc_tools_summary()
-            record_parts = []
-            if result_text:
-                record_parts.append(result_text)
-            if echo_text is not None:
-                record_parts.append(f"Out[{exec_count}]: {echo_text}")
-            record_tail = "\n\n".join(part for part in record_parts if part)
-            total_output_chars = _stdout_proxy.total_chars + len(record_tail)
-            remaining = max(0, _PTC_MAX_SPOOL_CHARS - _stdout_proxy.accepted_chars)
-            response_output = result_text[:remaining] if result_text else ""
-            echo_remaining = max(0, remaining - len(response_output))
-            response_echo = echo_text[:echo_remaining] if echo_text is not None else None
-            full_output = (
-                (stdout_text + record_tail).strip()
-                if stdout_text else record_tail
-            )
+    try:
+        if _current_line:
+            _report_execution_progress(_current_line, force=True)
+        _cancel_progress_flush()
+        images = _capture_figures()
+        stdout_text = _stdout_proxy.cell_text
+        result_text = _stringify_output(return_value)
 
-            # Persist the canonical full capture before notifying the host. The
-            # model may call read_cell_output immediately after exec_done.
-            _ptc_notebook_write(
-                exec_count,
-                code,
-                stdout_text=stdout_text,
-                echo_text=echo_text[:_PTC_MAX_SPOOL_CHARS] if echo_text is not None else None,
-                full_output=full_output,
-                images=images,
-                source_path=source_path,
-                source_cell_index=source_cell_index,
-            )
-            _stdout_proxy.cell_text = ""
-            _emit_protocol({
-                "type": "exec_done",
-                "id": exec_id,
-                "output": response_output,
-                "echo": response_echo,
-                "kernel_text": kernel_text,
-                "subagents_text": subagents_text,
-                "tools_text": tools_text,
-                "images": images,
-                "total_output_chars": total_output_chars,
-                "cell": exec_count,
-                "digest": digest,
-            })
-        except Exception as report_error:
-            # Formatting the result is host plumbing: a failure here must not take
-            # the whole session down (an unserializable return value used to).
-            _emit_protocol({
-                "type": "exec_error",
-                "id": exec_id,
-                "message": f"failed to report the chunk result: {report_error}",
-                "traceback": _ptc_traceback.format_exc(),
-            })
-            return
-    except BaseException as fatal:
-        # Only host-initiated teardown (abort/disconnect) lands here; report and
-        # let the interpreter die — the host is already tearing the session down.
-        _ptc_sys.stdout = _ORIGINAL_STDOUT
-        _ptc_sys.settrace(None)
+        # Segments travel as separate frame fields; the HOST composes the
+        # sectioned model text (column-0 markers, cell content indented), so
+        # provenance is structural. `output` carries only the cell's own produced
+        # result text (the top-level return value).
+        digest = _ptc_kernel_digest(before_fingerprint)
+        kernel_text = _ptc_format_digest(digest)
+        subagents_text = _ptc_subagents_summary()
+        tools_text = _ptc_tools_summary()
+        record_parts = []
+        if result_text:
+            record_parts.append(result_text)
+        if echo_text is not None:
+            record_parts.append(f"Out[{exec_count}]: {echo_text}")
+        record_tail = "\n\n".join(part for part in record_parts if part)
+        total_output_chars = _stdout_proxy.total_chars + len(record_tail)
+        remaining = max(0, _PTC_MAX_SPOOL_CHARS - _stdout_proxy.accepted_chars)
+        response_output = result_text[:remaining] if result_text else ""
+        echo_remaining = max(0, remaining - len(response_output))
+        response_echo = echo_text[:echo_remaining] if echo_text is not None else None
+        full_output = (
+            (stdout_text + record_tail).strip()
+            if stdout_text else record_tail
+        )
+
+        # Persist the canonical full capture before notifying the host. The
+        # model may call read_cell_output immediately after exec_done.
+        _ptc_notebook_write(
+            exec_count,
+            code,
+            stdout_text=stdout_text,
+            echo_text=echo_text[:_PTC_MAX_SPOOL_CHARS] if echo_text is not None else None,
+            full_output=full_output,
+            images=images,
+            rich_outputs=rich_outputs,
+            source_path=source_path,
+            target_cell_index=target_cell_index,
+            append=append,
+        )
+        _stdout_proxy.cell_text = ""
+        _emit_protocol({
+            "type": "exec_done",
+            "id": exec_id,
+            "output": response_output,
+            "echo": response_echo,
+            "kernel_text": kernel_text,
+            "subagents_text": subagents_text,
+            "tools_text": tools_text,
+            "images": images,
+            "total_output_chars": total_output_chars,
+            "cell": exec_count,
+            "digest": digest,
+        })
+    except Exception as report_error:
+        # Formatting the result is host plumbing: a failure here must not take
+        # the whole session down (an unserializable return value used to).
         _emit_protocol({
             "type": "exec_error",
             "id": exec_id,
-            "message": f"session terminated during execution: {fatal}",
+            "message": f"failed to report the chunk result: {report_error}",
             "traceback": _ptc_traceback.format_exc(),
         })
-        raise
+        return
 
 
 def _ptc_export_script(frame: dict) -> None:
@@ -1032,6 +1284,18 @@ async def _ptc_session_entry() -> None:
 
     await _rpc.start_reader()
     _setup_matplotlib()
+    # Fail loudly and early if the core dependency is missing: cells cannot run
+    # without it, and a clear stderr beats an opaque failure on the first cell.
+    try:
+        _ptc_setup_ipython()
+    except Exception as error:
+        print(
+            f"PTC: could not start the embedded IPython shell ({error}). Install it "
+            f"into the kernel environment, e.g. `uv pip install ipython --python "
+            f"{_ptc_sys.executable}` or provision_dependency('ipython').",
+            file=_ptc_sys.stderr,
+        )
+        raise
 
     frame_queue: "_ptc_asyncio.Queue[dict]" = _ptc_asyncio.Queue()
     _rpc.set_exec_handler(lambda frame: frame_queue.put_nowait(frame))
@@ -1058,6 +1322,12 @@ async def _ptc_session_entry() -> None:
             continue
         if frame.get("type") == "inspect":
             _ptc_emit_kernel_inspect(frame)
+            continue
+        if frame.get("type") == "doc":
+            # Document ops never run code; the loop is otherwise parked awaiting
+            # the (single) in-flight exec, so they serialize naturally.
+            _ptc_doc_op(frame)
+            _stdout_proxy.flush()
             continue
         task = _ptc_asyncio.ensure_future(_ptc_exec_chunk(frame))
         _ptc_current_chunk_task = task
