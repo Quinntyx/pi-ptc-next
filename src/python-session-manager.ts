@@ -19,8 +19,12 @@ import { buildSessionPrelude } from "./execution/session-prelude";
 import { loadPythonRuntimeSources } from "./execution/runtime-assets";
 import type {
   CodeExecutionResult,
+  DocumentOpResult,
   KernelDigest,
   ExecutionDetails,
+  NotebookCellSummary,
+  NotebookRunResult,
+  NotebookRunStep,
   PythonSessionManagerHooks,
   SandboxManager,
   ScriptExportResult,
@@ -119,6 +123,8 @@ class PersistentSessionProtocol {
   private notebookPath: string | undefined = undefined;
   private cellFile: string | undefined = undefined;
   private sourceCellIndex: number | undefined = undefined;
+  /** run_cell/run_to: 0-based position whose cell is replaced in place. */
+  private targetCellIndex: number | undefined = undefined;
   private initialCellCount: number | undefined = undefined;
   // Final subagent snapshot of the running exec; stamped onto exec_done so the
   // completed tool render keeps the subagent panel (live updates carry it, the
@@ -146,6 +152,10 @@ class PersistentSessionProtocol {
   private inspectResolve?: (digest: KernelDigest) => void;
   private inspectReject?: (error: Error) => void;
   private scriptExportReject?: (error: Error) => void;
+  /** In-flight notebook document op (write_cell/delete_cell/read_cells/read_cell). */
+  private docId = "";
+  private docResolve?: (result: DocumentOpResult) => void;
+  private docReject?: (error: Error) => void;
   private pendingInterrupt?: { kind: InterruptKind; message: string };
   private interruptGraceTimer?: NodeJS.Timeout;
 
@@ -223,6 +233,7 @@ class PersistentSessionProtocol {
     const rejectReady = this.readyReject;
     const rejectExec = this.execReject;
     const rejectInspect = this.inspectReject;
+    const rejectDoc = this.docReject;
     const rejectExport = this.scriptExportReject;
 
     this.readyResolve = undefined;
@@ -232,6 +243,9 @@ class PersistentSessionProtocol {
     this.inspectId = "";
     this.inspectResolve = undefined;
     this.inspectReject = undefined;
+    this.docId = "";
+    this.docResolve = undefined;
+    this.docReject = undefined;
     this.scriptExportId = "";
     this.scriptExportResolve = undefined;
     this.scriptExportReject = undefined;
@@ -245,6 +259,7 @@ class PersistentSessionProtocol {
     rejectReady?.(error);
     rejectExec?.(error);
     rejectInspect?.(error);
+    rejectDoc?.(error);
     rejectExport?.(error);
   }
 
@@ -437,6 +452,34 @@ class PersistentSessionProtocol {
         this.inspectReject = undefined;
         this.inspectId = "";
         resolveInspect?.(msg.digest as KernelDigest);
+        return;
+      }
+
+      case "doc_done": {
+        if (msg.id !== this.docId) {
+          return; // stale frame
+        }
+        const resolveDoc = this.docResolve;
+        this.docResolve = undefined;
+        this.docReject = undefined;
+        this.docId = "";
+        resolveDoc?.({
+          op: String(msg.op ?? ""),
+          total: typeof msg.total === "number" ? msg.total : 0,
+          cells: Array.isArray(msg.cells) ? (msg.cells as DocumentOpResult["cells"]) : [],
+        });
+        return;
+      }
+
+      case "doc_error": {
+        if (msg.id !== this.docId) {
+          return; // stale frame
+        }
+        const rejectDoc = this.docReject;
+        this.docResolve = undefined;
+        this.docReject = undefined;
+        this.docId = "";
+        rejectDoc?.(new PythonSessionError(String(msg.message ?? "document op failed")));
         return;
       }
 
@@ -638,7 +681,11 @@ class PersistentSessionProtocol {
   }
 
   /** Run one chunk. The caller serializes (one exec at a time). */
-  async exec(code: string, timeoutMs: number | undefined): Promise<CodeExecutionResult> {
+  async exec(
+    code: string,
+    timeoutMs: number | undefined,
+    options: { append?: boolean; targetCellIndex?: number } = {}
+  ): Promise<CodeExecutionResult> {
     if (this.execResolve) {
       // Serialization is the manager's job; this is defense in depth so two
       // overlapping execs can never clobber each other's promise state.
@@ -658,9 +705,11 @@ class PersistentSessionProtocol {
 
     const sourcePath = this.cellFile;
     const sourceCellIndex = this.sourceCellIndex;
+    const targetCellIndex = this.targetCellIndex;
     const initialCellCount = this.initialCellCount;
     this.cellFile = undefined;
     this.sourceCellIndex = undefined;
+    this.targetCellIndex = undefined;
     this.initialCellCount = undefined;
     this.send({
       type: "exec",
@@ -671,6 +720,9 @@ class PersistentSessionProtocol {
       source_path: sourcePath,
       source_cell_index: sourceCellIndex,
       initial_cell_count: initialCellCount,
+      // Scratch runs execute without recording; run_cell replaces a position.
+      append: options.append !== false,
+      target_cell_index: options.targetCellIndex ?? targetCellIndex,
     });
 
     // Do not arm protocol state until send succeeds. A closed/broken stdin must
@@ -755,6 +807,45 @@ class PersistentSessionProtocol {
     return promise;
   }
 
+  /**
+   * Run one notebook document op (write_cell/delete_cell/read_cells/read_cell).
+   * Document ops never execute code and never touch the namespace; the caller
+   * serializes them against execs (see PythonSessionManager.enqueue).
+   */
+  async doc(
+    op: "write_cell" | "delete_cell" | "read_cells" | "read_cell",
+    params: Record<string, unknown>,
+    timeoutMs: number | undefined
+  ): Promise<DocumentOpResult> {
+    const docId = `doc_${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+    this.send({ type: "doc", id: docId, op, ...params });
+
+    this.docId = docId;
+    const promise = new Promise<DocumentOpResult>((resolve, reject) => {
+      this.docResolve = resolve;
+      this.docReject = reject;
+    });
+    let timeout: NodeJS.Timeout | undefined;
+    if (timeoutMs !== undefined) {
+      timeout = setTimeout(() => {
+        if (this.docId !== docId) {
+          return;
+        }
+        const reject = this.docReject;
+        this.docId = "";
+        this.docResolve = undefined;
+        this.docReject = undefined;
+        reject?.(new Error(`document op ${op} timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+      }, timeoutMs);
+      timeout.unref?.();
+    }
+    void promise.then(
+      () => timeout && clearTimeout(timeout),
+      () => timeout && clearTimeout(timeout)
+    );
+    return promise;
+  }
+
   setNotebookPath(notebookPath: string | undefined): void {
     this.notebookPath = notebookPath;
   }
@@ -765,6 +856,10 @@ class PersistentSessionProtocol {
 
   setSourceCellIndex(sourceCellIndex: number | undefined): void {
     this.sourceCellIndex = sourceCellIndex;
+  }
+
+  setTargetCellIndex(targetCellIndex: number | undefined): void {
+    this.targetCellIndex = targetCellIndex;
   }
 
   setInitialCellCount(initialCellCount: number | undefined): void {
@@ -953,6 +1048,80 @@ interface SessionRecord {
   sourcedFrom?: string;
 }
 
+/** Join a notebook cell's `source`/`text` field, which may be a string or array. */
+function joinNotebookText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((part) => (typeof part === "string" ? part : String(part ?? ""))).join("");
+  }
+  return "";
+}
+
+/** Flatten one cell's outputs into a plain-text preview (host-side, best effort). */
+function notebookOutputText(outputs: unknown): string {
+  if (!Array.isArray(outputs)) {
+    return "";
+  }
+  const parts: string[] = [];
+  for (const output of outputs) {
+    if (!output || typeof output !== "object") {
+      continue;
+    }
+    const record = output as Record<string, unknown>;
+    if (record.output_type === "stream") {
+      parts.push(joinNotebookText(record.text));
+    } else if (record.output_type === "error") {
+      parts.push(joinNotebookText(record.traceback));
+    } else {
+      const data = record.data as Record<string, unknown> | undefined;
+      const text = data?.["text/plain"];
+      if (text !== undefined) {
+        parts.push(joinNotebookText(text));
+      }
+    }
+  }
+  return parts.join("\n").trimEnd();
+}
+
+/**
+ * Read an .ipynb's cells straight from disk as position-based summaries. Used
+ * by run_cell/run_to/run_all to resolve sources and by the failing-cell output
+ * fallback; it never mutates the file, so an in-flight kernel never races it.
+ */
+function readNotebookCells(notebookPath: string): NotebookCellSummary[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(notebookPath, "utf8");
+  } catch (error) {
+    throw new PythonSessionError(
+      `cannot read notebook ${notebookPath}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  let document: Record<string, unknown>;
+  try {
+    document = JSON.parse(raw) as Record<string, unknown>;
+  } catch (error) {
+    throw new PythonSessionError(
+      `notebook ${notebookPath} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  const cells = Array.isArray(document.cells) ? document.cells : [];
+  return cells.map((cell, position) => {
+    const record = (cell ?? {}) as Record<string, unknown>;
+    const outputs = record.outputs;
+    return {
+      index: position + 1,
+      cellType: record.cell_type === "markdown" ? "markdown" : "code",
+      executionCount: typeof record.execution_count === "number" ? record.execution_count : undefined,
+      source: joinNotebookText(record.source),
+      outputCount: Array.isArray(outputs) ? outputs.length : 0,
+      outputText: notebookOutputText(outputs),
+    } satisfies NotebookCellSummary;
+  });
+}
+
 /**
  * Owns the set of live persistent Python kernels: provisioning (optionally
  * sourcing a notebook/script), serialized foreground exec, notebook-backed
@@ -981,14 +1150,18 @@ export class PythonSessionManager {
   list(): SessionSummary[] {
     return [...this.sessions.values()]
       .sort((a, b) => this.recencyIndex(b.id) - this.recencyIndex(a.id))
-      .map((session) => ({
-        id: session.id,
-        createdAt: session.createdAt,
-        lastUsedAt: session.lastUsedAt,
-        chunks: session.prefixCellCount + Math.max(0, session.chunks.length - session.prefixChunkCount),
-        running: Boolean(session.protocol.currentExecId()),
-        notebookPath: session.notebookPath,
-      }));
+      .map((session) => this.summarize(session));
+  }
+
+  private summarize(session: SessionRecord): SessionSummary {
+    return {
+      id: session.id,
+      createdAt: session.createdAt,
+      lastUsedAt: session.lastUsedAt,
+      chunks: session.prefixCellCount + Math.max(0, session.chunks.length - session.prefixChunkCount),
+      running: Boolean(session.protocol.currentExecId()),
+      notebookPath: session.notebookPath,
+    };
   }
 
   private recencyIndex(id: string): number {
@@ -1218,6 +1391,60 @@ export class PythonSessionManager {
   }
 
   /**
+   * Build and spawn one interpreter plus its protocol client (no readiness
+   * wait). Shared by provision and reset_kernel; the caller attaches exit
+   * handlers and waits for `session_ready` once the record exists.
+   */
+  private createInterpreter(params: {
+    sessionId: string;
+    cwd: string;
+    ctx: ExtensionToolContext;
+    signal?: AbortSignal;
+    parentToolCallId?: string;
+  }): { proc: ChildProcess; protocol: PersistentSessionProtocol } {
+    const { sessionId, cwd } = params;
+    const callableToolRuntime = this.toolRegistry.createCallableToolRuntime(cwd, this.settings, {
+      ctx: params.ctx,
+      signal: params.signal,
+      parentToolCallId: params.parentToolCallId,
+    });
+    const { rpcCode, runtimeCode, sessionCode } = loadPythonRuntimeSources(this.extensionRoot);
+    const prelude = buildSessionPrelude({
+      sessionId,
+      toolWrappers: generateToolWrappers(callableToolRuntime.tools),
+      runtime: { rpcCode, runtimeCode, sessionCode },
+      maxParallelToolCalls: this.settings.maxParallelToolCalls,
+      // session-prelude's legacy field name feeds the runtime's sole emergency
+      // capture valve; it is no longer a model-facing output limit.
+      maxOutputChars: this.settings.maxSpoolChars,
+      hostWorkspaceRoot: cwd,
+      runtimeWorkspaceRoot: this.sandboxManager.getRuntimeWorkspaceRoot(cwd),
+      autoimportSubagents: !process.env.PI_SUBAGENT_DEPTH,
+    });
+
+    const proc = this.spawnSession(prelude, cwd);
+    const protocol = new PersistentSessionProtocol(proc, callableToolRuntime.runTool, {
+      terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
+      sendSignal: (signal) => {
+        this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal);
+      },
+      onSubagentSnapshot: (execId, snapshot) => {
+        const record = this.sessions.get(sessionId);
+        if (record) {
+          record.latestSnapshot = snapshot;
+        }
+        this.hooks.onSubagentSnapshot?.(sessionId, execId, snapshot);
+      },
+      onInterruptedReport: (text) => {
+        // Kept for callers that cannot observe the tool result; pi records our
+        // interrupt error as the tool result, so nothing is queued by default.
+        this.hooks.onInterrupted?.(sessionId, text);
+      },
+    });
+    return { proc, protocol };
+  }
+
+  /**
    * Spawn and ready a persistent kernel. `notebookPath` (required for a
    * durable record) is bound to the kernel; `source` (.ipynb or .py) is copied
    * to the destination and its code cells executed as prefix cells before
@@ -1278,40 +1505,12 @@ export class PythonSessionManager {
         pythonExecutable = await ensurePythonForVersion(preparedSource.pythonVersion);
       }
     }
-    const callableToolRuntime = this.toolRegistry.createCallableToolRuntime(cwd, this.settings, {
+    const { proc, protocol } = this.createInterpreter({
+      sessionId,
+      cwd,
       ctx: options.ctx,
       signal: options.signal,
       parentToolCallId: options.parentToolCallId,
-    });
-    const { rpcCode, runtimeCode, sessionCode } = loadPythonRuntimeSources(this.extensionRoot);
-    const prelude = buildSessionPrelude({
-      sessionId,
-      toolWrappers: generateToolWrappers(callableToolRuntime.tools),
-      runtime: { rpcCode, runtimeCode, sessionCode },
-      maxParallelToolCalls: this.settings.maxParallelToolCalls,
-      // session-prelude's legacy field name feeds the runtime's sole emergency
-      // capture valve; it is no longer a model-facing output limit.
-      maxOutputChars: this.settings.maxSpoolChars,
-      hostWorkspaceRoot: cwd,
-      runtimeWorkspaceRoot: this.sandboxManager.getRuntimeWorkspaceRoot(cwd),
-      autoimportSubagents: !process.env.PI_SUBAGENT_DEPTH,
-    });
-
-    const proc = this.spawnSession(prelude, cwd);
-    const protocol = new PersistentSessionProtocol(proc, callableToolRuntime.runTool, {
-      terminateProcess: (signal) => this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal),
-      sendSignal: (signal) => {
-        this.sandboxManager.terminate?.(proc, signal) ?? proc.kill(signal);
-      },
-      onSubagentSnapshot: (execId, snapshot) => {
-        record.latestSnapshot = snapshot;
-        this.hooks.onSubagentSnapshot?.(sessionId, execId, snapshot);
-      },
-      onInterruptedReport: (text) => {
-        // Kept for callers that cannot observe the tool result; pi records our
-        // interrupt error as the tool result, so nothing is queued by default.
-        this.hooks.onInterrupted?.(sessionId, text);
-      },
     });
 
     const record: SessionRecord = {
@@ -1331,7 +1530,15 @@ export class PythonSessionManager {
       sourcedFrom: preparedSource?.path,
     };
 
-    const reap = () => this.reapSession(record);
+    // Reap the session only if the process being reaped is still the record's
+    // current one; reset_kernel swaps in a fresh interpreter without killing the
+    // session, and the old process's exit must not evict the live replacement.
+    const reap = () => {
+      if (record.proc !== proc) {
+        return;
+      }
+      this.reapSession(record);
+    };
     proc.once("exit", reap);
     proc.once("error", reap);
 
@@ -1433,9 +1640,34 @@ export class PythonSessionManager {
       });
     }
     record.pendingJobs += 1;
+    const execOptions = {
+      targetCellIndex: options.targetCellIndex,
+      append: options.append,
+      recordChunk: options.recordChunk,
+    };
     const job = record.queue.then(
-      () => this.execChunk(record, code, options.onUpdate, options.signal, options.file, options.notebookPath),
-      () => this.execChunk(record, code, options.onUpdate, options.signal, options.file, options.notebookPath)
+      () =>
+        this.execChunk(
+          record,
+          code,
+          options.onUpdate,
+          options.signal,
+          options.file,
+          options.notebookPath,
+          undefined,
+          execOptions
+        ),
+      () =>
+        this.execChunk(
+          record,
+          code,
+          options.onUpdate,
+          options.signal,
+          options.file,
+          options.notebookPath,
+          undefined,
+          execOptions
+        )
     );
     // Advance the queue regardless of this job's outcome so a failed exec cannot
     // wedge every later call on the session.
@@ -1452,6 +1684,280 @@ export class PythonSessionManager {
       }
     );
     return job;
+  }
+
+  /**
+   * Serialize a non-exec notebook op behind any in-flight exec on the session.
+   * Unlike execForeground this does not show a queued notice: document ops are
+   * instantaneous and the manager only reaches here between execs.
+   */
+  private enqueue<T>(record: SessionRecord, job: () => Promise<T>): Promise<T> {
+    const run = record.queue.then(job, job);
+    record.queue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  /** Execute code without recording it as a notebook cell (namespace mutates). */
+  async scratchRun(sessionId: string, code: string, options: SessionExecOptions): Promise<CodeExecutionResult> {
+    return this.execForeground(sessionId, code, { ...options, append: false, recordChunk: false });
+  }
+
+  /** Upsert a cell at 1-based `at`; replaced cells lose their outputs. */
+  async writeCell(
+    sessionId: string,
+    params: { at: number; source: string; cellType: "code" | "markdown" }
+  ): Promise<DocumentOpResult> {
+    const record = this.require(sessionId);
+    return this.enqueue(record, () =>
+      record.protocol.doc(
+        "write_cell",
+        { at: params.at, source: params.source, cell_type: params.cellType },
+        this.settings.executionTimeoutMs
+      )
+    );
+  }
+
+  /** Delete cell `n`; later positions shift down. */
+  async deleteCell(sessionId: string, n: number): Promise<DocumentOpResult> {
+    const record = this.require(sessionId);
+    return this.enqueue(record, () =>
+      record.protocol.doc("delete_cell", { n }, this.settings.executionTimeoutMs)
+    );
+  }
+
+  /** Read cells `offset..offset+limit-1` (1-based), with sources and outputs. */
+  async readCells(sessionId: string, options: { offset?: number; limit?: number } = {}): Promise<DocumentOpResult> {
+    const record = this.require(sessionId);
+    return this.enqueue(record, () =>
+      record.protocol.doc(
+        "read_cells",
+        { offset: options.offset ?? 1, limit: options.limit },
+        this.settings.executionTimeoutMs
+      )
+    );
+  }
+
+  /** Read cell `n` (source plus current outputs). */
+  async readCell(sessionId: string, n: number): Promise<DocumentOpResult> {
+    const record = this.require(sessionId);
+    return this.enqueue(record, () =>
+      record.protocol.doc("read_cell", { n }, this.settings.executionTimeoutMs)
+    );
+  }
+
+  /** Execute cell `n` in place, refreshing only its stored outputs. */
+  async runCell(sessionId: string, n: number, options: SessionExecOptions): Promise<CodeExecutionResult> {
+    const record = this.require(sessionId);
+    const cell = this.notebookCell(record, n);
+    if (cell.cellType !== "code") {
+      throw new PythonSessionError(`cell ${n} is markdown; only code cells can be executed`);
+    }
+    return this.enqueue(record, () =>
+      this.execChunk(
+        record,
+        cell.source,
+        options.onUpdate,
+        options.signal,
+        undefined,
+        options.notebookPath ?? record.notebookPath,
+        undefined,
+        { targetCellIndex: n - 1, append: true, recordChunk: false }
+      )
+    );
+  }
+
+  /** Execute cells 1..n in order, stopping at the first error. */
+  async runTo(sessionId: string, n: number, options: SessionExecOptions): Promise<NotebookRunResult> {
+    const record = this.require(sessionId);
+    const cells = this.notebookCells(record);
+    if (n < 1 || n > cells.length) {
+      throw new PythonSessionError(`run_to: cell ${n} does not exist (the notebook has ${cells.length} cells)`);
+    }
+    const targets = cells.filter((cell) => cell.index <= n && cell.cellType === "code");
+    return this.enqueue(record, () => this.runCells(record, targets, n, options));
+  }
+
+  /** Execute every code cell in order, stopping at the first error. */
+  async runAll(sessionId: string, options: SessionExecOptions): Promise<NotebookRunResult> {
+    const record = this.require(sessionId);
+    const targets = this.notebookCells(record).filter((cell) => cell.cellType === "code");
+    return this.enqueue(record, () => this.runCells(record, targets, undefined, options));
+  }
+
+  /** Restart the interpreter (fresh namespace); the notebook file is untouched. */
+  async resetKernel(
+    sessionId: string,
+    options: { cwd: string; ctx: ExtensionToolContext; signal?: AbortSignal; parentToolCallId?: string }
+  ): Promise<SessionSummary> {
+    const record = this.require(sessionId);
+    if (record.protocol.currentExecId()) {
+      throw new PythonSessionError("kernel is busy executing a cell; reset after it finishes");
+    }
+    if (record.pendingJobs > 0) {
+      throw new PythonSessionError("kernel has queued work; reset after it finishes");
+    }
+    return this.enqueue(record, async () => {
+      const previousProc = record.proc;
+      const previousProtocol = record.protocol;
+      const { proc, protocol } = this.createInterpreter({
+        sessionId,
+        cwd: options.cwd,
+        ctx: options.ctx,
+        signal: options.signal,
+        parentToolCallId: options.parentToolCallId,
+      });
+      record.proc = proc;
+      record.protocol = protocol;
+      const reap = () => {
+        if (record.proc !== proc) {
+          return;
+        }
+        this.reapSession(record);
+      };
+      proc.once("exit", reap);
+      proc.once("error", reap);
+      if (record.notebookPath) {
+        protocol.setNotebookPath(record.notebookPath);
+      }
+      // A reset restarts execution numbering from 1 even though the notebook on
+      // disk still holds its cells (which run_all/run_cell will replace in place).
+      protocol.setInitialCellCount(0);
+      try {
+        await protocol.waitReady(15_000);
+        if (proc.exitCode !== null || proc.signalCode !== null) {
+          throw new PythonSessionError("python session exited during reset");
+        }
+      } catch (error) {
+        // The replacement failed to start; keep the session record pointing at it
+        // so reapSession still evicts cleanly, and surface the failure.
+        record.killed = true;
+        await protocol.dispose().catch(() => undefined);
+        this.sessions.delete(record.id);
+        this.recency = this.recency.filter((id) => id !== record.id);
+        throw error instanceof Error ? error : new PythonSessionError(String(error));
+      }
+      await previousProtocol.dispose().catch(() => undefined);
+      this.terminateProc(previousProc);
+      record.lastUsedAt = Date.now();
+      return this.summarize(record);
+    });
+  }
+
+  /** Re-read the notebook and return cell `n` (1-based); throws when absent. */
+  private notebookCell(record: SessionRecord, n: number): NotebookCellSummary {
+    const cells = this.notebookCells(record);
+    if (!Number.isInteger(n) || n < 1 || n > cells.length) {
+      throw new PythonSessionError(`cell ${n} does not exist (the notebook has ${cells.length} cells)`);
+    }
+    return cells[n - 1]!;
+  }
+
+  private notebookCells(record: SessionRecord): NotebookCellSummary[] {
+    if (!record.notebookPath) {
+      throw new PythonSessionError(`kernel ${record.id} has no notebook; nothing to run`);
+    }
+    return readNotebookCells(record.notebookPath);
+  }
+
+  /** Best-effort read of a cell's recorded output after its exec rejected. */
+  private failingCellOutput(record: SessionRecord, index: number): string | undefined {
+    try {
+      const cell = this.notebookCell(record, index);
+      return cell.outputText.length > 0 ? cell.outputText : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Run a batch of code cells in order, collecting per-cell status. */
+  private async runCells(
+    record: SessionRecord,
+    targets: NotebookCellSummary[],
+    limitTo: number | undefined,
+    options: SessionExecOptions
+  ): Promise<NotebookRunResult> {
+    const steps: NotebookRunStep[] = [];
+    let lastOutput = "";
+    let failedIndex: number | undefined;
+    const total = targets.length;
+    for (let i = 0; i < targets.length; i += 1) {
+      const cell = targets[i]!;
+      const wrappedUpdate = this.wrapRunUpdate(options.onUpdate, cell.index, i + 1, total);
+      try {
+        const result = await this.execChunk(
+          record,
+          cell.source,
+          wrappedUpdate,
+          options.signal,
+          undefined,
+          options.notebookPath ?? record.notebookPath,
+          undefined,
+          { targetCellIndex: cell.index - 1, append: true, recordChunk: false }
+        );
+        lastOutput = result.output;
+        steps.push({ index: cell.index, execCount: result.details.cellIdx, ok: true });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        steps.push({ index: cell.index, ok: false, error: message });
+        failedIndex = cell.index;
+        // The runtime recorded the failing cell's own (sectioned) output into the
+        // notebook; surface it even though the exec rejected.
+        lastOutput = this.failingCellOutput(record, cell.index) ?? message;
+        break;
+      }
+    }
+    return {
+      sessionId: record.id,
+      steps,
+      failedIndex,
+      output: this.describeRun(record.id, steps, failedIndex, limitTo, lastOutput),
+      lastOutput,
+    };
+  }
+
+  /** Prefix per-cell progress updates with the cell position and batch size. */
+  private wrapRunUpdate(
+    onUpdate: ToolUpdateCallback | undefined,
+    index: number,
+    position: number,
+    total: number
+  ): ToolUpdateCallback | undefined {
+    if (!onUpdate) {
+      return undefined;
+    }
+    return (update) => {
+      const prefix = `Cell ${index} (${position}/${total}) · `;
+      const content = update.content.map((part) =>
+        part.type === "text" ? { type: "text" as const, text: prefix + part.text } : part
+      );
+      onUpdate({ content, details: update.details });
+    };
+  }
+
+  private describeRun(
+    sessionId: string,
+    steps: NotebookRunStep[],
+    failedIndex: number | undefined,
+    limitTo: number | undefined,
+    lastOutput: string
+  ): string {
+    const scope = limitTo === undefined ? "all cells" : `cells 1\u2013${limitTo}`;
+    const lines = steps.map((step) => {
+      if (step.ok) {
+        return `  \u2713 cell ${step.index}${step.execCount !== undefined ? ` (execution ${step.execCount})` : ""}`;
+      }
+      return `  \u2717 cell ${step.index}: ${step.error ?? "failed"}`;
+    });
+    const header =
+      steps.length === 0
+        ? `run_all: no runnable code cells in kernel ${sessionId}.`
+        : `Ran ${scope} in kernel ${sessionId}: ${steps.length} code cell${steps.length === 1 ? "" : "s"} ` +
+          `${failedIndex === undefined ? "executed" : `attempted, stopped at cell ${failedIndex}`}.`;
+    const body = lines.length > 0 ? `\n${lines.join("\n")}` : "";
+    return lastOutput.length > 0 ? `${header}${body}\n\n${lastOutput}` : `${header}${body}`;
   }
 
   /**
@@ -1480,7 +1986,8 @@ export class PythonSessionManager {
     signal?: AbortSignal,
     cellFile?: string,
     notebookPath?: string,
-    sourceCellIndex?: number
+    sourceCellIndex?: number,
+    execOptions: { targetCellIndex?: number; append?: boolean; recordChunk?: boolean } = {}
   ): Promise<CodeExecutionResult> {
     // Sourced library cells must be recorded even when they contain code that
     // ordinary model-authored cells reject before execution. Let the runtime
@@ -1497,7 +2004,11 @@ export class PythonSessionManager {
     record.lastUsedAt = Date.now();
     this.recency = this.recency.filter((id) => id !== record.id);
     this.recency.push(record.id);
-    record.chunks.push(code);
+    // Re-runs (run_cell/run_to/run_all) replace existing cells, so they must not
+    // extend the script-export chunk list with duplicate code.
+    if (execOptions.recordChunk !== false) {
+      record.chunks.push(code);
+    }
     record.protocol.setUpdateHandler(onUpdate);
     if (notebookPath) record.notebookPath = notebookPath;
     record.protocol.setNotebookPath(record.notebookPath);
@@ -1506,6 +2017,9 @@ export class PythonSessionManager {
     }
     if (sourceCellIndex !== undefined) {
       record.protocol.setSourceCellIndex(sourceCellIndex);
+    }
+    if (execOptions.targetCellIndex !== undefined) {
+      record.protocol.setTargetCellIndex(execOptions.targetCellIndex);
     }
 
     // An aborted tool call interrupts the running chunk (Ctrl-C semantics) and
@@ -1521,7 +2035,10 @@ export class PythonSessionManager {
     }
 
     try {
-      return await record.protocol.exec(code, this.settings.executionTimeoutMs);
+      return await record.protocol.exec(code, this.settings.executionTimeoutMs, {
+        append: execOptions.append,
+        targetCellIndex: execOptions.targetCellIndex,
+      });
     } finally {
       if (abortListener && signal) {
         signal.removeEventListener("abort", abortListener);
@@ -1676,11 +2193,16 @@ export class PythonSessionManager {
   }
 
   private terminateSession(record: SessionRecord): void {
+    this.terminateProc(record.proc);
+  }
+
+  /** SIGTERM a process, escalating to SIGKILL if it does not exit promptly. */
+  private terminateProc(proc: ChildProcess): void {
     const terminate = (signal: NodeJS.Signals) => {
       try {
-        const result = this.sandboxManager.terminate?.(record.proc, signal);
+        const result = this.sandboxManager.terminate?.(proc, signal);
         if (result === undefined || result === false) {
-          record.proc.kill(signal);
+          proc.kill(signal);
         }
       } catch {
         // best-effort teardown
@@ -1688,7 +2210,7 @@ export class PythonSessionManager {
     };
     terminate("SIGTERM");
     const forceKill = setTimeout(() => {
-      if (record.proc.exitCode === null && record.proc.signalCode === null) {
+      if (proc.exitCode === null && proc.signalCode === null) {
         terminate("SIGKILL");
       }
     }, 1_000);

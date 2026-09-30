@@ -143,6 +143,53 @@ export interface SessionExecOptions {
   notebookPath?: string;
   /** File mode: execute this file's contents inside the kernel (%run semantics). */
   file?: string;
+  /** 0-based notebook position whose cell is replaced (run_cell/run_to). */
+  targetCellIndex?: number;
+  /** false for scratch_run: execute without recording a notebook cell. */
+  append?: boolean;
+  /** false for re-runs: do not extend the session's script-export chunk list. */
+  recordChunk?: boolean;
+}
+
+/** One notebook cell as returned by read_cells / read_cell (position-based). */
+export interface NotebookCellSummary {
+  /** 1-based notebook position (not the execution number). */
+  index: number;
+  cellType: "code" | "markdown";
+  executionCount?: number;
+  source: string;
+  outputCount: number;
+  outputText: string;
+}
+
+/** Result of a document op (write_cell / delete_cell / read_cells / read_cell). */
+export interface DocumentOpResult {
+  op: string;
+  /** Total cell count in the notebook after the op. */
+  total: number;
+  /** Populated by read_cells / read_cell; empty for writes/deletes. */
+  cells: NotebookCellSummary[];
+}
+
+/** One cell's outcome in a run_to / run_all batch. */
+export interface NotebookRunStep {
+  index: number;
+  execCount?: number;
+  ok: boolean;
+  error?: string;
+}
+
+/** Result of a run_to / run_all batch. */
+export interface NotebookRunResult {
+  sessionId: string;
+  /** Cells attempted, in order. */
+  steps: NotebookRunStep[];
+  /** 1-based position of the first failing cell, when the run stopped early. */
+  failedIndex?: number;
+  /** Model-facing summary (per-cell status plus the last cell's output). */
+  output: string;
+  /** Sectioned output of the last executed (or failing) cell. */
+  lastOutput: string;
 }
 
 /** Public status row for one persistent kernel. */
