@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { homedir } from "os";
 import type { ChildProcess } from "child_process";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import {
   PtcAbortError,
   PtcProtocolError,
@@ -1227,7 +1227,7 @@ export class PythonSessionManager {
    */
   async provision(options: {
     cwd: string;
-    ctx: ExtensionContext;
+    ctx: ExtensionToolContext;
     signal?: AbortSignal;
     onUpdate?: ToolUpdateCallback;
     parentToolCallId?: string;
