@@ -253,6 +253,15 @@ export interface ExecutionDetails extends ExecutionMetrics {
   cellIdx?: number;
   /** Result text uses the sectioned (output/return/kernel/subagents) format. */
   sectioned?: boolean;
+  /**
+   * Live Out-box screen while the cell executes: raw stdout interpreted
+   * through the terminal emulator (\r overwrites, EL, cursor moves) into
+   * display lines, tail-capped to the newest lines. Present on partial frames
+   * only; absent once the cell settles.
+   */
+  liveOutput?: string[];
+  /** Head lines hidden from `liveOutput` by the tail cap. */
+  liveOutputHidden?: number;
   /** Bridged Pi tool calls made from inside this cell (tool subtree rendering). */
   nestedCallRecords?: NestedToolCallRecord[];
 }

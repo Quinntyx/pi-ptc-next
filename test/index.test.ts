@@ -963,6 +963,72 @@ test("completed exec_cell rendering omits missing durations instead of printing 
   }
 });
 
+test("exec_cell partial rendering streams the live Out box below the code view", async () => {
+  const sandbox = {
+    async cleanup() {},
+    spawn() { throw new Error("sandbox spawn should not be used"); },
+    getRuntimeWorkspaceRoot(cwd) { return cwd; },
+  };
+  const restore = restoreInjectedModules(sandbox, {
+    execForeground() {
+      return new Promise(() => {}); // never settles; we only render partials
+    },
+  });
+
+  try {
+    const ptcExtension = await loadExtension();
+    const eventHandlers = new Map();
+    const registered = [];
+    const { pi } = buildPi({ eventHandlers, registered, activeTools: [] });
+    await ptcExtension(pi);
+    await eventHandlers.get("session_start")({}, { cwd: process.cwd() });
+    const execCell = registered.find((tool) => tool.name === "exec_cell");
+    const theme = { fg(_color, text) { return text; } };
+
+    const partialDetails = {
+      userCode: ["import tqdm", "for _ in tqdm(range(3)):\n    pass"],
+      currentLine: 2,
+      totalLines: 2,
+      liveOutput: ["100%|##########| 3/3"],
+      liveOutputHidden: 0,
+    };
+    const rendered = execCell.renderResult(
+      { content: [{ type: "text", text: "Executing line 2/2" }], details: partialDetails },
+      { isPartial: true, expanded: false },
+      theme,
+      { state: {} }
+    ).render(80).join("\n");
+
+    // The live Out box renders BELOW the executing-code view, with the
+    // emulated screen content (not raw control sequences) inside the fence.
+    assert.match(rendered, /Out:/);
+    assert.match(rendered, /100\|?%/);
+    assert.match(rendered, /100%\|##########\| 3\/3/);
+    assert.doesNotMatch(rendered, /\x1b\[K/);
+
+    // Truncation marker when the tail cap hid earlier lines.
+    const truncated = execCell.renderResult(
+      { content: [{ type: "text", text: "Executing" }], details: { ...partialDetails, liveOutputHidden: 7 } },
+      { isPartial: true, expanded: false },
+      theme,
+      { state: {} }
+    ).render(80).join("\n");
+    assert.match(truncated, /\.\.\. 7 earlier output lines/);
+
+    // No live output yet: no Out box at all.
+    const quiet = execCell.renderResult(
+      { content: [{ type: "text", text: "Executing line 1/1" }], details: { userCode: ["pass"], currentLine: 1, totalLines: 1 } },
+      { isPartial: true, expanded: false },
+      theme,
+      { state: {} }
+    ).render(80).join("\n");
+    assert.doesNotMatch(quiet, /Out:/);
+  } finally {
+    restore();
+    delete require.cache[require.resolve("../dist/index.js")];
+  }
+});
+
 test("parallel exec_cell calls retain independent default command targets", async () => {
   const sandbox = {
     async cleanup() {},

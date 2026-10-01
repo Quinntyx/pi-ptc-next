@@ -10,7 +10,7 @@ import type {
   Theme,
   ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Editor, type EditorTheme, Key, matchesKey, Text, type Component, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PtcPythonError } from "./execution/execution-errors";
 import { CustomToolManager } from "./custom-tool-manager";
 import { buildCodeExecutionRecoveryPrompt, classifyCodeExecutionFailure } from "./recovery-classifier";
@@ -39,18 +39,15 @@ import {
   isMutationPrompt,
   loadSettingsFromEnv,
   logWarning,
-  parseSectionedOutput,
   shouldAutoRoutePromptToCodeExecution,
   withActivityLabel,
 } from "./utils";
+import { relevantAgents } from "./execution/subagent-panel";
 import {
-  CODE_VIEW_FULL_THRESHOLD,
-  CODE_VIEW_HEIGHT,
-  computeCodeViewStart,
-  type CodeViewState,
-} from "./execution/code-view";
-import { relevantAgents, renderSubagentNotification, renderSubagentPanel } from "./execution/subagent-panel";
-import { renderNestedToolTree } from "./execution/tool-subtree";
+	renderNotebookCall,
+	renderNotebookResult,
+	setNotebookTuiModeProvider,
+} from "./execution/notebook-render";
 import { PythonSessionManager } from "./python-session-manager";
 import type {
   CodeExecutionResult,
@@ -82,236 +79,22 @@ interface PartialRenderContext {
 }
 
 /**
- * Build the model-visible executing-code view: a header with progress and the
- * active nested tool, then a line-numbered viewport of the cell. For long
- * cells (> CODE_VIEW_FULL_THRESHOLD lines) the viewport follows currentLine
- * via the shared CodeViewState so scroll position persists across updates.
+ * Notebook cell rendering. All kernel tools dispatch their renderResult to
+ * src/execution/notebook-render.ts, which maps each op onto the pure
+ * cell-view renderer (`In[N]:`/`Out[N]:` boxes, line numbers, viewport rules).
+ * pi passes each tool row a shared `state` object on every renderResult call;
+ * the notebook renderer keeps its scroll position there (state.viewStartLine)
+ * across partial updates.
  */
-function buildExecutingCodeLines(
-  codeLines: string[],
-  currentLine: number,
-  totalLines: number,
-  activeTool: string | undefined,
-  theme: Theme,
-  state: CodeViewState
-): string[] {
-  const lines: string[] = [];
-  const toolBadge = activeTool ? theme.fg("success", ` • calling ${activeTool}()`) : "";
-  lines.push(theme.fg("muted", `Executing Python code (line ${currentLine}/${totalLines})`) + toolBadge);
-  lines.push("");
 
-  let startIdx = 0;
-  let endIdx = codeLines.length;
-
-  if (codeLines.length > CODE_VIEW_FULL_THRESHOLD) {
-    state.viewStartLine = computeCodeViewStart(currentLine, codeLines.length, state.viewStartLine);
-    startIdx = state.viewStartLine - 1;
-    endIdx = Math.min(codeLines.length, startIdx + CODE_VIEW_HEIGHT);
-  } else {
-    state.viewStartLine = 1;
-  }
-
-  if (startIdx > 0) {
-    lines.push(theme.fg("muted", "       │ ..."));
-  }
-
-  for (let index = startIdx; index < endIdx; index++) {
-    const lineNumber = index + 1;
-    const isCurrentLine = lineNumber === currentLine;
-    const line = codeLines[index];
-    // The 6-char number field + separator keeps the rail at a constant column
-    // for every row. The current line swaps the rail glyph for the marker IN
-    // that column: a leading `▶ ` before the number depends on the terminal
-    // rendering ▶ as exactly one cell (U+25B6 gets wide/emoji rendering in
-    // some terminals, which shoved that one row's rail sideways). ▸ (U+25B8)
-    // has no wide presentation, and sitting in the rail column keeps the
-    // number field identical across rows regardless.
-    const numberField = String(lineNumber).padStart(6, " ");
-    let prefix = `${numberField} │ `;
-    let content = line;
-
-    if (isCurrentLine) {
-      prefix = theme.fg("success", `${numberField} ▸ `);
-      content = theme.fg("text", line);
-    } else if (lineNumber < currentLine) {
-      prefix = theme.fg("muted", prefix);
-      content = theme.fg("muted", line);
-    } else {
-      prefix = theme.fg("muted", prefix);
-    }
-
-    lines.push(prefix + content);
-  }
-
-  if (endIdx < codeLines.length) {
-    lines.push(theme.fg("muted", "       │ ..."));
-  }
-
-  return lines;
-}
-
-/** Render the executing-code view as a static TUI component. */
-function renderExecutingCode(
-  codeLines: string[],
-  currentLine: number,
-  totalLines: number,
-  activeTool: string | undefined,
-  theme: Theme,
-  state: CodeViewState
-): Component {
-  return new Text(buildExecutingCodeLines(codeLines, currentLine, totalLines, activeTool, theme, state).join("\n"), 0, 0);
-}
-
-
-/** Full-width horizontal rule; the Component.render(width) contract supplies the edge. */
-class RuleComponent implements Component {
-  constructor(private readonly theme: Theme) {}
-
-  render(width: number): string[] {
-    return [this.theme.fg("muted", "─".repeat(Math.max(1, width)))];
-  }
-
-  invalidate(): void {}
-}
-
-/** Compact per-pool/stage rollup for finished workflow cells (display only). */
-function renderWorkflowRollup(details: ExecutionDetails | undefined, theme: Theme): Component | null {
-  const pools = (details?.subagentSnapshot?.pools ?? []).filter((pool) =>
-    (pool.stages ?? []).some((stage) => stage.submitted > 0)
-  );
-  if (pools.length === 0) return null;
-  let settled = 0;
-  let submitted = 0;
-  let failed = 0;
-  const stageLines: string[] = [];
-  for (const pool of pools) {
-    for (const stage of pool.stages ?? []) {
-      if (stage.submitted === 0) continue;
-      settled += stage.settled;
-      submitted += stage.submitted;
-      failed += stage.failed;
-      stageLines.push(theme.fg("muted", `  ${stage.name}: ${stage.settled}/${stage.submitted} settled`));
-    }
-  }
-  if (submitted === 0) return null;
-  const glyph = failed > 0 ? "!" : settled >= submitted ? "✓" : "●";
-  const color = failed > 0 ? "warning" : "success";
-  const lines = [
-    `${theme.fg("muted", "[workflow]")} ${theme.fg(color, `${glyph} ${settled}/${submitted} done`)}`,
-    ...stageLines,
-  ];
-  return new Text(lines.join("\n"), 0, 0);
-}
-
-/**
- * Render a finished exec result. Sectioned results render as rule-separated
- * blocks (workflow rollup and subagent panel between return and kernel);
- * legacy/sectionless output renders verbatim with a 25-line display cap.
- */
-/** Collapsed view shows this many body lines; ctrl-o expands to the full cell output. */
-const COMPLETED_PREVIEW_LINES = 4;
-
-function renderCompletedOutput(
-  resultText: string,
-  details: ExecutionDetails | undefined,
-  theme: Theme,
-  expanded?: boolean
-): Component {
-  if (!details) {
-    return new Text(resultText || "(No output)", 0, 0);
-  }
-
-  const durationStr = typeof details.durationMs === "number"
-    ? ` • ${(details.durationMs / 1000).toFixed(1).replace(/\.0$/, "")}s`
-    : "";
-  const avoidTok = details.estimatedAvoidedTokens > 0
-    ? ` • ~${details.estimatedAvoidedTokens.toLocaleString()} tokens saved`
-    : "";
-  const nestedStr = details.nestedToolCalls > 0
-    ? `${details.nestedToolCalls} nested call${details.nestedToolCalls > 1 ? "s" : ""}`
-    : "local logic";
-  const imgStr = details.imagesCount && details.imagesCount > 0
-    ? theme.fg("success", ` • ${details.imagesCount} figure${details.imagesCount > 1 ? "s" : ""} generated`)
-    : "";
-  const sessionStr = details.sessionId
-    ? theme.fg("muted", ` • session ${details.sessionId}${details.backgrounded ? " (backgrounded)" : ""}`)
-    : "";
-
-  const header = theme.fg(
-    "muted",
-    `[PTC] ${nestedStr}${avoidTok}${durationStr}`
-  ) + imgStr + sessionStr;
-
-  const sections = details.sectioned ? parseSectionedOutput(resultText) : null;
-  if (!sections) {
-    // Legacy blob (stale runtime) or error text: render verbatim.
-    const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
-    const toolLines = renderNestedToolTree(details.nestedCallRecords, theme);
-    const subagentBlock =
-      subagentLines.length + toolLines.length > 0 ? `\n${[...subagentLines, ...toolLines].join("\n")}\n` : "";
-    const rawBody = resultText || "(No output)";
-    const bodyLines = rawBody.split("\n");
-    let displayedBody = rawBody;
-    if (!expanded && bodyLines.length > COMPLETED_PREVIEW_LINES) {
-      displayedBody = bodyLines.slice(0, COMPLETED_PREVIEW_LINES).join("\n") +
-        `\n${theme.fg("muted", `... (${bodyLines.length - COMPLETED_PREVIEW_LINES} more lines — ctrl-o to expand)`)}`;
-    }
-    return new Text(`${header}${subagentBlock}\n${displayedBody}`, 0, 0);
-  }
-
-  // Sectioned result: rule-separated blocks (rules run to the right edge, like
-  // edit/write chrome), workflow rollup + live panel between return and kernel.
-  const container = new Container();
-  container.addChild(new Text(header, 0, 0));
-  const addRule = () => container.addChild(new RuleComponent(theme));
-  // Collapsed: cap every section body to a few lines (ctrl-o expands).
-  const addSection = (body: string) => {
-    if (expanded) {
-      container.addChild(new Text(body || "(empty)", 0, 0));
-      return;
-    }
-    const lines = (body || "(empty)").split("\n");
-    if (lines.length <= COMPLETED_PREVIEW_LINES) {
-      container.addChild(new Text(body || "(empty)", 0, 0));
-      return;
-    }
-    container.addChild(new Text(
-      lines.slice(0, COMPLETED_PREVIEW_LINES).join("\n") +
-        `\n${theme.fg("muted", `... (${lines.length - COMPLETED_PREVIEW_LINES} more lines — ctrl-o to expand)`)}`,
-      0, 0
-    ));
-  };
-
-  const kernel = sections.find((s) => s.name === "kernel");
-  for (const section of sections) {
-    if (section === kernel) continue;
-    addRule();
-    addSection(section.body);
-  }
-  const rollup = renderWorkflowRollup(details, theme);
-  if (rollup) {
-    addRule();
-    container.addChild(rollup);
-  }
-  const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
-  if (subagentLines.length > 0) {
-    addRule();
-    container.addChild(new Text(subagentLines.join("\n"), 0, 0));
-  }
-  const toolTreeLines = renderNestedToolTree(details.nestedCallRecords, theme);
-  if (toolTreeLines.length > 0) {
-    addRule();
-    container.addChild(new Text(toolTreeLines.join("\n"), 0, 0));
-  }
-  if (kernel) {
-    addRule();
-    addSection(kernel.body);
-  }
-  if (container.children.length === 1) {
-    // Header with no sections at all (shouldn't happen, but never render a bare header).
-    container.addChild(new Text("(No output)", 0, 0));
-  }
-  return container;
+/** Per-tool renderResult: dispatches to the notebook renderer by tool name. */
+function notebookResultRenderer(toolName: string) {
+  return (
+    result: AgentToolResult<unknown>,
+    options: ToolRenderResultOptions,
+    theme: Theme,
+    context?: PartialRenderContext
+  ): Component => renderNotebookResult(toolName, result, options, theme, context);
 }
 
 /** Extension root directory (parent of dist/ when loaded from the build output). */
@@ -1355,7 +1138,7 @@ function provisionKernelTool(
       const sessionLine = details?.sessionId
         ? theme.fg("success", `kernel ${details.sessionId}`) + (details.notebookPath ? theme.fg("muted", ` · ${details.notebookPath}`) : "")
         : "";
-      return new Text(`${sessionLine ? `${theme.fg("muted", "[PTC]")} ${sessionLine}\n` : ""}${result.content.map((c) => (c.type === "text" ? c.text : "")).join("")}`, 0, 0);
+      return new Text(`${sessionLine ? `${sessionLine}\n` : ""}${result.content.map((c) => (c.type === "text" ? c.text : "")).join("")}`, 0, 0);
     },
   });
 }
@@ -1447,6 +1230,11 @@ function execCellTool(
           // live subagent viewer straightforward. The manager keeps the machinery
           // for when it returns.
 
+          // Pre-highlight through the existing shiki pipeline (awaited here, in
+          // execute — the renderer stays synchronous and zero-jitter: it just
+          // reads details.highlightLines during streaming and at completion).
+          const highlightLines = ctx.hasUI ? await highlightCellCode(cellCode as string) : undefined;
+
           // Foreground exec with the recovery flow from the legacy code_execution tool.
       noteCodeExecutionAttempt(recoveryState);
       sessionState.lastCtx = ctx;
@@ -1469,8 +1257,11 @@ function execCellTool(
         // same for its shimmer).
         let lastUpdate: { content: Array<{ type: "text"; text: string }>; details: ExecutionDetails } | undefined;
         const streamingOnUpdate: typeof onUpdate = (update) => {
-          lastUpdate = update as never;
-          onUpdate?.(update);
+          const patched = highlightLines
+            ? ({ ...update, details: { ...(update.details ?? {}), highlightLines } } as typeof update)
+            : update;
+          lastUpdate = patched as never;
+          onUpdate?.(patched);
         };
         const repaint = setInterval(() => {
           if (!lastUpdate || !onUpdate) return;
@@ -1496,19 +1287,6 @@ function execCellTool(
         if (result.details.estimatedAvoidedTokens > 0) {
           ptcTokensSaved.tokensSaved += result.details.estimatedAvoidedTokens;
         }
-        // Persist the subagent fan as a transcript notification: finished tool
-        // results collapse into grouped one-line rows, so a workflow would
-        // otherwise vanish the moment the chunk returns.
-        const notification = result.details.subagentSnapshot
-          ? renderSubagentNotification(result.details.subagentSnapshot, ctx.ui.theme, result.details.execId)
-          : null;
-        if (notification) {
-          try {
-            pi.sendMessage({ customType: "subagent-notification", content: notification, display: true }, { triggerTurn: false });
-          } catch {
-            // never break the tool over transcript plumbing
-          }
-        }
         const reportedCellIdx = result.details.cellIdx;
         const compatibilityCellIdx = sessionManager.list().find((kernel) => kernel.id === sessionId)?.chunks ?? 1;
         const visibleOutput = collapseOutputPreview(
@@ -1529,6 +1307,7 @@ function execCellTool(
           details: {
             ...result.details,
             sessionId,
+            highlightLines,
             imagesCount: result.images?.length || 0,
             telemetry: buildPtcExecutionTelemetry(recoveryState),
             recovery: buildPtcRecoveryDetails(recoveryState),
@@ -1547,50 +1326,17 @@ function execCellTool(
         sessionState.activeForegroundExecutions.delete(toolCallId);
       }
     },
-    renderResult: renderCellResult,
+    renderShell: "self",
+    renderCall: (args: unknown, theme: Theme) =>
+      renderNotebookCall(
+        typeof args === "object" && args !== null && typeof (args as { code?: unknown }).code === "string"
+          ? (args as { code: string }).code
+          : undefined,
+        undefined,
+        theme,
+      ),
+    renderResult: notebookResultRenderer("exec_cell"),
   });
-}
-
-/**
- * Shared renderResult for exec-like tools (exec_cell/scratch_run/run_cell):
- * partial frames draw the live code view; completed frames render the sectioned
- * output with the usual collapse/expand behavior.
- */
-function renderCellResult(
-  result: AgentToolResult<unknown>,
-  { isPartial, expanded }: ToolRenderResultOptions,
-  theme: Theme,
-  context?: PartialRenderContext
-): Component {
-  const details = result.details as ExecutionDetails | undefined;
-  if (isPartial && details?.userCode && details.userCode.length > 0) {
-    const state = (context?.state ?? {}) as CodeViewState;
-    // Progress frames set currentLine; fast execs may complete a line tick
-    // before the first render, so default to the top of the chunk.
-    const currentLine = details.currentLine && details.currentLine > 0 ? details.currentLine : 1;
-    const totalLines = details.totalLines || details.userCode.length;
-    const lines = buildExecutingCodeLines(details.userCode, currentLine, totalLines, details.activeTool, theme, state);
-    // The subagent fan renders below the code view when the chunk spawned
-    // subagents through pi_subagents.
-    const subagentLines = renderSubagentPanel(details.subagentSnapshot, theme, details.execId);
-    if (subagentLines.length > 0) {
-      lines.push("");
-      lines.push(...subagentLines);
-    }
-    const toolTreeLines = renderNestedToolTree(details.nestedCallRecords, theme);
-    if (toolTreeLines.length > 0) {
-      lines.push("");
-      lines.push(...toolTreeLines);
-    }
-    return new Text(lines.join("\n"), 0, 0);
-  }
-
-  const text = result.content
-    .filter((content): content is { type: "text"; text: string } => content.type === "text")
-    .map((content) => content.text)
-    .join("");
-
-  return renderCompletedOutput(text, details, theme, expanded);
 }
 
 // ============================================================================
@@ -1725,7 +1471,8 @@ function scratchRunTool(
         sessionState.activeForegroundExecutions.delete(toolCallId);
       }
     },
-    renderResult: renderCellResult,
+    renderShell: "self",
+    renderResult: notebookResultRenderer("scratch_run"),
   });
 }
 
@@ -1763,9 +1510,23 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
         return { content: [{ type: "text", text: target.error }], details: {} };
       }
       const cellType = type ?? "code";
+      // Peek at the current cell first: its source feeds the renderer's
+      // inline diff (replace) or cleared-contents red, and tells insert apart
+      // from replace even when the write races with the notebook model.
+      let oldSource: string | undefined;
+      let replaced = false;
+      try {
+        const existing = await sessionManager.readCell(target.id, at);
+        if (existing.cells.length > 0) {
+          replaced = true;
+          oldSource = existing.cells[0]!.source;
+        }
+      } catch {
+        // Position past the end (or read failed): treat as an append.
+      }
       try {
         const result = await sessionManager.writeCell(target.id, { at, source, cellType });
-        const verb = at <= result.total ? "Wrote" : "Appended";
+        const verb = replaced ? "Replaced" : "Appended";
         return {
           content: [
             {
@@ -1773,7 +1534,15 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
               text: `${verb} ${cellType} cell at position ${at} (kernel ${target.id}; notebook now has ${result.total} cell${result.total === 1 ? "" : "s"}).`,
             },
           ],
-          details: { sessionId: target.id, at, cellType, total: result.total },
+          details: {
+            sessionId: target.id,
+            at,
+            cellType,
+            total: result.total,
+            cellSource: source,
+            oldCellSource: oldSource,
+            replaced,
+          },
         };
       } catch (error) {
         return {
@@ -1782,6 +1551,8 @@ function writeCellTool(sessionManager: PythonSessionManager): PtcToolDefinition 
         };
       }
     },
+    renderShell: "self",
+    renderResult: notebookResultRenderer("write_cell"),
   });
 }
 
@@ -1804,6 +1575,15 @@ function deleteCellTool(sessionManager: PythonSessionManager): PtcToolDefinition
       if ("error" in target) {
         return { content: [{ type: "text", text: target.error }], details: {} };
       }
+      // Capture the doomed cell's source first: the renderer draws the whole
+      // deleted cell (red, gutter included) from it.
+      let deletedSource: string | undefined;
+      try {
+        const existing = await sessionManager.readCell(target.id, n);
+        deletedSource = existing.cells[0]?.source;
+      } catch {
+        // Cell may not exist; the delete below surfaces the real error.
+      }
       try {
         const result = await sessionManager.deleteCell(target.id, n);
         return {
@@ -1813,7 +1593,7 @@ function deleteCellTool(sessionManager: PythonSessionManager): PtcToolDefinition
               text: `Deleted cell ${n} (kernel ${target.id}; notebook now has ${result.total} cell${result.total === 1 ? "" : "s"}).`,
             },
           ],
-          details: { sessionId: target.id, n, total: result.total },
+          details: { sessionId: target.id, n, total: result.total, cellSource: deletedSource },
         };
       } catch (error) {
         return {
@@ -1822,6 +1602,8 @@ function deleteCellTool(sessionManager: PythonSessionManager): PtcToolDefinition
         };
       }
     },
+    renderShell: "self",
+    renderResult: notebookResultRenderer("delete_cell"),
   });
 }
 
@@ -1862,6 +1644,7 @@ function readCellsTool(sessionManager: PythonSessionManager): PtcToolDefinition 
         };
       }
     },
+    renderResult: notebookResultRenderer("read_cells"),
   });
 }
 
@@ -1897,6 +1680,8 @@ function readCellTool(sessionManager: PythonSessionManager): PtcToolDefinition {
         };
       }
     },
+    renderShell: "self",
+    renderResult: notebookResultRenderer("read_cell"),
   });
 }
 
@@ -1981,7 +1766,8 @@ function runCellTool(
         sessionState.activeForegroundExecutions.delete(toolCallId);
       }
     },
-    renderResult: renderCellResult,
+    renderShell: "self",
+    renderResult: notebookResultRenderer("run_cell"),
   });
 }
 
@@ -2042,6 +1828,8 @@ function runBatchTool(
         sessionState.activeForegroundExecutions.delete(toolCallId);
       }
     },
+    renderShell: "self",
+    renderResult: notebookResultRenderer(opts.name),
   });
 }
 
@@ -2086,6 +1874,7 @@ function resetKernelTool(sessionManager: PythonSessionManager): PtcToolDefinitio
         };
       }
     },
+    renderResult: notebookResultRenderer("reset_kernel"),
   });
 }
 
@@ -2449,6 +2238,16 @@ async function handleSessionShutdown(
 export default async function ptcExtension(pi: ExtensionAPI, context?: ExtensionContext) {
   const settings = loadSettingsFromEnv();
   const extensionRoot = getExtensionRoot();
+  // Capture the live settings view once: getSettings() structured-clones per
+  // call, so the resolver always reads the CURRENT tuiMode even after a
+  // regular↔fullscreen switch (pi re-renders all rows on switch).
+  setNotebookTuiModeProvider(() => {
+    try {
+      return pi.getSettings().tuiMode;
+    } catch {
+      return undefined; // RPC/non-interactive contexts: collapse to "normal"
+    }
+  });
   const toolRegistry = new ToolRegistry(pi);
   const sandboxManager = await createSandbox();
   const sessionState: PtcSessionState = {
