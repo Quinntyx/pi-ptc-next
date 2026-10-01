@@ -24,6 +24,7 @@
 
 import { Text, type Component } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { parseSectionedOutput } from "../utils";
 import {
   FULLSCREEN_VIEWPORT_LINES,
   renderClearedCell,
@@ -312,15 +313,39 @@ function renderExecCompleted(
   return new NotebookComponent((width) => {
     const opts = boxOptions(details, expanded, theme, state);
     // scratch_run is a console op, not a notebook cell: unnumbered In:/Out:.
+    // Otherwise the gutter shows Jupyter's execution count; a missing count
+    // degrades to the empty `In[ ]:` rather than inventing a number (a
+    // notebook position is not an execution count).
     const cellNumber =
-      toolName === "scratch_run"
-        ? undefined
-        : (details.cellIdx ?? (toolName === "run_cell" ? details.runCellIndex : undefined));
+      toolName === "scratch_run" ? undefined : (details.cellIdx ?? null);
     const code = (details.userCode ?? []).join("\n");
-    const text = resultText(result) || "(No output)";
+    const text = outBoxContent(resultText(result)) || "(No output)";
     const outputStyle = result.isError ? ("error" as const) : text === "(No output)" ? ("muted" as const) : undefined;
     return renderExecutedCell(code, text, { ...opts, width, cellNumber, outputStyle });
   });
+}
+
+/**
+ * Jupyter-style Out content: stdout plus the echoed value, without the
+ * model-facing section markers (`kernel:`, `subagents:`, `tools:` digests)
+ * and without re-stating `Out[N]:` inside the box — the gutter already says
+ * it. Falls back to the raw text when it is not sectioned (plain tracebacks).
+ */
+function outBoxContent(sectioned: string): string {
+  const sections = parseSectionedOutput(sectioned);
+  if (!sections) return sectioned.replace(/\n$/, "");
+  const parts: string[] = [];
+  for (const section of sections) {
+    if (section.name === "output") {
+      if (section.body.trim()) parts.push(section.body);
+    } else if (section.name === "return") {
+      // The runtime's echo already prefixes `Out[N]:`; the gutter says it too.
+      const body = section.body.replace(/^Out\[\d+\]:\s*/m, "");
+      if (body.trim()) parts.push(body);
+    }
+    // kernel / subagents / tools digests stay out of the notebook Out box.
+  }
+  return parts.join("\n");
 }
 
 /** write_cell: insert → In box; replace → inline diff; replace-with-empty → cleared red. */
@@ -338,19 +363,23 @@ function renderWriteCompleted(
   }
   return new NotebookComponent((width) => {
     const opts = boxOptions(details, expanded, theme, state);
+    // Jupyter numbering: a written/edited cell has not executed, so its gutter
+    // is the empty `In[ ]:` — never the notebook position, never an invented
+    // execution count.
+    const notExecuted = { ...opts, width, cellNumber: null as null };
     const oldSource = details.oldCellSource;
     if (details.replaced) {
       if (source.trim() === "" && oldSource !== undefined) {
         // Cleared contents: only the cell's internal content goes red.
-        return renderClearedCell(oldSource, { ...opts, width, cellNumber: details.at });
+        return renderClearedCell(oldSource, notExecuted);
       }
       if (oldSource !== undefined) {
-        return renderEditedCell(oldSource, source, { ...opts, width, cellNumber: details.at });
+        return renderEditedCell(oldSource, source, notExecuted);
       }
       // Old source unavailable (stale frame): render like a fresh write.
-      return renderInCell(source, { ...opts, width, cellNumber: details.at });
+      return renderInCell(source, notExecuted);
     }
-    return renderInCell(source, { ...opts, width, cellNumber: details.at });
+    return renderInCell(source, notExecuted);
   });
 }
 

@@ -41,10 +41,13 @@ export type ViewportMode = "fullscreen" | "normal" | "expanded";
 
 export interface CellRenderOptions {
   /**
-   * Cell number N for `In[N]:` / `Out[N]:`. Omit for the unnumbered variant
-   * used by `scratch_run` (`In:` / `Out:`).
+   * Cell number N for `In[N]:` / `Out[N]:`.
+   * - a number → the execution count (Jupyter's `In[N]:`).
+   * - `null` → the cell exists but has not (yet) been executed: Jupyter's
+   *   empty `In[ ]:` gutter. Use for write/edit renders.
+   * - omitted → the unnumbered variant (`In:`), used for `scratch_run`.
    */
-  cellNumber?: number;
+  cellNumber?: number | null;
   /**
    * Pad the cell number to this many digits so separately rendered cells
    * (e.g. a `run_all` sequence) keep their fences in one column even when
@@ -385,7 +388,8 @@ export function applyViewport(
 
 function gutterLabels(opts: CellRenderOptions, kind: "in" | "out"): { label: string; labelWidth: number } {
   const numbered = opts.cellNumber !== undefined;
-  const numberPart = numbered ? `[${opts.cellNumber}]` : "";
+  const numberPart =
+    opts.cellNumber === null ? "[ ]" : numbered ? `[${opts.cellNumber}]` : "";
   const label = (kind === "in" ? "In" : "Out") + numberPart + ":";
   // The gutter width must fit the widest label that ANY cell rendered with the
   // same cellNumberWidth setting can produce, so In and Out fences align
@@ -393,7 +397,7 @@ function gutterLabels(opts: CellRenderOptions, kind: "in" | "out"): { label: str
   // rendered cells keep one fence column as cell numbers gain digits.
   const cellDigits = Math.max(
     opts.cellNumberWidth ?? 0,
-    numbered ? digits(opts.cellNumber!) : 0,
+    numbered && opts.cellNumber !== null ? digits(opts.cellNumber!) : 1,
   );
   const widest = numbered
     ? visibleWidth(`Out[${"9".repeat(cellDigits)}]:`)

@@ -72,9 +72,9 @@ test("exec_cell completed: In[N] box + Out[N] box from the reported execution co
   assert.ok(flat.includes("42"), flat);
 });
 
-test("exec_cell without a reported count falls back to the unnumbered variant (never invents N)", () => {
+test("exec_cell without a reported count degrades to the empty In[ ] (never invents N)", () => {
   const lines = renderPlain("exec_cell", textResult("ok", { userCode: ["print(1)"] }));
-  assert.match(lines[0], /^In: {2}┌/);
+  assert.match(lines[0], /^In\[ \]: {1,2}┌/);
 });
 
 test("exec_cell error results render the Out box red", () => {
@@ -137,7 +137,7 @@ test("scratch_run: unnumbered In: box + Out: box", () => {
 // write_cell
 // ---------------------------------------------------------------------------
 
-test("write_cell insert: In box only, numbered by notebook position", () => {
+test("write_cell insert: In box only, unexecuted (empty In[ ] gutter)", () => {
   const lines = renderPlain(
     "write_cell",
     textResult("Wrote code cell at position 4.", {
@@ -148,7 +148,7 @@ test("write_cell insert: In box only, numbered by notebook position", () => {
       cellSource: "y = 2",
     }),
   );
-  assert.match(lines[0], /^In\[4\]: {2}┌/);
+  assert.match(lines[0], /^In\[ \]: {1,2}┌/);
   assert.ok(!lines.some((line) => /^Out/.test(line)), "no Out box for a write");
   const flat = lines.map(stripAnsi).join("\n");
   assert.ok(flat.includes("y = 2"), flat);
@@ -195,7 +195,7 @@ test("write_cell replace without old source degrades to a fresh-write In box", (
     "write_cell",
     textResult("Wrote code cell at position 2.", { at: 2, replaced: true, cellSource: "z = 9" }),
   );
-  assert.match(lines[0], /^In\[2\]: {2}┌/);
+  assert.match(lines[0], /^In\[ \]: {1,2}┌/);
   assert.ok(lines.map(stripAnsi).join("\n").includes("z = 9"));
 });
 
