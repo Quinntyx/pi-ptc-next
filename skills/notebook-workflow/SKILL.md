@@ -42,8 +42,8 @@ namespace actually holds. Never assume the kernel matches the notebook.
 | `provision_kernel` | You need a kernel (once per task). | Creates/opens the `.ipynb`. | Fresh namespace. |
 | `scratch_run(code)` | Explore: try an import, check a shape, iterate on a value. | **Nothing is appended.** | Mutates the namespace. |
 | `write_cell(at, source, type=...)` | Author content: add or replace a cell (`type="markdown"` for prose). | Inserts/replaces at position `at`; a replaced cell's outputs are cleared as stale; saved immediately. | None. |
-| `run_cell(n)` | Execute the cell you just wrote or edited, at its position. | Updates that cell's outputs. | Mutates the namespace. |
-| `run_to(n)` | Resync: rerun cells 1..*n* in order after edits/desync. | Refreshes outputs for 1..*n*. | Rebuilds namespace from those cells. |
+| `run_cell(n)` | Execute the cell you just wrote or edited, at its position. **The main execution path** — write one cell, run one cell. | Updates that cell's outputs. | Mutates the namespace. |
+| `run_to(n)` | Jump to a cell: rebuild 1..*n* after `reset_kernel()`, or resync to a specific point when otherwise needed. **Not the routine driver for freshly written cells.** | Refreshes outputs for 1..*n*. | Rebuilds namespace from those cells. |
 | `run_all()` | Resync the whole notebook (the run-before-handover op). | Refreshes all outputs. | Rebuilds the full namespace. |
 | `reset_kernel()` | You need a clean namespace. | Untouched. | Restarts the interpreter. |
 | `exec_cell(code)` | You have proven code and want it **both executed and appended** as a new cell. | Appends a new code cell with outputs. | Mutates the namespace. |
@@ -58,12 +58,19 @@ only in-place source editor, and it never executes anything.
 
 - *Fresh scripted work:* `scratch_run` to explore → `write_cell` the proven
   version → `run_cell` it. This is the default authoring loop.
-- *Appending proven work in one move:* `exec_cell` (run + append) — the code runs
-  and the cell joins the notebook.
+- **Write one cell, run one cell.** The main execution path is
+  `write_cell(n)` → `run_cell(n)`, repeated per cell — or `exec_cell` when
+  proven code should run and append in one move. Do not write many cells and
+  then drive them with `run_to`/`run_all`: executing cell-by-cell keeps every
+  step's output next to its cell and surfaces failures where they happen.
+- *`run_to(n)` is a jump, not a driver:* use it to reach a particular cell
+  after `reset_kernel()` (rerun 1..*n* to rebuild state) or when resync is
+  otherwise needed — never as the routine way to execute freshly written
+  cells.
 - *Resync after edits:* `reset_kernel()` (optional) → `run_all()` → check the
   outputs. Before handover, always do this.
-- *Never* narrate a scratch session into the notebook cell by cell; that is what
-  `scratch_run` is for.
+- *Never* narrate a scratch session into the notebook cell by cell; that is
+  what `scratch_run` is for.
 
 # Cell granularity
 
