@@ -1,6 +1,6 @@
 # pi-pycells
 
-Persistent Python notebooks for [Pi](https://github.com/earendil-works/pi). Explore data, author code and markdown cells, rerun a notebook from a clean kernel, and save working notebooks as reusable workflows. Optional subagent orchestration lets a cell coordinate parallel Pi instances in tmux.
+A persistent Python notebook runtime for [Pi](https://github.com/earendil-works/pi), with **optional parallel subagent orchestration**. Explore data, author code and markdown cells, rerun a notebook from a clean kernel, and save working notebooks as reusable workflows. Enable the subagent integration to coordinate multiple Pi agents from a cell, with each agent visible in its own tmux window.
 
 Cells run on embedded IPython: imports, variables, and definitions survive across cells and conversation turns, with top-level `await`, Jupyter-style expression output, magics, and rich display output.
 
