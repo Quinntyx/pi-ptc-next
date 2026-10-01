@@ -43,7 +43,11 @@ import {
   withActivityLabel,
 } from "./utils";
 import { relevantAgents } from "./execution/subagent-panel";
-import { renderNotebookResult, setNotebookTuiModeProvider } from "./execution/notebook-render";
+import {
+	renderNotebookCall,
+	renderNotebookResult,
+	setNotebookTuiModeProvider,
+} from "./execution/notebook-render";
 import { PythonSessionManager } from "./python-session-manager";
 import type {
   CodeExecutionResult,
@@ -1226,6 +1230,11 @@ function execCellTool(
           // live subagent viewer straightforward. The manager keeps the machinery
           // for when it returns.
 
+          // Pre-highlight through the existing shiki pipeline (awaited here, in
+          // execute — the renderer stays synchronous and zero-jitter: it just
+          // reads details.highlightLines during streaming and at completion).
+          const highlightLines = ctx.hasUI ? await highlightCellCode(cellCode as string) : undefined;
+
           // Foreground exec with the recovery flow from the legacy code_execution tool.
       noteCodeExecutionAttempt(recoveryState);
       sessionState.lastCtx = ctx;
@@ -1248,8 +1257,11 @@ function execCellTool(
         // same for its shimmer).
         let lastUpdate: { content: Array<{ type: "text"; text: string }>; details: ExecutionDetails } | undefined;
         const streamingOnUpdate: typeof onUpdate = (update) => {
-          lastUpdate = update as never;
-          onUpdate?.(update);
+          const patched = highlightLines
+            ? ({ ...update, details: { ...(update.details ?? {}), highlightLines } } as typeof update)
+            : update;
+          lastUpdate = patched as never;
+          onUpdate?.(patched);
         };
         const repaint = setInterval(() => {
           if (!lastUpdate || !onUpdate) return;
@@ -1295,6 +1307,7 @@ function execCellTool(
           details: {
             ...result.details,
             sessionId,
+            highlightLines,
             imagesCount: result.images?.length || 0,
             telemetry: buildPtcExecutionTelemetry(recoveryState),
             recovery: buildPtcRecoveryDetails(recoveryState),
@@ -1314,6 +1327,14 @@ function execCellTool(
       }
     },
     renderShell: "self",
+    renderCall: (args: unknown, theme: Theme) =>
+      renderNotebookCall(
+        typeof args === "object" && args !== null && typeof (args as { code?: unknown }).code === "string"
+          ? (args as { code: string }).code
+          : undefined,
+        undefined,
+        theme,
+      ),
     renderResult: notebookResultRenderer("exec_cell"),
   });
 }

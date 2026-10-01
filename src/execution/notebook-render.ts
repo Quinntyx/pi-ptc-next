@@ -87,6 +87,8 @@ export interface CellOpDetails extends ExecutionDetails {
   runSteps?: NotebookRunStep[];
   /** run_to/run_all: 1-based position of the first failing cell. */
   failedIndex?: number;
+  /** Pre-highlighted code lines (synchronous shiki output), one per code line. */
+  highlightLines?: string[];
   /** read_cells / read_cell: the returned cells with sources and outputs. */
   cells?: NotebookCellSummary[];
   /** write_cell: 1-based position written. */
@@ -241,14 +243,29 @@ export function buildExecutingCodeLines(
  */
 class ExecPartialComponent implements Component {
   constructor(
-    private readonly headerLines: string[],
+    private readonly code: string,
+    private readonly highlightLines: string[] | undefined,
+    private readonly cellNumber: number | null | undefined,
+    private readonly badgeLines: string[],
     private readonly liveText: string,
     private readonly liveHidden: number,
+    private readonly expanded: boolean,
     private readonly theme: Theme
   ) {}
 
   render(width: number): string[] {
-    const lines = [...this.headerLines];
+    // The In box at paint width: the code as submitted, exactly the settled
+    // render's geometry, so streaming → completed never changes shape.
+    const lines = renderInCell(this.code, {
+      width,
+      mode: currentViewportMode(this.expanded),
+      cellNumber: this.cellNumber ?? null,
+      highlightLines: this.highlightLines,
+      theme: this.theme,
+    });
+    if (this.badgeLines.length > 0) {
+      lines.push(...this.badgeLines);
+    }
     if (this.liveText.length === 0 && this.liveHidden === 0) {
       return lines;
     }
@@ -256,15 +273,19 @@ class ExecPartialComponent implements Component {
     if (this.liveHidden > 0) {
       lines.push(this.theme.fg("muted", `... ${this.liveHidden} earlier output lines`));
     }
-    const mode = currentViewportMode(false);
-    // While streaming, the newest output is at the bottom: tail-pin the
-    // fullscreen scroll window instead of starting at line 1.
+    // Live output is tail-pinned in every collapsed mode: while streaming you
+    // care about the NEWEST output (a tqdm bar's current line, the last log
+    // lines), not the head. Expanded (ctrl+o) shows everything.
     const totalLines = this.liveText.length > 0 ? this.liveText.split("\n").length : 0;
+    if (this.expanded) {
+      lines.push(...renderOutCell(this.liveText, { width, mode: "expanded", theme: this.theme }));
+      return lines;
+    }
     const viewStart =
-      mode === "fullscreen" && totalLines > FULLSCREEN_VIEWPORT_LINES
-        ? totalLines - FULLSCREEN_VIEWPORT_LINES + 1
-        : undefined;
-    lines.push(...renderOutCell(this.liveText, { width, mode, viewStart, theme: this.theme }));
+      totalLines > FULLSCREEN_VIEWPORT_LINES ? totalLines - FULLSCREEN_VIEWPORT_LINES + 1 : undefined;
+    lines.push(
+      ...renderOutCell(this.liveText, { width, mode: "fullscreen", viewStart, theme: this.theme }),
+    );
     return lines;
   }
 
@@ -276,28 +297,43 @@ function renderExecutingFrame(
   details: CellOpDetails,
   theme: Theme,
   state: NotebookRenderState,
+  expanded: boolean,
 ): Component {
   const codeLines = details.userCode ?? [];
-  const headerLines =
-    codeLines.length > 0
-      ? buildExecutingCodeLines(
-          codeLines,
-          details.currentLine && details.currentLine > 0 ? details.currentLine : 1,
-          details.totalLines || codeLines.length,
-          details.activeTool,
-          theme,
-          state,
-        )
-      : [theme.fg("muted", "Executing Python code…")];
+  const badge = details.activeTool ? [theme.fg("muted", `· calling ${details.activeTool}()`)] : [];
   return new ExecPartialComponent(
-    headerLines,
+    codeLines.join("\n"),
+    details.highlightLines,
+    details.cellIdx ?? null,
+    badge,
     (details.liveOutput ?? []).join("\n"),
     details.liveOutputHidden ?? 0,
+    expanded,
     theme,
   );
 }
 
 // ---------------------------------------------------------------------------
+// Call phase (renderCall): the In box for the submitted code. During
+// execution this same box is what the partial frames render, so the tool
+// call never shows a raw/truncated argument dump.
+export function renderNotebookCall(
+  code: string | undefined,
+  options: { width?: number } | undefined,
+  theme: Theme,
+): Component {
+  return new NotebookComponent((width) => {
+    const source = code ?? "";
+    if (source.trim() === "") return [];
+    return renderInCell(source, {
+      width: options?.width ?? width,
+      mode: "normal",
+      cellNumber: null,
+      theme,
+    });
+  });
+}
+
 // Completed frames, per op
 // ---------------------------------------------------------------------------
 
@@ -321,7 +357,7 @@ function renderExecCompleted(
     const code = (details.userCode ?? []).join("\n");
     const text = outBoxContent(resultText(result)) || "(No output)";
     const outputStyle = result.isError ? ("error" as const) : text === "(No output)" ? ("muted" as const) : undefined;
-    return renderExecutedCell(code, text, { ...opts, width, cellNumber, outputStyle });
+    return renderExecutedCell(code, text, { ...opts, width, cellNumber, highlightLines: details.highlightLines, outputStyle });
   });
 }
 
@@ -511,7 +547,7 @@ export function renderNotebookResult(
     const details = (result.details ?? {}) as CellOpDetails;
     const state = (context?.state ?? {}) as NotebookRenderState;
     if (options.isPartial) {
-      return renderExecutingFrame(details, theme, state);
+      return renderExecutingFrame(details, theme, state, options.expanded ?? false);
     }
     switch (toolName) {
       case "exec_cell":

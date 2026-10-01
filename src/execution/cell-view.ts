@@ -26,6 +26,13 @@
  */
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import {
+	backgroundAnsi,
+	mixColors,
+	parseColor,
+	truncateToWidth as tuiTruncateToWidth,
+	visibleWidth as tuiVisibleWidth,
+} from "@earendil-works/pi-tui";
 
 /** Body lines shown in the collapsed, fullscreen (scrollable) In-box window. */
 export const FULLSCREEN_VIEWPORT_LINES = 8;
@@ -114,13 +121,14 @@ const STYLE_ATTRS: Record<BodyStyle, StyleAttrs> = {
 // Text measurement helpers (ANSI-aware, dependency-free)
 // ---------------------------------------------------------------------------
 
-const ANSI_ESCAPE = /\x1b\[[0-9;]*m/g;
-
-/** Visible width of a line: ANSI SGR escapes count as zero cells. */
+/**
+ * Visible width of a line, in terminal cells. Delegated to pi-tui, whose
+ * implementation is grapheme-aware (Intl.Segmenter, East-Asian-width table,
+ * ANSI/OSC stripping, memoized) — counting code points mis-sizes emoji and
+ * ZWJ sequences, which shifts the right fence out of alignment.
+ */
 export function visibleWidth(text: string): number {
-  let width = 0;
-  for (const ch of text.replace(ANSI_ESCAPE, "")) width += 1;
-  return width;
+  return tuiVisibleWidth(text);
 }
 
 /** Expand tabs to 4 spaces so widths are stable regardless of terminal tab stops. */
@@ -134,30 +142,10 @@ function expandTabs(text: string): string {
  * This is the ONLY long-line strategy in the module (no wrapping).
  */
 function truncateVisible(text: string, maxWidth: number): string {
-  if (maxWidth <= 0) return "";
-  if (visibleWidth(text) <= maxWidth) return text;
-  const limit = maxWidth - 1; // room for the ellipsis marker
-  let out = "";
-  let width = 0;
-  let index = 0;
-  while (index < text.length) {
-    if (text[index] === "\x1b") {
-      const match = /^\x1b\[[0-9;]*m/.exec(text.slice(index));
-      if (match) {
-        out += match[0];
-        index += match[0].length;
-        continue;
-      }
-    }
-    if (width >= limit) break;
-    const ch = Array.from(text.slice(index, index + 2))[0] ?? text[index]!;
-    out += ch;
-    width += 1;
-    index += ch.length;
-  }
-  out += "…";
-  if (out.includes("\x1b")) out += "\x1b[0m";
-  return out;
+	if (maxWidth <= 0) return "";
+	// pi-tui's truncation is grapheme-aware (an emoji tail truncates to the
+	// ellipsis without splitting the cluster) and ANSI-escape preserving.
+	return tuiTruncateToWidth(text, maxWidth, "\u2026");
 }
 
 /** Split cell text into body lines, dropping the single trailing empty line. */
@@ -185,7 +173,25 @@ function applyStyle(text: string, style: BodyStyle | undefined, theme: Theme | u
   if (!attrs.fg && !attrs.strike) return text;
   let inner = text;
   if (attrs.strike) inner = `\x1b[9m${inner}\x1b[29m`;
-  return theme.fg(attrs.fg ?? "text", inner);
+  let styled = theme.fg(attrs.fg ?? "text", inner);
+  // Diff rows get a subtle background wash, like a GitHub diff: the theme's
+  // own diff color mixed ~18% over the theme's intended background (light
+  // themes wash toward white, dark toward black), so it stays quiet. Theme
+  // stubs without the color API degrade to fg-only styling.
+  if (style === "added" || style === "removed") {
+    try {
+      const token = style === "added" ? "toolDiffAdded" : "toolDiffRemoved";
+      const diffColor = theme.colors?.[token];
+      if (diffColor) {
+        const base = parseColor(theme.appearance === "dark" ? "#1a1a1a" : "#fbfbf8");
+        const wash = mixColors(diffColor, base, 0.82);
+        styled = backgroundAnsi(wash, theme.getColorMode?.() ?? "truecolor") + styled + "\x1b[49m";
+      }
+    } catch {
+      // fg-only fallback
+    }
+  }
+  return styled;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +314,10 @@ function renderBox(spec: BoxSpec): string[] {
   const prefixWidth = gutterChars + 1; // gutter + separating space before the fence
   const interior = Math.max(1, width - prefixWidth - 2);
   const numberField = lineNumberWidth > 0 ? lineNumberWidth + 1 : 0;
-  const contentWidth = Math.max(1, interior - numberField);
+  // The rail column (+ its separating space) sits between the line-number
+  // field and the content, in both In and Out boxes.
+  const railWidth = numberField > 0 ? 2 : 0;
+  const contentWidth = Math.max(1, interior - numberField - railWidth);
 
   const gutterText = (text: string, style: BodyStyle = "muted"): string =>
     spec.wholeCellError ? applyStyle(text, "error", theme) : applyStyle(text, style, theme);
@@ -322,9 +331,12 @@ function renderBox(spec: BoxSpec): string[] {
     gutterText(left + HORIZONTAL.repeat(interior) + right);
 
   const lines: string[] = [];
-  lines.push(gutterFor(true) + fenceBody(FENCE_TOP_LEFT, FENCE_TOP_RIGHT));
+  // The label does not sit on the fence row: it is pushed down one line so it
+  // aligns with the box's upper-left corner — the first character of the first
+  // content row.
+  lines.push(gutterFor(false) + fenceBody(FENCE_TOP_LEFT, FENCE_TOP_RIGHT));
 
-  for (const row of rows) {
+  rows.forEach((row, rowIndex) => {
     const numText =
       numberField > 0 ? String(row.num ?? "").padStart(lineNumberWidth) + " " : "";
     const content = truncateVisible(row.text, contentWidth);
@@ -335,14 +347,24 @@ function renderBox(spec: BoxSpec): string[] {
     // pre-highlighted and carry ANSI escapes).
     const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(content)));
     const numStyle = style === "plain" ? "muted" : style;
+    // The label rides the first content row; later rows keep a blank gutter.
+    const labelGutter = rowIndex === 0 ? gutterFor(true) : gutterFor(false);
+    // Vertical rail between the line-number field and the content.
+    const rail = numberField > 0 ? applyStyle("│", "muted", theme) + " " : "";
     lines.push(
-      gutterFor(false) +
+      labelGutter +
         gutterText(FENCE_LEFT) +
         gutterText(numText, numStyle) +
+        rail +
         applyStyle(content, style, theme) +
         padding +
         gutterText(FENCE_RIGHT),
     );
+  });
+
+  if (rows.length === 0) {
+    // An empty body still gets its label row so the gutter is never lost.
+    lines.push(gutterFor(true) + gutterText(FENCE_LEFT) + gutterText(FENCE_RIGHT));
   }
 
   lines.push(gutterFor(false) + fenceBody(FENCE_BOTTOM_LEFT, FENCE_BOTTOM_RIGHT));
@@ -464,11 +486,12 @@ export function renderInCell(code: string, opts: CellRenderOptions): string[] {
  * apply so a chatty cell cannot blow up the collapsed view.
  */
 export function renderOutCell(output: string, opts: CellRenderOptions): string[] {
-  const rows = splitBodyLines(output).map((line) => ({
+  const rows = splitBodyLines(output).map((line, i) => ({
     text: line,
+    num: i + 1,
     style: (opts.outputStyle ?? "plain") as BodyStyle,
   }));
-  return buildBox(rows, opts, "out", { showLineNumbers: false });
+  return buildBox(rows, opts, "out");
 }
 
 /**

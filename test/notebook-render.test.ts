@@ -65,8 +65,11 @@ test("exec_cell completed: In[N] box + Out[N] box from the reported execution co
     "exec_cell",
     textResult("42", { userCode: ["x = 6", "x * 7"], cellIdx: 12 }),
   );
-  assert.match(lines[0], /^In\[12\]: {2}┌/);
-  assert.ok(lines.some((line) => /^Out\[12\]: ┌/.test(line)), lines.join("\n"));
+  assert.match(lines[0], /^ {9}┌/);
+  assert.match(lines[1], /^In\[12\]: {2}│/);
+  // (gutter = "Out[12]:" width 8 + 1 separator; all rows 50 wide)
+  assert.ok(lines.some((line, i) => /^ {9}┌/.test(line) && i > 1), lines.join("\n"));
+  assert.ok(lines.some((line) => /^Out\[12\]: │/.test(line)), lines.join("\n"));
   const flat = lines.map(stripAnsi).join("\n");
   assert.ok(flat.includes("x = 6"), flat);
   assert.ok(flat.includes("42"), flat);
@@ -74,7 +77,7 @@ test("exec_cell completed: In[N] box + Out[N] box from the reported execution co
 
 test("exec_cell without a reported count degrades to the empty In[ ] (never invents N)", () => {
   const lines = renderPlain("exec_cell", textResult("ok", { userCode: ["print(1)"] }));
-  assert.match(lines[0], /^In\[ \]: {1,2}┌/);
+  assert.match(lines[1], /^In\[ \]: {1,2}│/);
 });
 
 test("exec_cell error results render the Out box red", () => {
@@ -129,8 +132,8 @@ test("scratch_run: unnumbered In: box + Out: box", () => {
     "scratch_run",
     textResult("7", { userCode: ["3 + 4"], sectioned: true }),
   );
-  assert.match(lines[0], /^In: {2}┌/);
-  assert.ok(lines.some((line) => /^Out: ┌/.test(line)), lines.join("\n"));
+  assert.match(lines[0], /^ {5}┌/); // blank gutter on the fence row
+  assert.ok(lines.some((line) => /^Out: │/.test(line)), lines.join("\n"));
 });
 
 // ---------------------------------------------------------------------------
@@ -148,7 +151,8 @@ test("write_cell insert: In box only, unexecuted (empty In[ ] gutter)", () => {
       cellSource: "y = 2",
     }),
   );
-  assert.match(lines[0], /^In\[ \]: {1,2}┌/);
+  assert.match(lines[0], /^ {8}┌/);
+  assert.match(lines[1], /^In\[ \]: {1,2}│/);
   assert.ok(!lines.some((line) => /^Out/.test(line)), "no Out box for a write");
   const flat = lines.map(stripAnsi).join("\n");
   assert.ok(flat.includes("y = 2"), flat);
@@ -195,7 +199,8 @@ test("write_cell replace without old source degrades to a fresh-write In box", (
     "write_cell",
     textResult("Wrote code cell at position 2.", { at: 2, replaced: true, cellSource: "z = 9" }),
   );
-  assert.match(lines[0], /^In\[ \]: {1,2}┌/);
+  assert.match(lines[0], /^ {8}┌/);
+  assert.match(lines[1], /^In\[ \]: {1,2}│/);
   assert.ok(lines.map(stripAnsi).join("\n").includes("z = 9"));
 });
 
@@ -235,7 +240,8 @@ test("run_all: compact Run: box with per-cell status rows", () => {
       ],
     }),
   );
-  assert.match(lines[0], /^Run: ┌/);
+  assert.match(lines[0], /^ {5}┌/);
+  assert.match(lines[1], /^Run: │/);
   const themed = renderLines(
     "run_all",
     textResult("ran 3 cells", {
@@ -284,8 +290,11 @@ test("read_cell: In box with the cell's recorded execution count, plus its Out b
       ],
     }),
   );
-  assert.match(lines[0], /^In\[7\]: {2}┌/);
-  assert.ok(lines.some((line) => /^Out\[7\]: ┌/.test(line)), lines.join("\n"));
+  assert.match(lines[0], /^ {8}┌/);
+  assert.match(lines[1], /^In\[7\]: {2}│/);
+  // gutter = "Out[7]:" width 7 + 1; fences align with the Out box below
+  assert.ok(lines.some((line, i) => /^ {8}┌/.test(line) && i > 2), lines.join("\n"));
+  assert.ok(lines.some((line) => /^Out\[7\]: │1 │/.test(line)), lines.join("\n"));
 });
 
 test("read_cells: compact muted list, one block per cell", () => {
@@ -348,7 +357,7 @@ test("doc-op failure without details degrades to muted text; isError renders red
 // Executing (partial) frames
 // ---------------------------------------------------------------------------
 
-test("partial frame: executing code view with progress header and line marker", () => {
+test("partial frame: the In box carries the code while streaming, no legacy header", () => {
   const state = {};
   const lines = renderPlain(
     "exec_cell",
@@ -357,9 +366,12 @@ test("partial frame: executing code view with progress header and line marker", 
     state,
   );
   const flat = lines.map(stripAnsi);
-  assert.ok(flat[0].includes("Executing Python code (line 2/3)"), flat.join("\n"));
-  assert.ok(flat.some((line) => line.includes("▸ ") && line.includes("b = 2")), flat.join("\n"));
-  assert.equal(state.viewStartLine, 1, "short cells anchor the scroll at the top");
+  // The In box renders exactly like the settled one — no separate
+  // "Executing Python code" header, no legacy line-marker view.
+  assert.match(flat[0], /^ {8}┌/);
+  assert.match(flat[1], /^In\[ \]: {1,2}│/);
+  assert.ok(flat.some((line) => line.includes("b = 2")), flat.join("\n"));
+  assert.ok(!flat.some((line) => line.includes("Executing Python code")), flat.join("\n"));
 });
 
 test("partial frame: live Out box appended below the code view", () => {
@@ -376,17 +388,24 @@ test("partial frame: live Out box appended below the code view", () => {
   );
   const flat = lines.map(stripAnsi).join("\n");
   assert.ok(flat.includes("... 4 earlier output lines"), flat);
-  assert.match(flat, /Out: ┌/);
-  assert.ok(flat.includes("\n2") || flat.includes("│2"), flat);
+  assert.match(flat, /Out: │1 │ 0/);
+  assert.ok(flat.includes("│2 │ 1"), flat);
 });
 
-test("long streaming cells keep scrolling state across updates via the shared state object", () => {
+test("long streaming cells tail-pin the live Out box across updates", () => {
   const state = {};
   const userCode = Array.from({ length: 30 }, (_, i) => `line_${i + 1}`);
-  renderPlain("exec_cell", textResult("", { userCode, currentLine: 1, totalLines: 30 }), { isPartial: true }, state);
-  const first = state.viewStartLine;
-  renderPlain("exec_cell", textResult("", { userCode, currentLine: 15, totalLines: 30 }), { isPartial: true }, state);
-  const second = state.viewStartLine;
-  assert.equal(first, 1);
-  assert.ok(second > 1 && second <= 30 - 10 + 1, `viewStart advanced: ${second}`);
+  const live = (n) =>
+    renderPlain(
+      "exec_cell",
+      textResult("", { userCode, currentLine: n, totalLines: 30, liveOutput: Array.from({ length: n }, (_, i) => `out ${i}`) }),
+      { isPartial: true, expanded: true },
+      state,
+    );
+  const first = live(1);
+  const second = live(15);
+  // Zero-jitter: same code, same width — only the live Out content grows.
+  assert.equal(first.filter((l) => l.includes("┌")).length, second.filter((l) => l.includes("┌")).length);
+  // The newest output line is visible in the second frame (tail-pinned).
+  assert.ok(second.some((l) => l.includes("out 14")), second.join("\n"));
 });

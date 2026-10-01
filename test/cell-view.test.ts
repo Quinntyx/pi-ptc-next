@@ -45,20 +45,20 @@ function codeOf(n) {
 test("In box: label floats in the gutter outside a square fence with numbered rows", () => {
   const lines = renderInCell("import os\nos.getcwd()", { ...OPTS });
   assert.equal(lines.length, 2 + 2); // top + 2 body + bottom
-  assert.match(lines[0], /^In\[1\]: {2}┌─+┐$/);
-  assert.match(lines[1], /^ {8}│1 import os +│$/);
-  assert.match(lines[2], /^ {8}│2 os\.getcwd\(\) +│$/);
+  assert.match(lines[0], /^ {8}┌─+┐$/); // blank gutter on the fence row
+  assert.match(lines[1], /^In\[1\]: {2}│1 │ import os +│$/); // label aligns with the first content row; rail after the number
+  assert.match(lines[2], /^ {8}│2 │ os\.getcwd\(\) +│$/);
   assert.match(lines[3], /^ {8}└─+┘$/);
   // Every row has the same visible width.
   const widths = lines.map(visibleWidth);
   assert.deepEqual(widths, [40, 40, 40, 40]);
 });
 
-test("Out box: Out[N]: gutter, no line numbers, same fence column as In", () => {
+test("Out box: Out[N]: gutter with line numbers, same fence column as In", () => {
   const inLines = renderInCell("x = 1", { ...OPTS });
   const outLines = renderOutCell("1", { ...OPTS });
-  assert.match(outLines[0], /^Out\[1\]: ┌─+┐$/);
-  assert.match(outLines[1], /^ {8}│1 +│$/); // content "1", no line-number field
+  assert.match(outLines[0], /^ {8}┌─+┐$/);
+  assert.match(outLines[1], /^Out\[1\]: │1 │ 1 +│$/); // Out rows are numbered too, rail included
   assert.equal(outLines.length, 3);
   // Fences align despite Out's wider label.
   assert.equal(inLines[0].indexOf("┌"), outLines[0].indexOf("┌"));
@@ -66,9 +66,11 @@ test("Out box: Out[N]: gutter, no line numbers, same fence column as In", () => 
 
 test("executed cell renders the In block followed by the Out block", () => {
   const lines = renderExecutedCell("x = 1\nprint(x)", "1", { ...OPTS });
-  assert.match(lines[0], /^In\[1\]: {2}┌/);
+  assert.match(lines[0], /^ {8}┌/);
+  assert.match(lines[1], /^In\[1\]: {2}│/);
   assert.match(lines[3], /^ {8}└─+┘$/);
-  assert.match(lines[4], /^Out\[1\]: ┌/);
+  assert.match(lines[4], /^ {8}┌/);
+  assert.match(lines[5], /^Out\[1\]: │/);
   assert.equal(lines.length, 4 + 3);
 });
 
@@ -87,8 +89,8 @@ test("cellNumberWidth keeps the fence column fixed as In[N] gains digits", () =>
   );
   assert.deepEqual(columns, [columns[0], columns[0], columns[0]]);
   // And every label fits the shared gutter (padded after the colon).
-  const first = renderInCell("x = 1", { cellNumber: 9, cellNumberWidth: 3, width: 40, mode: "expanded" })[0];
-  assert.match(first, /^In\[9\]: {4}┌/);
+  const first = renderInCell("x = 1", { cellNumber: 9, cellNumberWidth: 3, width: 40, mode: "expanded" })[1];
+  assert.match(first, /^In\[9\]: {4}│/);
 });
 
 test("In and Out fences align inside a single executed render without extra hints", () => {
@@ -102,7 +104,7 @@ test("line-number field width comes from the full line count, so scrolling canno
   const scrolled = renderInCell(twenty, { ...OPTS, mode: "fullscreen", viewStart: 12 });
   assert.equal(top.indexOf("┌"), scrolled[0].indexOf("┌"));
   // 20 lines -> 2-digit number field for both windows.
-  assert.match(scrolled[1], /│12 line 12/);
+  assert.match(scrolled[1], /│12 │ line 12/);
 });
 
 // ---------------------------------------------------------------------------
@@ -123,19 +125,19 @@ test("collapsed + fullscreen draws an 8-line scrollable box with no more-hint", 
 test("fullscreen box honors viewStart and clamps it", () => {
   const opts = { ...OPTS, mode: "fullscreen" };
   const at6 = renderInCell(codeOf(20), { ...opts, viewStart: 6 });
-  assert.match(at6[1], /│ ?6 line 6/);
-  assert.match(at6[8], /│13 line 13/);
+  assert.match(at6[1], /│ 6 │ line 6/);
+  assert.match(at6[8], /│13 │ line 13/);
   const clampedLow = renderInCell(codeOf(20), { ...opts, viewStart: -5 });
-  assert.match(clampedLow[1], /│ ?1 line 1/);
+  assert.match(clampedLow[1], /│ 1 │ line 1/);
   const clampedHigh = renderInCell(codeOf(20), { ...opts, viewStart: 500 });
-  assert.match(clampedHigh[8], /│20 line 20/);
+  assert.match(clampedHigh[8], /│20 │ line 20/);
 });
 
 test("collapsed + normal shows the first 7 lines plus a below-box more-hint", () => {
   const lines = renderInCell(codeOf(20), { ...OPTS, mode: "normal" });
   assert.equal(lines.length, 2 + NORMAL_VIEWPORT_LINES + 1);
-  assert.match(lines[1], /│ ?1 line 1/);
-  assert.match(lines[7], /│ ?7 line 7/);
+  assert.match(lines[1], /│ 1 │ line 1/);
+  assert.match(lines[7], /│ 7 │ line 7/);
   assert.match(lines[9], /^ {8}\.\.\. 13 more lines >\.\.\.$/);
 });
 
@@ -192,7 +194,7 @@ test("a highlightLines length mismatch falls back to plain (never a short render
   const code = "a = 1\nb = 2";
   const lines = renderInCell(code, { ...OPTS, highlightLines: ["only one line"] });
   assert.equal(lines.length, 4);
-  assert.equal(stripAnsi(lines[2]), " ".repeat(8) + "│2 b = 2" + " ".repeat(23) + "│");
+  assert.equal(stripAnsi(lines[2]), " ".repeat(8) + "│2 │ b = 2" + " ".repeat(21) + "│");
 });
 
 test("moreLinesHint matches the built-in hint text", () => {
@@ -216,7 +218,7 @@ test("long lines are hard-truncated with a … marker, never wrapped", () => {
 
 test("tabs are expanded before measurement", () => {
   const lines = renderInCell("if x:\n\treturn 1", { ...OPTS });
-  assert.match(stripAnsi(lines[2]), /│2 {5}return 1/);
+  assert.match(stripAnsi(lines[2]), /│2 │ {5}return 1/);
 });
 
 // ---------------------------------------------------------------------------
@@ -264,8 +266,8 @@ test("edited cell renders removed lines red+struck and added lines green", () =>
 test("deleted cell paints the whole cell red, including the In[N]: gutter", () => {
   const theme = stubTheme();
   const lines = renderDeletedCell("a = 1", { ...OPTS, cellNumber: 5, theme });
-  assert.ok(lines[0].includes("\u0001error\u0002In[5]: "), "gutter label is error-styled");
   assert.ok(lines[0].includes("\u0001error\u0002┌"), "top fence is error-styled");
+  assert.ok(lines[1].includes("\u0001error\u0002In[5]: "), "gutter label is error-styled");
   assert.ok(lines[1].includes("\u0001error\u0002a = 1"), "content is error-styled");
   assert.ok(lines[2].includes("\u0001error\u0002└"), "bottom fence is error-styled");
 });
@@ -273,8 +275,8 @@ test("deleted cell paints the whole cell red, including the In[N]: gutter", () =
 test("cleared cell paints only the internal content red; gutter and fence stay normal", () => {
   const theme = stubTheme();
   const lines = renderClearedCell("a = 1", { ...OPTS, cellNumber: 5, theme });
-  assert.ok(lines[0].includes("\u0001muted\u0002In[5]: "), "gutter label keeps the normal style");
   assert.ok(lines[0].includes("\u0001muted\u0002┌"), "fence keeps the normal style");
+  assert.ok(lines[1].includes("\u0001muted\u0002In[5]: "), "gutter label keeps the normal style");
   assert.ok(lines[1].includes("\u0001error\u0002a = 1"), "content is error-styled");
   // The error style must not leak into the fence columns of the body row.
   const bodyRow = lines[1];
@@ -289,8 +291,9 @@ test("cleared cell paints only the internal content red; gutter and fence stay n
 
 test("omitting cellNumber renders the unnumbered In:/Out: scratch_run variant", () => {
   const lines = renderExecutedCell("x = 1", "1", { width: 40, mode: "expanded" });
-  assert.match(lines[0], /^In: {2}┌/);
-  assert.match(lines[3], /^Out: ┌/);
+  assert.match(lines[0], /^ {5}┌/);
+  assert.match(lines[1], /^In: {2}│/);
+  assert.match(lines[4], /^Out: │1 │/); // Out rows are numbered even in the scratch variant
   assert.equal(lines[0].indexOf("┌"), lines[3].indexOf("┌"));
 });
 
@@ -333,7 +336,8 @@ test("renderLabeledBox: generic label, square fence, viewport + hint in normal m
   const rows = codeOf(20).split("\n").map((text, i) => ({ text, num: i + 1 }));
   const lines = renderLabeledBox("Run:", rows, { width: 40, mode: "normal" });
   assert.equal(lines.length, 2 + NORMAL_VIEWPORT_LINES + 1);
-  assert.match(lines[0], /^Run: ┌─+┐$/);
+  assert.match(lines[0], /^ {5}┌─+┐$/); // label rides the first content row, not the fence
+  assert.match(lines[1], /^Run: │line 1/);
   assert.match(lines.at(-1), /more lines/);
   // Box rows share one visible width (the hint line below the box is exempt).
   const boxRows = lines.slice(0, -1).map(visibleWidth);
