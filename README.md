@@ -30,7 +30,7 @@ pi remove git:github.com/Quinntyx/pi-pycells
 
 - **Pi and a compatible Node.js runtime.** Follow Pi's current runtime requirements.
 - **uv.** Provisions Python environments and installs dependencies. The default interpreter is CPython 3.14; it is downloaded automatically if needed. IPython is provisioned into kernel environments.
-- **Subagents only:** `git`, [tmux](https://github.com/tmux/tmux), and [pi-sock](https://github.com/Quinntyx/pi-sock) installed in the Pi configuration used by spawned agents. The `pi_subagents` Python module is provisioned when subagents are enabled.
+- **Subagents only:** `git` and [tmux](https://github.com/tmux/tmux). `pi install` installs and loads [pi-sock](https://github.com/Quinntyx/pi-sock) with pi-pycells; agents using the same Pi configuration inherit it. A separate subagents configuration needs pi-sock installed there too (see below). The `pi_subagents` Python module is provisioned when subagents are enabled.
 
 The package includes three skills: **notebook-workflow** for authoring and handover, **pycells-library** for reusable notebooks, and **pi-subagents** for orchestration.
 
@@ -110,7 +110,21 @@ The positive value caps concurrency and enables background provisioning of `pi_s
 
 Cells can import `pi_subagents`, create an `AgentPool`, submit tasks to stages, and collect results in completion order. Each agent is a real Pi instance in a tmux window, visible and steerable while it works. Keep setup/submission, result collection, and teardown in separate cells, and always finish with `pool.close()` to dispose the agent windows and report the pool summary. Check failed results rather than silently ignoring them.
 
-Agents share your Pi configuration by default. Set `PI_CODING_SUBAGENT_DIR` to a separate Pi agent directory for a leaner extension set or a different default model. Unless you explicitly select a model, agents use that configuration's default; [pi-profiles](https://github.com/chaychoong/pi-profiles) can manage these directories but is not required.
+### Default configuration
+
+Agents share your current Pi configuration by default, including the pi-sock extension installed with pi-pycells. No separate pi-sock installation is needed in this case. If this configuration already loads a standalone copy of pi-sock, disable that copy with `pi config` to avoid loading the extension twice; keep the copy supplied by pi-pycells enabled.
+
+### Separate subagents configuration
+
+Set `PI_CODING_SUBAGENT_DIR` to a separate Pi agent directory for a leaner extension set or a different default model. **That configuration must also load pi-sock**: installing pi-pycells in the main configuration does not install extensions into a separate profile. For an existing standalone subagents configuration, install pi-sock there:
+
+```bash
+# Replace this path with your subagents profile's Pi agent directory.
+PI_CODING_AGENT_DIR=/path/to/subagents pi install git:github.com/Quinntyx/pi-sock
+export PI_CODING_SUBAGENT_DIR=/path/to/subagents
+```
+
+If pi-pycells is installed in that configuration too, it already supplies pi-sock; you do not need the separate install. Make sure the selected configuration has working model credentials. Unless you explicitly select a model, agents use that configuration's default; [pi-profiles](https://github.com/chaychoong/pi-profiles) can manage these directories but is not required.
 
 [pi-activity](https://git.quinntyx.dev/quinntyx/pi-activity) optionally supplies live activity labels. Load it before pi-pycells. It is not required for notebooks or subagent execution.
 

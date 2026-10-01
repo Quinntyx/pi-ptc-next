@@ -99,13 +99,38 @@ For long or destructive workflows, put the entire declared workflow in one cell 
 
 - `subagentFooter` (`src/contracts/settings.ts:23`) — the settings-file form of `PTC_SUBAGENT_FOOTER` (default `true`).
 
-## Standalone setup notes
+## Subagents setup
 
-This feature was built on the author's machine and several defaults only work there. Workarounds:
+### Shared configuration (default)
+
+Spawned agents use the orchestrator's current Pi agent directory unless `PI_CODING_SUBAGENT_DIR` or a task's `profile` overrides it. They inherit that configuration's extensions, credentials, and default model. `pi install git:github.com/Quinntyx/pi-pycells` installs pi-sock as a dependency and declares its extension for loading, so this default configuration needs no separate pi-sock installation. A profile named `subagents` is not selected automatically.
+
+If that configuration already loads a standalone pi-sock package, disable its extension with `pi config` and keep the copy supplied by pi-pycells enabled. Loading both copies can create competing socket servers. This does not apply to a standalone subagents profile that only installs pi-sock.
+
+### Standalone subagents profile
+
+A separate profile does not inherit packages installed in the orchestrator's profile. **Install and enable pi-sock in the configuration used by spawned agents**, even if pi-pycells is already installed in the main profile:
+
+```bash
+# Use an existing Pi agent directory with working model credentials.
+PI_CODING_AGENT_DIR=/path/to/subagents pi install git:github.com/Quinntyx/pi-sock
+export PI_CODING_SUBAGENT_DIR=/path/to/subagents
+export PI_SUBAGENTS_MAX_CONCURRENT=8
+# Start the orchestrator in tmux using its usual configuration.
+pi
+```
+
+Replace `/path/to/subagents` with your standalone profile's agent directory. The first command installs pi-sock into that directory; `PI_CODING_SUBAGENT_DIR` selects it for spawned agents without changing the orchestrator's configuration. A task's `profile` override must likewise select a configuration with pi-sock loaded. Installing pi-pycells into the standalone profile also supplies pi-sock, so a separate pi-sock install is unnecessary in that case. pi-pycells itself is not required in the standalone profile unless those agents need notebook tools.
+
+pi-sock supplies the control socket used to deliver prompts and communicate with agents; without it, startup waits for the socket and fails. Run the orchestrator under tmux and ensure the selected profile can answer a normal Pi prompt.
+
+### Provisioning notes
+
+The Python module is provisioned separately from the Pi extensions. Relevant defaults and overrides:
 
 - **Source URL.** `PTC_SUBAGENTS_REPO_URL` defaults to the public GitHub mirror (`https://github.com/Quinntyx/pi-subagents`) and works anonymously. Point it at your own fork if you maintain one: `export PTC_SUBAGENTS_REPO_URL=https://github.com/<you>/pi-subagents`. The provisioner shells out to plain `git`, so the URL must be reachable by your credential helper.
 - **Author-specific dev-checkout path.** `PTC_SUBAGENTS_SOURCE` defaults to `~/docs/src/pi-subagents` (joined from your homedir, `src/subagents-env.ts:50`). If you don't have that directory nothing breaks — resolution falls through to the managed clone — but set `PTC_SUBAGENTS_SOURCE` if you keep a checkout elsewhere.
-- **tmux is the only hard requirement.** `pi_subagents` warns at import when not running under tmux (its API then raises `NotImplementedError`). Spawned agents run under the orchestrator's own agent dir by default, so your existing extensions (pi-sock for prompt delivery — required for spawning — and optionally pi-tool-tree) and auth carry over with zero setup. For a separate subagent environment set `PI_CODING_SUBAGENT_DIR` to any directory with a pi config.
+- **tmux and pi-sock are required for subagents.** `pi_subagents` warns at import when not running under tmux (its API then raises `NotImplementedError`). pi-pycells supplies pi-sock in its own configuration; a standalone subagents profile must load it separately as described above. Existing extensions (optionally pi-tool-tree) and auth carry over only when agents share the orchestrator's configuration.
 - **`pi_subagents` is not on PyPI / npm.** It is fetched from git at sync time. Without network access to a valid repo, provisioning fails (stamped, and logged to `~/.cache/pi-pycells/subagents-sync.log`); a previous working checkout or dev source keeps working. You can also supply any checkout via `PTC_SUBAGENTS_SOURCE` — it must contain a `pyproject.toml` at its root or under a `main/` subdirectory.
 - **Machine cache layout.** The venv (`python-env/`), managed clone (`pi-subagents/`), sync log, and lock file all live under `~/.cache/pi-pycells/` (non-configurable in code). The venv is used for *all* PTC kernels, even if you never use subagents; delete it if you want kernels on a different interpreter.
 - **`uv` and `git` assumed.** `uv` is preferred for venv creation and editable installs (falls back to `python3 -m venv` / `pip`); `git` is required for the managed-clone path.

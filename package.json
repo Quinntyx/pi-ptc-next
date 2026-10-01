@@ -30,6 +30,7 @@
   ],
   "pi": {
     "extensions": [
+      "./node_modules/pi-sock/index.ts",
       "./src/index.ts"
     ],
     "skills": [
@@ -57,8 +58,12 @@
     "@sinclair/typebox": "*"
   },
   "dependencies": {
+    "pi-sock": "https://codeload.github.com/Quinntyx/pi-sock/tar.gz/aa842bcfbd178667b9b359ca4411aa879480ff0f",
     "shiki": "^4.4.3"
   },
+  "bundledDependencies": [
+    "pi-sock"
+  ],
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.3.0"
