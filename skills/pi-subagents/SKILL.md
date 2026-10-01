@@ -236,6 +236,9 @@ Result fields: `task`, `stage`, `handle`, `body` (str or dict response),
 
 # Model and effort selection
 
+- Unless the user names a model, spawned agents inherit the subagents
+  profile's own default model from its `settings.json` — the library handles
+  resolution; do not pick manually when the user didn't specify.
 - Every `pi_subagents` object is introspectable: call `help(obj)` (e.g. `help(pool)`, `help(task)`, `help(result)`) inside a cell to see all attributes and methods when this skill is silent on a detail. `dir(obj)` lists them tersely.
 - Resolve every named model: `subagents.best_model_match("flash")` returns one
   pick (exact slug > agent dir's default provider > first-party > proxied);
