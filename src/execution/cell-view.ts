@@ -15,8 +15,8 @@
  *   them the renderer falls back to plain text. Because geometry (line count,
  *   gutter width, fence columns) is derived exclusively from the raw text,
  *   both paths produce byte-identical geometry — only colors differ.
- * - **No pi integration, no I/O.** The only import is the `Theme` type;
- *   a missing theme degrades to fully unstyled text.
+ * - **No host state or I/O.** Theme/color and terminal-width helpers are the
+ *   only dependencies; a missing theme degrades to fully unstyled text.
  *
  * Long lines are HARD-TRUNCATED (never wrapped) to the available interior
  * width with a trailing `…` marker. Wrapping was rejected: it multiplies row
@@ -25,7 +25,7 @@
  * Tabs are expanded to 4 spaces before any measurement.
  */
 
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Theme, ThemeBg } from "@earendil-works/pi-coding-agent";
 import {
 	backgroundAnsi,
 	mixColors,
@@ -58,9 +58,11 @@ export interface CellRenderOptions {
   /**
    * Pad the cell number to this many digits so separately rendered cells
    * (e.g. a `run_all` sequence) keep their fences in one column even when
-   * digit counts differ. Defaults to the digits of `cellNumber`.
+   * digit counts differ. Defaults to three digits (grows safely past 999).
    */
   cellNumberWidth?: number;
+  /** Background for the label badge, matching the host tool-call state. */
+  labelBackground?: ThemeBg;
   /**
    * Total render width: gutter + fence + content must fit inside it.
    * The interior is truncated (never wrapped) to this width.
@@ -283,6 +285,9 @@ interface BoxSpec {
    * longest label), so In and Out fences align vertically.
    */
   labelWidth: number;
+  /** One-column transcript inset for In/Out cells; generic boxes stay unchanged. */
+  leftPadding?: number;
+  labelBackground?: ThemeBg;
   /** Width of the line-number field (digits), 0 for no line numbers. */
   lineNumberWidth: number;
   /** Body rows, already viewport-sliced. */
@@ -311,7 +316,8 @@ function renderBox(spec: BoxSpec): string[] {
   const { label, labelWidth, lineNumberWidth, rows, hidden, width, theme } = spec;
 
   const gutterChars = Math.max(visibleWidth(label), labelWidth);
-  const prefixWidth = gutterChars + 1; // gutter + separating space before the fence
+  const leftPadding = spec.leftPadding ?? 0;
+  const prefixWidth = leftPadding + gutterChars + 1; // gutter + separating space before the fence
   const interior = Math.max(1, width - prefixWidth - 2);
   const numberField = lineNumberWidth > 0 ? lineNumberWidth + 1 : 0;
   // The rail column (+ its separating space) sits between the line-number
@@ -324,7 +330,11 @@ function renderBox(spec: BoxSpec): string[] {
 
   const gutterFor = (isLabelRow: boolean): string => {
     const text = isLabelRow ? label.padEnd(gutterChars, " ") : " ".repeat(gutterChars);
-    return gutterText(text) + " ";
+    const badge = gutterText(text);
+    const shaded = isLabelRow && spec.labelBackground && theme?.bg
+      ? theme.bg(spec.labelBackground, badge)
+      : badge;
+    return " ".repeat(leftPadding) + shaded + " ";
   };
 
   const fenceBody = (left: string, right: string): string =>
@@ -418,12 +428,10 @@ function gutterLabels(opts: CellRenderOptions, kind: "in" | "out"): { label: str
   // vertically (`Out[N]:` is one cell wider than `In[N]:`) and separately
   // rendered cells keep one fence column as cell numbers gain digits.
   const cellDigits = Math.max(
-    opts.cellNumberWidth ?? 0,
+    opts.cellNumberWidth ?? 3,
     numbered && opts.cellNumber !== null ? digits(opts.cellNumber!) : 1,
   );
-  const widest = numbered
-    ? visibleWidth(`Out[${"9".repeat(cellDigits)}]:`)
-    : Math.max(visibleWidth("In:"), visibleWidth("Out:"));
+  const widest = visibleWidth(`Out[${"9".repeat(cellDigits)}]:`);
   return { label, labelWidth: Math.max(visibleWidth(label), widest) };
 }
 
@@ -455,6 +463,8 @@ function buildBox(
   return renderBox({
     label,
     labelWidth,
+    leftPadding: 1,
+    labelBackground: opts.labelBackground ?? "toolSuccessBg",
     lineNumberWidth: extras?.showLineNumbers === false ? 0 : (extras?.lineNumberWidth ?? lineNumberWidthFor(rows.length)),
     rows: viewport.rows,
     hidden: viewport.hidden,
@@ -481,8 +491,8 @@ export function renderInCell(code: string, opts: CellRenderOptions): string[] {
 }
 
 /**
- * Render the `Out[N]:` output box. Output lines carry NO line numbers (only
- * code is numbered, matching notebook convention) and the same viewport rules
+ * Render the `Out[N]:` output box. Output lines are numbered, with the same
+ * viewport rules
  * apply so a chatty cell cannot blow up the collapsed view.
  */
 export function renderOutCell(output: string, opts: CellRenderOptions): string[] {

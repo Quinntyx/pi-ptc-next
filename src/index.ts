@@ -48,6 +48,7 @@ import {
 	renderNotebookResult,
 	setNotebookTuiModeProvider,
 } from "./execution/notebook-render";
+import { highlightCellCode } from "./execution/code-highlight";
 import { PythonSessionManager } from "./python-session-manager";
 import type {
   CodeExecutionResult,
@@ -75,7 +76,8 @@ ptcGlobal.__ptcTokensSaved = ptcTokensSaved;
 // execution, which lets the executing-code view carry its scroll position between
 // partial updates (older installed types predate this argument).
 interface PartialRenderContext {
-  state?: { viewStartLine?: number };
+  state?: import("./execution/notebook-render").NotebookRenderState;
+  invalidate?: () => void;
 }
 
 /**
@@ -571,166 +573,6 @@ function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessi
     restored: sessionState.activeToolsBeforeRouting,
   });
   sessionState.activeToolsBeforeRouting = null;
-}
-
-// Shiki syntax highlighting for the cell-approval preview. Shiki is ESM-only
-// while this package is loaded as TypeScript through jiti; jiti's transformed
-// dynamic import resolves bare specifiers from this package's node_modules and
-// shims the ESM interop (a raw `new Function("m", "return import(m)")` does NOT
-// work under jiti: the VM context has no dynamic import callback). Falls back
-// to unhighlighted text if the load or highlighting fails.
-interface ShikiToken {
-  content: string;
-  color?: string;
-  fontStyle?: number;
-}
-
-/** Convert a Shiki token's hex color to a truecolor ANSI foreground escape (null when not a #rrggbb string). */
-function hexToAnsiFg(hex: string): string | null {
-  const match = /^#([0-9a-fA-F]{6})$/.exec(hex.trim());
-  if (!match) return null;
-  const value = parseInt(match[1], 16);
-  return `\x1b[38;2;${(value >> 16) & 0xff};${(value >> 8) & 0xff};${value & 0xff}m`;
-}
-
-/** Map Shiki FontStyle bits (italic/bold/underline) to ANSI SGR escapes. */
-function tokenFontAnsi(fontStyle: number | undefined): string {
-  // Shiki FontStyle bits: Italic = 1, Bold = 2, Underline = 4.
-  let out = "";
-  if (fontStyle && fontStyle & 1) out += "\x1b[3m";
-  if (fontStyle && fontStyle & 2) out += "\x1b[1m";
-  if (fontStyle && fontStyle & 4) out += "\x1b[4m";
-  return out;
-}
-
-let highlighters = new Map<string, Promise<any> | null>();
-
-/**
- * Pick the Shiki theme that matches the terminal's background. Token colors
- * from a dark palette on a light terminal (or vice versa) are unreadable, so
- * mirror pi-tool-tree: choose github-light/github-dark from the active pi
- * theme's background luminance. PTC_CODE_THEME overrides the choice.
- */
-function resolveShikiThemeName(theme?: Theme): string {
-  if (process.env.PTC_CODE_THEME) return process.env.PTC_CODE_THEME;
-  const bg = parseAnsiColorRgb(safeGetAnsi(theme, "getBgAnsi", "selectedBg")
-    || safeGetAnsi(theme, "getBgAnsi", "userMessageBg"));
-  const fg = parseAnsiColorRgb(safeGetAnsi(theme, "getFgAnsi", "text")
-    || safeGetAnsi(theme, "getFgAnsi", "fg"));
-  const sample = bg ?? fg;
-  if (!sample) return "github-dark";
-  const luminance = 0.2126 * sample.r + 0.7152 * sample.g + 0.0722 * sample.b;
-  // A bright sampled color means a light terminal: use the light palette.
-  return luminance > 128 ? "github-light" : "github-dark";
-}
-
-function safeGetAnsi(theme: Theme | undefined, method: "getFgAnsi" | "getBgAnsi", key: string): string | null {
-  try {
-    const ansi = (theme as unknown as Record<string, ((k: string) => string) | undefined> | undefined)?.[method]?.(key);
-    return typeof ansi === "string" && ansi.length > 0 ? ansi : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Parse a truecolor (38;2;/48;2;) or 256-color (38;5;/48;5;) ANSI sequence into RGB. */
-function parseAnsiColorRgb(ansi: string | null): { r: number; g: number; b: number } | null {
-  if (!ansi) return null;
-  const tc = ansi.match(/\x1b\[(?:38|48);2;(\d+);(\d+);(\d+)m/);
-  if (tc) return { r: +tc[1], g: +tc[2], b: +tc[3] };
-  const idx = ansi.match(/\x1b\[(?:38|48);5;(\d+)m/);
-  if (idx) {
-    // 256-color cube approximation (xterm): enough for light/dark decisions.
-    const n = +idx[1];
-    if (n < 16) return null;
-    if (n < 232) {
-      const cube = [0, 95, 135, 175, 215, 255];
-      const i = n - 16;
-      return { r: cube[Math.floor(i / 36) % 6], g: cube[Math.floor(i / 6) % 6], b: cube[i % 6] };
-    }
-    const level = 8 + (n - 232) * 10;
-    return { r: level, g: level, b: level };
-  }
-  return null;
-}
-
-/**
- * Lazily create a Shiki highlighter per theme name. Returns null when Shiki
- * cannot load; a failure resets the memo so a later call can retry.
- */
-function getHighlighter(themeName: string): Promise<any> | null {
-  if (!highlighters.has(themeName)) {
-    const promise = import("shiki")
-      .then((shiki: any) => shiki.createHighlighter({ themes: [themeName], langs: ["python"] }))
-      .catch((error: unknown) => {
-        // A transient module/theme failure should not disable highlighting for
-        // the rest of the process lifetime; allow the next request to retry.
-        highlighters.delete(themeName);
-        debugLog(`shiki unavailable, approval preview falls back to plain text: ${error instanceof Error ? error.message : String(error)}`);
-        return null;
-      });
-    highlighters.set(themeName, promise);
-  }
-  return highlighters.get(themeName) ?? null;
-}
-
-const highlightCache = new Map<string, string[]>();
-
-/**
- * Highlight Python cell code to ANSI-colored lines for the approval popup,
- * with a small clear-on-overflow cache; null when highlighting is unavailable.
- */
-async function highlightCellCode(code: string, theme?: Theme): Promise<string[] | null> {
-  const cached = highlightCache.get(code);
-  if (cached) return cached;
-  try {
-    const themeName = resolveShikiThemeName(theme);
-    const highlighter = await getHighlighter(themeName);
-    if (!highlighter) return null;
-    const { tokens }: { tokens: ShikiToken[][] } = highlighter.codeToTokens(code, {
-      lang: "python",
-      theme: themeName,
-    });
-    // Light palette on a light terminal (or dark on dark) washes out: clamp
-    // token colors whose luminance sits on the wrong side of the background to
-    // a safe muted foreground — same normalization pi-tool-tree applies.
-    const onLight = themeName.includes("light");
-    const minLuminance = onLight ? 140 : 72;
-    const safeMuted = hexToAnsiFg(onLight ? "#57606a" : "#8b949e") ?? "";
-    const lines = tokens.map((line) => {
-      let out = "";
-      for (const token of line) {
-        const font = tokenFontAnsi(token.fontStyle);
-        let color: string | null = null;
-        if (token.color) {
-          const rgb = hexRgb(token.color);
-          if (rgb) {
-            const lum = 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
-            color = lum < minLuminance ? safeMuted : hexToAnsiFg(token.color);
-          } else {
-            color = hexToAnsiFg(token.color);
-          }
-        }
-        if (color || font) out += (color ?? "") + font + token.content + "\x1b[0m";
-        else out += token.content;
-      }
-      return out;
-    });
-    if (highlightCache.size > 8) highlightCache.clear();
-    highlightCache.set(code, lines);
-    return lines;
-  } catch (error) {
-    debugLog(`shiki highlighting failed, approval preview falls back to plain text: ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  }
-}
-
-/** Parse a #rrggbb (or #rgb) hex color into RGB components. */
-function hexRgb(hex: string): { r: number; g: number; b: number } | null {
-  const m = /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/.exec(hex.trim());
-  if (!m) return null;
-  const full = m[1].length === 3 ? m[1].split("").map((c) => c + c).join("") : m[1];
-  return { r: parseInt(full.slice(0, 2), 16), g: parseInt(full.slice(2, 4), 16), b: parseInt(full.slice(4, 6), 16) };
 }
 
 // ============================================================================
@@ -1233,7 +1075,7 @@ function execCellTool(
           // Pre-highlight through the existing shiki pipeline (awaited here, in
           // execute — the renderer stays synchronous and zero-jitter: it just
           // reads details.highlightLines during streaming and at completion).
-          const highlightLines = ctx.hasUI ? await highlightCellCode(cellCode as string) : undefined;
+          const highlightLines = ctx.hasUI ? await highlightCellCode(cellCode as string, ctx.ui.theme) : undefined;
 
           // Foreground exec with the recovery flow from the legacy code_execution tool.
       noteCodeExecutionAttempt(recoveryState);
@@ -1327,13 +1169,14 @@ function execCellTool(
       }
     },
     renderShell: "self",
-    renderCall: (args: unknown, theme: Theme) =>
+    renderCall: (args: unknown, theme: Theme, context?: PartialRenderContext) =>
       renderNotebookCall(
         typeof args === "object" && args !== null && typeof (args as { code?: unknown }).code === "string"
           ? (args as { code: string }).code
           : undefined,
         undefined,
         theme,
+        context,
       ),
     renderResult: notebookResultRenderer("exec_cell"),
   });

@@ -15,14 +15,15 @@
  *   (`details.cellIdx`) for executed cells, the notebook position for
  *   non-executing doc ops, and falls back to the unnumbered `In:` variant when
  *   the frame carries no number. Numbers are never invented.
- * - **Plain text only.** The highlighting path (`highlightLines`) exists in
- *   cell-view but is intentionally unused here: the available shiki integration
- *   is async, and async highlighting is exactly the pi-tool-tree jitter bug.
- *   Wiring a *synchronous* highlighter later only changes colors, never
- *   geometry (cell-view derives all geometry from the raw text).
+ * - **Stable geometry.** Shared, theme-keyed Shiki work runs asynchronously;
+ *   redraws replace colors without changing raw-text-derived geometry.
+ * - **Real fullscreen scrolling.** Each input/output box has its own persistent
+ *   wheel-scroll window; regular mode retains terminal scrollback.
  */
 
 import { Text, type Component } from "@earendil-works/pi-tui";
+import { NotebookComponent } from "./notebook-component";
+import { cachedCellHighlights, cellHighlightKey, highlightCellCode } from "./code-highlight";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { parseSectionedOutput } from "../utils";
 import {
@@ -30,7 +31,6 @@ import {
   renderClearedCell,
   renderDeletedCell,
   renderEditedCell,
-  renderExecutedCell,
   renderInCell,
   renderLabeledBox,
   renderOutCell,
@@ -57,6 +57,12 @@ export interface NotebookToolResult {
 export interface NotebookRenderState {
   /** 1-based first visible code line, carried over from the executing view. */
   viewStartLine?: number;
+  scrollPositions?: Record<string, number>;
+  /** Call previews yield to the partial/final input box at paint time. */
+  resultOwnsInput?: boolean;
+  callCode?: string;
+  highlights?: Map<string, string[] | null>;
+  pendingHighlights?: Set<string>;
 }
 
 /** Structural view of pi's ToolRenderResultOptions. */
@@ -68,6 +74,7 @@ export interface NotebookRenderOptions {
 /** Structural view of the fourth renderResult argument (context.state). */
 export interface NotebookRenderContext {
   state?: NotebookRenderState;
+  invalidate?: () => void;
 }
 
 /**
@@ -132,16 +139,35 @@ export function currentViewportMode(expanded: boolean): ViewportMode {
 // ---------------------------------------------------------------------------
 
 /** Width-aware Component: cell boxes are built at paint time, per width. */
-class NotebookComponent implements Component {
-  constructor(private readonly build: (width: number) => string[]) {}
-
-  render(width: number): string[] {
-    return this.build(width);
-  }
-
-  invalidate(): void {}
+function bodyLineCount(text: string): number {
+  return text.replace(/\n$/, "").split("\n").length;
 }
 
+/** Start async work outside geometry; only the colors change when it finishes. */
+function renderHighlights(
+  code: string,
+  supplied: string[] | undefined,
+  theme: Theme,
+  state: NotebookRenderState,
+  redraw?: () => void,
+): string[] | undefined {
+  const key = cellHighlightKey(code, theme);
+  const cached = cachedCellHighlights(code, theme) ?? state.highlights?.get(key);
+  if (cached !== undefined) return cached ?? undefined;
+  if (!redraw) return supplied;
+  const pending = state.pendingHighlights ??= new Set();
+  if (!pending.has(key)) {
+    pending.add(key);
+    void highlightCellCode(code, theme).then((lines) => {
+      pending.delete(key);
+      const highlights = state.highlights ??= new Map();
+      if (highlights.size >= 8) highlights.clear();
+      highlights.set(key, lines);
+      redraw();
+    });
+  }
+  return undefined;
+}
 function resultText(result: NotebookToolResult): string {
   return result.content
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
@@ -241,78 +267,40 @@ export function buildExecutingCodeLines(
  * the emulated stdout screen (\r/EL/cursor moves already interpreted by the
  * session manager); expanded (ctrl+o) shows the full live screen.
  */
-class ExecPartialComponent implements Component {
-  constructor(
-    private readonly code: string,
-    private readonly highlightLines: string[] | undefined,
-    private readonly cellNumber: number | null | undefined,
-    private readonly badgeLines: string[],
-    private readonly liveText: string,
-    private readonly liveHidden: number,
-    private readonly expanded: boolean,
-    private readonly theme: Theme
-  ) {}
-
-  render(width: number): string[] {
-    // The In box at paint width: the code as submitted, exactly the settled
-    // render's geometry, so streaming → completed never changes shape.
-    const lines = renderInCell(this.code, {
-      width,
-      mode: currentViewportMode(this.expanded),
-      cellNumber: this.cellNumber ?? null,
-      highlightLines: this.highlightLines,
-      theme: this.theme,
-    });
-    if (this.badgeLines.length > 0) {
-      lines.push(...this.badgeLines);
-    }
-    if (this.liveText.length === 0 && this.liveHidden === 0) {
-      return lines;
-    }
-    lines.push("");
-    if (this.liveHidden > 0) {
-      lines.push(this.theme.fg("muted", `... ${this.liveHidden} earlier output lines`));
-    }
-    // Live output is tail-pinned in every collapsed mode: while streaming you
-    // care about the NEWEST output (a tqdm bar's current line, the last log
-    // lines), not the head. Expanded (ctrl+o) shows everything.
-    const totalLines = this.liveText.length > 0 ? this.liveText.split("\n").length : 0;
-    if (this.expanded) {
-      lines.push(...renderOutCell(this.liveText, { width, mode: "expanded", theme: this.theme }));
-      return lines;
-    }
-    const viewStart =
-      totalLines > FULLSCREEN_VIEWPORT_LINES ? totalLines - FULLSCREEN_VIEWPORT_LINES + 1 : undefined;
-    lines.push(
-      ...renderOutCell(this.liveText, { width, mode: "fullscreen", viewStart, theme: this.theme }),
-    );
-    return lines;
-  }
-
-  invalidate(): void {}
-}
-
 /** Streaming (isPartial) frame: executing code view + live output box. */
 function renderExecutingFrame(
+  toolName: string,
   details: CellOpDetails,
   theme: Theme,
   state: NotebookRenderState,
   expanded: boolean,
+  redraw?: () => void,
 ): Component {
-  const codeLines = details.userCode ?? [];
-  const badge = details.activeTool ? [theme.fg("muted", `· calling ${details.activeTool}()`)] : [];
-  return new ExecPartialComponent(
-    codeLines.join("\n"),
-    details.highlightLines,
-    details.cellIdx ?? null,
-    badge,
-    (details.liveOutput ?? []).join("\n"),
-    details.liveOutputHidden ?? 0,
-    expanded,
-    theme,
-  );
+  return new NotebookComponent((width, layout) => {
+    const code = (details.userCode ?? []).join("\n");
+    const mode = currentViewportMode(expanded);
+    const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
+    const opts = { width, mode, cellNumber, theme, labelBackground: "toolPendingBg" as const };
+    const lines = layout.box("input", bodyLineCount(code), {
+      ...opts, viewStart: state.viewStartLine,
+      highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
+    }, (options) => renderInCell(code, options));
+    if (details.activeTool) lines.push(theme.fg("muted", `· calling ${details.activeTool}()`));
+    const liveText = (details.liveOutput ?? []).join("\n");
+    const hidden = details.liveOutputHidden ?? 0;
+    if (!liveText && !hidden) return lines;
+    lines.push("");
+    if (hidden > 0) lines.push(theme.fg("muted", `... ${hidden} earlier output lines`));
+    const total = bodyLineCount(liveText);
+    // Retain the live tail in regular mode; fullscreen additionally allows
+    // independent wheel scrolling, suspended while the user inspects history.
+    lines.push(...layout.box("output", total, {
+      ...opts, mode: expanded ? "expanded" : "fullscreen",
+      viewStart: Math.max(1, total - FULLSCREEN_VIEWPORT_LINES + 1),
+    }, (options) => renderOutCell(liveText, options), lines.length, true, mode === "fullscreen"));
+    return lines;
+  }, state, redraw);
 }
-
 // ---------------------------------------------------------------------------
 // Call phase (renderCall): the In box for the submitted code. During
 // execution this same box is what the partial frames render, so the tool
@@ -321,19 +309,27 @@ export function renderNotebookCall(
   code: string | undefined,
   options: { width?: number } | undefined,
   theme: Theme,
+  context?: NotebookRenderContext,
 ): Component {
-  return new NotebookComponent((width) => {
+  const state = context?.state ?? {};
+  if (code !== undefined) state.callCode = code;
+  return new NotebookComponent((width, layout) => {
+    // Pi retains both call and result components. Read shared state at PAINT
+    // time (after both renderer callbacks), so even the first result replaces
+    // this preview without a duplicate or an extra invalidation round.
+    if (state.resultOwnsInput) return [];
     const source = code ?? "";
-    if (source.trim() === "") return [];
-    return renderInCell(source, {
+    if (!source.trim()) return [];
+    return layout.box("input", bodyLineCount(source), {
       width: options?.width ?? width,
-      mode: "normal",
+      mode: currentViewportMode(false),
       cellNumber: null,
       theme,
-    });
-  });
+      labelBackground: "toolPendingBg",
+      highlightLines: renderHighlights(source, undefined, theme, state, context?.invalidate),
+    }, (opts) => renderInCell(source, opts));
+  }, state, context?.invalidate);
 }
-
 // Completed frames, per op
 // ---------------------------------------------------------------------------
 
@@ -345,22 +341,26 @@ function renderExecCompleted(
   expanded: boolean,
   theme: Theme,
   state: NotebookRenderState,
+  redraw?: () => void,
 ): Component {
-  return new NotebookComponent((width) => {
+  if (details.userCode === undefined && state.callCode === undefined) return renderFallback(result, theme);
+  return new NotebookComponent((width, layout) => {
     const opts = boxOptions(details, expanded, theme, state);
-    // scratch_run is a console op, not a notebook cell: unnumbered In:/Out:.
-    // Otherwise the gutter shows Jupyter's execution count; a missing count
-    // degrades to the empty `In[ ]:` rather than inventing a number (a
-    // notebook position is not an execution count).
-    const cellNumber =
-      toolName === "scratch_run" ? undefined : (details.cellIdx ?? null);
-    const code = (details.userCode ?? []).join("\n");
+    const cellNumber = toolName === "scratch_run" ? undefined : details.cellIdx ?? null;
+    const code = details.userCode?.join("\n") ?? state.callCode ?? "";
     const text = outBoxContent(resultText(result)) || "(No output)";
-    const outputStyle = result.isError ? ("error" as const) : text === "(No output)" ? ("muted" as const) : undefined;
-    return renderExecutedCell(code, text, { ...opts, width, cellNumber, highlightLines: details.highlightLines, outputStyle });
-  });
+    const outputStyle = result.isError ? "error" as const : text === "(No output)" ? "muted" as const : undefined;
+    const labelBackground = result.isError ? "toolErrorBg" as const : "toolSuccessBg" as const;
+    const base = { ...opts, width, cellNumber, labelBackground };
+    const lines = layout.box("input", bodyLineCount(code), {
+      ...base, highlightLines: renderHighlights(code, details.highlightLines, theme, state, redraw),
+    }, (options) => renderInCell(code, options));
+    lines.push("");
+    lines.push(...layout.box("output", bodyLineCount(text), { ...base, viewStart: 1, outputStyle },
+      (options) => renderOutCell(text, options), lines.length));
+    return lines;
+  }, state, redraw);
 }
-
 /**
  * Jupyter-style Out content: stdout plus the echoed value, without the
  * model-facing section markers (`kernel:`, `subagents:`, `tools:` digests)
@@ -391,76 +391,60 @@ function renderWriteCompleted(
   expanded: boolean,
   theme: Theme,
   state: NotebookRenderState,
+  redraw?: () => void,
 ): Component {
   const source = details.cellSource;
-  if (source === undefined) {
-    // No source threaded (failure or stale frame): plain muted text.
-    return renderFallback(result, theme);
-  }
-  return new NotebookComponent((width) => {
-    const opts = boxOptions(details, expanded, theme, state);
-    // Jupyter numbering: a written/edited cell has not executed, so its gutter
-    // is the empty `In[ ]:` — never the notebook position, never an invented
-    // execution count.
-    const notExecuted = { ...opts, width, cellNumber: null as null };
+  if (source === undefined) return renderFallback(result, theme);
+  return new NotebookComponent((width, layout) => {
+    const opts = { ...boxOptions(details, expanded, theme, state), width, cellNumber: null };
     const oldSource = details.oldCellSource;
-    if (details.replaced) {
-      if (source.trim() === "" && oldSource !== undefined) {
-        // Cleared contents: only the cell's internal content goes red.
-        return renderClearedCell(oldSource, notExecuted);
-      }
-      if (oldSource !== undefined) {
-        return renderEditedCell(oldSource, source, notExecuted);
-      }
-      // Old source unavailable (stale frame): render like a fresh write.
-      return renderInCell(source, notExecuted);
+    if (details.replaced && oldSource !== undefined) {
+      if (!source.trim()) return layout.box("input", bodyLineCount(oldSource), opts,
+        (options) => renderClearedCell(oldSource, options));
+      const count = renderEditedCell(oldSource, source, { ...opts, mode: "expanded" }).length - 2;
+      return layout.box("input", count, opts, (options) => renderEditedCell(oldSource, source, options));
     }
-    return renderInCell(source, notExecuted);
-  });
+    return layout.box("input", bodyLineCount(source), {
+      ...opts, highlightLines: renderHighlights(source, undefined, theme, state, redraw),
+    }, (options) => renderInCell(source, options));
+  }, state, redraw);
 }
-
 /** delete_cell: the whole cell — gutter included — in red. */
 function renderDeleteCompleted(
   details: CellOpDetails,
   expanded: boolean,
   theme: Theme,
   state: NotebookRenderState,
+  redraw?: () => void,
 ): Component {
-  return new NotebookComponent((width) => {
-    const opts = boxOptions(details, expanded, theme, state);
+  return new NotebookComponent((width, layout) => {
     const source = details.cellSource ?? "(source unavailable)";
-    return renderDeletedCell(source, { ...opts, width, cellNumber: details.n });
-  });
+    return layout.box("input", bodyLineCount(source), {
+      ...boxOptions(details, expanded, theme, state), width, cellNumber: details.n,
+    }, (options) => renderDeletedCell(source, options));
+  }, state, redraw);
 }
-
 /** run_to / run_all: one compact per-cell status list. */
 function renderRunBatchCompleted(
   details: CellOpDetails,
   expanded: boolean,
   theme: Theme,
+  state: NotebookRenderState,
+  redraw?: () => void,
 ): Component {
-  return new NotebookComponent((width) => {
-    const steps = details.runSteps ?? [];
-    const rows: BodyRow[] = steps.map((step) => {
+  return new NotebookComponent((width, layout) => {
+    const rows: BodyRow[] = (details.runSteps ?? []).map((step) => {
       const glyph = step.ok ? "✓" : "✗";
       const target = step.execCount !== undefined ? ` → Out[${step.execCount}]` : "";
       const failure = step.ok ? "" : `: ${firstLine(step.error ?? "failed")}`;
-      return {
-        text: `${glyph} cell ${step.index}${target}${failure}`,
-        style: step.ok ? ("success" as const) : ("error" as const),
-      };
+      return { text: `${glyph} cell ${step.index}${target}${failure}`, style: step.ok ? "success" : "error" };
     });
-    if (rows.length === 0) {
-      rows.push({ text: "(no code cells executed)", style: "muted" });
-    }
-    return renderLabeledBox("Run:", rows, {
-      width,
-      mode: currentViewportMode(expanded),
-      theme,
-    });
-  });
+    if (!rows.length) rows.push({ text: "(no code cells executed)", style: "muted" });
+    return layout.box("run", rows.length, {
+      width, mode: currentViewportMode(expanded), theme,
+    }, (options) => renderLabeledBox("Run:", rows, options));
+  }, state, redraw);
 }
-
 /** reset_kernel: one muted line; the notebook file is untouched. */
 function renderResetCompleted(result: NotebookToolResult, theme: Theme): Component {
   const text = resultText(result) || "Kernel restarted: fresh namespace.";
@@ -473,24 +457,22 @@ function renderReadOneCompleted(
   expanded: boolean,
   theme: Theme,
   state: NotebookRenderState,
+  redraw?: () => void,
 ): Component {
-  return new NotebookComponent((width) => {
-    const opts = boxOptions(details, expanded, theme, state);
+  return new NotebookComponent((width, layout) => {
     const cell = details.cells?.[0];
-    if (!cell) {
-      return [theme.fg("muted", "(no cell)")];
-    }
-    // Truthful numbering: the cell's recorded execution count, or the
-    // unnumbered variant when it has never run.
-    const cellNumber = cell.executionCount;
-    const lines = renderInCell(cell.source, { ...opts, width, cellNumber });
-    if (cell.outputText.length > 0) {
-      lines.push(...renderOutCell(cell.outputText, { ...opts, width, cellNumber }));
+    if (!cell) return [theme.fg("muted", "(no cell)")];
+    const opts = { ...boxOptions(details, expanded, theme, state), width, cellNumber: cell.executionCount };
+    const lines = layout.box("input", bodyLineCount(cell.source), {
+      ...opts, highlightLines: cell.cellType === "code" ? renderHighlights(cell.source, undefined, theme, state, redraw) : undefined,
+    }, (options) => renderInCell(cell.source, options));
+    if (cell.outputText) {
+      lines.push(...layout.box("output", bodyLineCount(cell.outputText), { ...opts, viewStart: 1 },
+        (options) => renderOutCell(cell.outputText, options), lines.length));
     }
     return lines;
-  });
+  }, state, redraw);
 }
-
 /** read_cells: compact per-cell list (headers muted, sources plain). */
 function renderReadManyCompleted(
   details: CellOpDetails,
@@ -546,25 +528,28 @@ export function renderNotebookResult(
   try {
     const details = (result.details ?? {}) as CellOpDetails;
     const state = (context?.state ?? {}) as NotebookRenderState;
+    if (["exec_cell", "run_cell", "scratch_run"].includes(toolName)) {
+      state.resultOwnsInput = details.userCode !== undefined || state.callCode !== undefined;
+    }
     if (options.isPartial) {
-      return renderExecutingFrame(details, theme, state, options.expanded ?? false);
+      return renderExecutingFrame(toolName, details, theme, state, options.expanded ?? false, context?.invalidate);
     }
     switch (toolName) {
       case "exec_cell":
       case "run_cell":
       case "scratch_run":
-        return renderExecCompleted(toolName, result, details, options.expanded ?? false, theme, state);
+        return renderExecCompleted(toolName, result, details, options.expanded ?? false, theme, state, context?.invalidate);
       case "write_cell":
-        return renderWriteCompleted(result, details, options.expanded ?? false, theme, state);
+        return renderWriteCompleted(result, details, options.expanded ?? false, theme, state, context?.invalidate);
       case "delete_cell":
-        return renderDeleteCompleted(details, options.expanded ?? false, theme, state);
+        return renderDeleteCompleted(details, options.expanded ?? false, theme, state, context?.invalidate);
       case "run_to":
       case "run_all":
-        return renderRunBatchCompleted(details, options.expanded ?? false, theme);
+        return renderRunBatchCompleted(details, options.expanded ?? false, theme, state, context?.invalidate);
       case "reset_kernel":
         return renderResetCompleted(result, theme);
       case "read_cell":
-        return renderReadOneCompleted(details, options.expanded ?? false, theme, state);
+        return renderReadOneCompleted(details, options.expanded ?? false, theme, state, context?.invalidate);
       case "read_cells":
         return renderReadManyCompleted(details, theme);
       default:
