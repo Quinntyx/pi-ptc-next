@@ -61,7 +61,7 @@ export interface CellRenderOptions {
    * digit counts differ. Defaults to three digits (grows safely past 999).
    */
   cellNumberWidth?: number;
-  /** Background for the label badge, matching the host tool-call state. */
+  /** Background for the entire cell box, matching the host tool-call state. */
   labelBackground?: ThemeBg;
   /**
    * Total render width: gutter + fence + content must fit inside it.
@@ -287,6 +287,7 @@ interface BoxSpec {
   labelWidth: number;
   /** One-column transcript inset for In/Out cells; generic boxes stay unchanged. */
   leftPadding?: number;
+  /** Host tool background, applied across the entire box (including its gutter). */
   labelBackground?: ThemeBg;
   /** Width of the line-number field (digits), 0 for no line numbers. */
   lineNumberWidth: number;
@@ -312,6 +313,25 @@ const FENCE_LEFT = "│";
 const FENCE_RIGHT = "│";
 const HORIZONTAL = "─";
 
+/** Restore the enclosing box background after content resets, without overwriting diff washes. */
+function restoreBackground(text: string, background: string): string {
+  return text.replace(/\x1b\[([0-9;]*)m/g, (escape, parameters: string) => {
+    const codes = parameters === "" ? [0] : parameters.split(";").map(Number);
+    let reset = false;
+    for (let i = 0; i < codes.length; i++) {
+      if (codes[i] === 0 || codes[i] === 49) reset = true;
+      else if ((codes[i]! >= 40 && codes[i]! <= 47) || (codes[i]! >= 100 && codes[i]! <= 107)) reset = false;
+      else if (codes[i] === 38 || codes[i] === 48 || codes[i] === 58) {
+        if (codes[i] === 48) reset = false;
+        // RGB/indexed color arguments can contain 0/49; they are not SGR resets.
+        if (codes[i + 1] === 2) i += 4;
+        else if (codes[i + 1] === 5) i += 2;
+      }
+    }
+    return reset ? escape + background : escape;
+  });
+}
+
 function renderBox(spec: BoxSpec): string[] {
   const { label, labelWidth, lineNumberWidth, rows, hidden, width, theme } = spec;
 
@@ -330,11 +350,7 @@ function renderBox(spec: BoxSpec): string[] {
 
   const gutterFor = (isLabelRow: boolean): string => {
     const text = isLabelRow ? label.padEnd(gutterChars, " ") : " ".repeat(gutterChars);
-    const badge = gutterText(text);
-    const shaded = isLabelRow && spec.labelBackground && theme?.bg
-      ? theme.bg(spec.labelBackground, badge)
-      : badge;
-    return " ".repeat(leftPadding) + shaded + " ";
+    return " ".repeat(leftPadding) + gutterText(text) + " ";
   };
 
   const fenceBody = (left: string, right: string): string =>
@@ -386,7 +402,13 @@ function renderBox(spec: BoxSpec): string[] {
     );
   }
 
-  return lines;
+  if (!spec.labelBackground || !theme?.bg) return lines;
+  const background = theme.getBgAnsi?.(spec.labelBackground);
+  return lines.map((line) => {
+    const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
+    const content = background ? restoreBackground(padded, background) : padded;
+    return theme.bg(spec.labelBackground!, content);
+  });
 }
 
 // ---------------------------------------------------------------------------
