@@ -279,6 +279,67 @@ test("edited cell renders removed lines red+struck and added lines green", () =>
   assert.ok(!context.includes("\u0001toolDiff"), "context row is not diff-colored");
 });
 
+test("diff washes cover every interior column and stop before the fences", () => {
+  const { backgroundAnsi, mixColors, parseColor } = require("@earendil-works/pi-tui");
+  function backgroundCells(text) {
+    const cells = [];
+    let background = null;
+    for (let i = 0; i < text.length;) {
+      const sgr = /^\u001b\[([0-9;]*)m/.exec(text.slice(i));
+      if (!sgr) { cells.push(background); i++; continue; }
+      const codes = sgr[1] === "" ? [0] : sgr[1].split(";").map(Number);
+      for (let j = 0; j < codes.length; j++) {
+        if (codes[j] === 0 || codes[j] === 49) background = null;
+        else if ([38, 48, 58].includes(codes[j])) {
+          const size = codes[j + 1] === 2 ? 5 : 3;
+          if (codes[j] === 48) background = codes.slice(j, j + size).join(";");
+          j += size - 1;
+        }
+      }
+      i += sgr[0].length;
+    }
+    return cells;
+  }
+  for (const appearance of ["light", "dark"]) {
+    for (const mode of ["truecolor", "256"]) {
+      const host = backgroundAnsi(parseColor(appearance === "dark" ? "#202020" : "#eeeeee"), mode);
+      const theme = {
+        appearance,
+        colors: { toolDiffAdded: parseColor("#208020"), toolDiffRemoved: parseColor("#d02020") },
+        getColorMode: () => mode,
+        fg: (_token, text) => `\u001b[38;2;100;110;120m${text}\u001b[0m`,
+        getBgAnsi: () => host,
+        bg: (_token, text) => `${host}${text}\u001b[49m`,
+      };
+      for (const width of [32, 80]) {
+        const lines = renderEditedCell("keep\nb = 2", "keep\nb = 22", {
+          ...OPTS, width, theme, labelBackground: "toolSuccessBg",
+        });
+        for (const [needle, token] of [["b = 2", "toolDiffRemoved"], ["b = 22", "toolDiffAdded"]]) {
+          const line = lines.find((row) => stripAnsi(row).trimEnd().includes(needle) &&
+            (needle === "b = 22" || !stripAnsi(row).includes("b = 22")));
+          const plain = stripAnsi(line);
+          assert.equal(visibleWidth(line), width);
+          const leftFence = plain.indexOf("│");
+          const rightFence = plain.lastIndexOf("│");
+          const base = parseColor(appearance === "dark" ? "#1a1a1a" : "#fbfbf8");
+          const expected = /\u001b\[([0-9;]*)m/.exec(backgroundAnsi(
+            mixColors(theme.colors[token], base, 0.82), mode,
+          ))[1];
+          const colors = backgroundCells(line);
+          assert.ok(colors.slice(leftFence + 1, rightFence).every((bg) => bg === expected),
+            "number, rail, code and trailing spaces must share the full diff wash");
+          assert.notEqual(colors[leftFence], expected, "left fence keeps the tool background");
+          assert.notEqual(colors[rightFence], expected, "right fence keeps the tool background");
+        }
+        const context = lines.find((row) => stripAnsi(row).includes("keep"));
+        assert.ok(backgroundCells(context).every((bg) => bg === backgroundCells(lines[0])[0]),
+          "unchanged rows retain the host tool background");
+      }
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Red modes: delete vs clear
 // ---------------------------------------------------------------------------

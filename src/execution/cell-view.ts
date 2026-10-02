@@ -177,25 +177,24 @@ function applyStyle(text: string, style: BodyStyle | undefined, theme: Theme | u
   if (!attrs.fg && !attrs.strike) return text;
   let inner = text;
   if (attrs.strike) inner = `\x1b[9m${inner}\x1b[29m`;
-  let styled = theme.fg(attrs.fg ?? "text", inner);
-  // Diff rows get a subtle background wash, like a GitHub diff: the theme's
-  // own diff color mixed ~18% over the theme's intended background (light
-  // themes wash toward white, dark toward black), so it stays quiet. Theme
-  // stubs without the color API degrade to fg-only styling.
-  if (style === "added" || style === "removed") {
-    try {
-      const token = style === "added" ? "toolDiffAdded" : "toolDiffRemoved";
-      const diffColor = theme.colors?.[token];
-      if (diffColor) {
-        const base = parseColor(theme.appearance === "dark" ? "#1a1a1a" : "#fbfbf8");
-        const wash = mixColors(diffColor, base, 0.82);
-        styled = backgroundAnsi(wash, theme.getColorMode?.() ?? "truecolor") + styled + "\x1b[49m";
-      }
-    } catch {
-      // fg-only fallback
-    }
+  return theme.fg(attrs.fg ?? "text", inner);
+}
+
+/** Wash the entire diff-row interior, including numbers, rail and trailing padding. */
+function applyDiffBackground(text: string, style: BodyStyle, theme: Theme | undefined): string {
+  if (!theme || (style !== "added" && style !== "removed")) return text;
+  try {
+    const token = style === "added" ? "toolDiffAdded" : "toolDiffRemoved";
+    const diffColor = theme.colors?.[token];
+    if (!diffColor) return text;
+    const base = parseColor(theme.appearance === "dark" ? "#1a1a1a" : "#fbfbf8");
+    const wash = backgroundAnsi(mixColors(diffColor, base, 0.82), theme.getColorMode?.() ?? "truecolor");
+    // Foreground helpers may reset all attributes. Restore the row's wash,
+    // not the enclosing tool background, until the right fence is reached.
+    return wash + restoreBackground(text, wash) + "\x1b[49m";
+  } catch {
+    return text;
   }
-  return styled;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,10 +385,11 @@ function renderBox(spec: BoxSpec): string[] {
     lines.push(
       labelGutter +
         gutterText(FENCE_LEFT) +
-        gutterText(numText, numStyle) +
-        rail +
-        applyStyle(content, style, theme) +
-        padding +
+        applyDiffBackground(
+          gutterText(numText, numStyle) + rail + applyStyle(content, style, theme) + padding,
+          style,
+          theme,
+        ) +
         gutterText(FENCE_RIGHT),
     );
   });
