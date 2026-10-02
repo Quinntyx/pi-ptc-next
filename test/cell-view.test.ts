@@ -45,10 +45,10 @@ function codeOf(n) {
 test("In box: label floats in the gutter outside a square fence with numbered rows", () => {
   const lines = renderInCell("import os\nos.getcwd()", { ...OPTS });
   assert.equal(lines.length, 2 + 2); // top + 2 body + bottom
-  assert.match(lines[0], /^ {8}┌─+┐$/); // blank gutter on the fence row
-  assert.match(lines[1], /^In\[1\]: {2}│1 │ import os +│$/); // label aligns with the first content row; rail after the number
-  assert.match(lines[2], /^ {8}│2 │ os\.getcwd\(\) +│$/);
-  assert.match(lines[3], /^ {8}└─+┘$/);
+  assert.match(lines[0], /^ {11}┌─+┐$/); // blank gutter on the fence row
+  assert.match(lines[1], /^ In\[1\]: {4}│1 │ import os +│$/); // label aligns with the first content row; rail after the number
+  assert.match(lines[2], /^ {11}│2 │ os\.getcwd\(\) +│$/);
+  assert.match(lines[3], /^ {11}└─+┘$/);
   // Every row has the same visible width.
   const widths = lines.map(visibleWidth);
   assert.deepEqual(widths, [40, 40, 40, 40]);
@@ -57,8 +57,8 @@ test("In box: label floats in the gutter outside a square fence with numbered ro
 test("Out box: Out[N]: gutter with line numbers, same fence column as In", () => {
   const inLines = renderInCell("x = 1", { ...OPTS });
   const outLines = renderOutCell("1", { ...OPTS });
-  assert.match(outLines[0], /^ {8}┌─+┐$/);
-  assert.match(outLines[1], /^Out\[1\]: │1 │ 1 +│$/); // Out rows are numbered too, rail included
+  assert.match(outLines[0], /^ {11}┌─+┐$/);
+  assert.match(outLines[1], /^ Out\[1\]: {3}│1 │ 1 +│$/); // Out rows are numbered too, rail included
   assert.equal(outLines.length, 3);
   // Fences align despite Out's wider label.
   assert.equal(inLines[0].indexOf("┌"), outLines[0].indexOf("┌"));
@@ -66,11 +66,11 @@ test("Out box: Out[N]: gutter with line numbers, same fence column as In", () =>
 
 test("executed cell renders the In block followed by the Out block", () => {
   const lines = renderExecutedCell("x = 1\nprint(x)", "1", { ...OPTS });
-  assert.match(lines[0], /^ {8}┌/);
-  assert.match(lines[1], /^In\[1\]: {2}│/);
-  assert.match(lines[3], /^ {8}└─+┘$/);
-  assert.match(lines[4], /^ {8}┌/);
-  assert.match(lines[5], /^Out\[1\]: │/);
+  assert.match(lines[0], /^ {11}┌/);
+  assert.match(lines[1], /^ In\[1\]: {4}│/);
+  assert.match(lines[3], /^ {11}└─+┘$/);
+  assert.match(lines[4], /^ {11}┌/);
+  assert.match(lines[5], /^ Out\[1\]: {3}│/);
   assert.equal(lines.length, 4 + 3);
 });
 
@@ -90,7 +90,7 @@ test("cellNumberWidth keeps the fence column fixed as In[N] gains digits", () =>
   assert.deepEqual(columns, [columns[0], columns[0], columns[0]]);
   // And every label fits the shared gutter (padded after the colon).
   const first = renderInCell("x = 1", { cellNumber: 9, cellNumberWidth: 3, width: 40, mode: "expanded" })[1];
-  assert.match(first, /^In\[9\]: {4}│/);
+  assert.match(first, /^ In\[9\]: {4}│/);
 });
 
 test("In and Out fences align inside a single executed render without extra hints", () => {
@@ -138,7 +138,7 @@ test("collapsed + normal shows the first 7 lines plus a below-box more-hint", ()
   assert.equal(lines.length, 2 + NORMAL_VIEWPORT_LINES + 1);
   assert.match(lines[1], /│ 1 │ line 1/);
   assert.match(lines[7], /│ 7 │ line 7/);
-  assert.match(lines[9], /^ {8}\.\.\. 13 more lines >\.\.\.$/);
+  assert.match(lines[9], /^ {11}\.\.\. 13 more lines >\.\.\.$/);
 });
 
 test("collapsed + normal with 7 or fewer lines shows everything and no hint", () => {
@@ -194,7 +194,7 @@ test("a highlightLines length mismatch falls back to plain (never a short render
   const code = "a = 1\nb = 2";
   const lines = renderInCell(code, { ...OPTS, highlightLines: ["only one line"] });
   assert.equal(lines.length, 4);
-  assert.equal(stripAnsi(lines[2]), " ".repeat(8) + "│2 │ b = 2" + " ".repeat(21) + "│");
+  assert.equal(stripAnsi(lines[2]), " ".repeat(11) + "│2 │ b = 2" + " ".repeat(18) + "│");
 });
 
 test("moreLinesHint matches the built-in hint text", () => {
@@ -291,9 +291,9 @@ test("cleared cell paints only the internal content red; gutter and fence stay n
 
 test("omitting cellNumber renders the unnumbered In:/Out: scratch_run variant", () => {
   const lines = renderExecutedCell("x = 1", "1", { width: 40, mode: "expanded" });
-  assert.match(lines[0], /^ {5}┌/);
-  assert.match(lines[1], /^In: {2}│/);
-  assert.match(lines[4], /^Out: │1 │/); // Out rows are numbered even in the scratch variant
+  assert.match(lines[0], /^ {11}┌/);
+  assert.match(lines[1], /^ In: {7}│/);
+  assert.match(lines[4], /^ Out: {6}│1 │/); // Out rows are numbered even in the scratch variant
   assert.equal(lines[0].indexOf("┌"), lines[3].indexOf("┌"));
 });
 

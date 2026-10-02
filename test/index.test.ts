@@ -1001,7 +1001,7 @@ test("exec_cell partial rendering streams the live Out box below the code view",
 
     // The live Out box renders BELOW the executing-code view, with the
     // emulated screen content (not raw control sequences) inside the fence.
-    assert.match(rendered, /Out:/);
+    assert.match(rendered, /Out\[ \]:/);
     assert.match(rendered, /100\|?%/);
     assert.match(rendered, /100%\|##########\| 3\/3/);
     assert.doesNotMatch(rendered, /\x1b\[K/);
@@ -1022,7 +1022,7 @@ test("exec_cell partial rendering streams the live Out box below the code view",
       theme,
       { state: {} }
     ).render(80).join("\n");
-    assert.doesNotMatch(quiet, /Out:/);
+    assert.doesNotMatch(quiet, /Out\[ \]:/);
   } finally {
     restore();
     delete require.cache[require.resolve("../dist/index.js")];
