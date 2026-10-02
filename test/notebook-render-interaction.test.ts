@@ -33,12 +33,12 @@ test("default gutters align one/two/three digits, pending, and scratch cells wit
   for (const n of [1, 12, 123, null, undefined]) {
     for (const render of [renderInCell, renderOutCell]) {
       const lines = render("x", { width: 50, mode: "expanded", cellNumber: n });
-      assert.equal(lines[0].indexOf("┌"), 11);
+      assert.equal(lines[0].indexOf("┌"), 14);
       assert.match(lines[1], /^ (In|Out)/);
       assert.equal(visibleWidth(lines[1]), 50);
     }
   }
-  assert.equal(renderInCell("x", { width: 50, mode: "expanded", cellNumber: 1234 })[0].indexOf("┌"), 12);
+  assert.equal(renderInCell("x", { width: 50, mode: "expanded", cellNumber: 1234 })[0].indexOf("┌"), 14);
 });
 
 test("the normal tool background covers every complete In/Out row, fence, gutter, and hint", () => {
@@ -170,19 +170,19 @@ test("live output follows the tail, pauses while scrolled up, and resumes at the
     let lines = component.render(80);
     let row = labelRow(lines, "Out[ ]:");
     assert.ok(lines[row].includes("output_12"));
-    assert.ok(lines[row - 2].includes("... 12 lines above ..."));
+    assert.ok(lines[row + 1].includes("(20 lines)"));
     component.handleMouse(wheel(row, -4));
     component = frame(details(22), state, true);
     lines = component.render(80);
     row = labelRow(lines, "Out[ ]:");
     assert.ok(lines[row].includes("output_8"));
-    assert.ok(lines[row - 2].includes("... 8 lines above ..."));
+    assert.ok(lines[row + 1].includes("(22 lines)"));
     component.handleMouse(wheel(row, 100));
     component = frame(details(24), state, true);
     lines = component.render(80);
     row = labelRow(lines, "Out[ ]:");
     assert.ok(lines[row].includes("output_16"));
-    assert.ok(lines[row - 2].includes("... 16 lines above ..."));
+    assert.ok(lines[row + 1].includes("(24 lines)"));
   } finally { setNotebookTuiModeProvider(undefined); }
 });
 
@@ -238,7 +238,7 @@ test("streaming highlights retain colored prefixes while appended tokens wait fo
   assert.ok(!darkLines.some((line) => line.includes("\x1b[38;2;")), "do not retain the previous theme's foreground colors");
 });
 
-test("late older Shiki results cannot replace a newer retained highlight snapshot", async (t) => {
+test("late streaming results cannot replace a settled highlight snapshot", async (t) => {
   const module = require("../dist/execution/code-highlight.js");
   const pending = [];
   t.mock.method(module, "highlightCellCode", (code) => new Promise((resolve) => pending.push({ code, resolve })));
@@ -248,16 +248,31 @@ test("late older Shiki results cannot replace a newer retained highlight snapsho
   const second = first + "2";
   renderNotebookCall(first, undefined, THEME, context).render(100);
   renderNotebookCall(second, undefined, THEME, context).render(100);
-  assert.equal(pending.length, 2);
-  pending[1].resolve(["\x1b[32m" + second + "\x1b[0m"]);
-  await Promise.resolve();
+  assert.equal(pending.length, 1, "streaming highlight jobs are serialized");
+  renderNotebookResult("exec_cell", result({
+    userCode: [second], cellIdx: 1, highlightLines: ["\x1b[32m" + second + "\x1b[0m"],
+  }), {}, THEME, context).render(100);
   pending[0].resolve(["\x1b[31m" + first + "\x1b[0m"]);
-  await Promise.resolve();
+  for (let i = 0; i < 4; i++) await Promise.resolve();
   assert.equal(state.lastHighlights.code, second);
   assert.ok(state.lastHighlights.lines[0].includes("\x1b[32m"));
+  assert.equal(pending.length, 1, "settling cancels the queued preview");
 });
 
-test("streaming previews retain the newest lines with an above-box omitted-line count", () => {
+test("appending a newline and the next token never blacks out retained lines", async () => {
+  const code = "newline_color_regression = 123";
+  const colors = await highlightCellCode(code, THEME);
+  const state = {};
+  const context = { state, invalidate: () => {} };
+  renderNotebookCall(code, undefined, THEME, context).render(100);
+  for (const suffix of ["\n", "\np", "\nprint(1)", "\nprint(1)\n"]) {
+    const lines = renderNotebookCall(code + suffix, undefined, THEME, context).render(100);
+    assert.ok(lines.some((line) => line.includes(colors[0])), JSON.stringify(suffix));
+  }
+  state.streamingHighlights?.cancelPending();
+});
+
+test("streaming previews retain the newest lines with total-count gutter metadata", () => {
   try {
     for (const [mode, cap] of [["regular", 7], ["fullscreen", 8]]) {
       setNotebookTuiModeProvider(() => mode);
@@ -266,15 +281,17 @@ test("streaming previews retain the newest lines with an above-box omitted-line 
       let code = source.slice(0, 11).join("\n");
       let component = renderNotebookCall(code, undefined, THEME, context);
       let lines = component.render(80).map(stripAnsi);
-      assert.ok(lines[0].includes(`... ${11 - cap} lines above ...`));
-      assert.ok(lines[1].includes("┌"));
+      assert.ok(lines[0].includes("┌"));
+      assert.ok(lines[2].includes("(11 lines)"));
+      assert.equal(lines.length, cap + 2);
       assert.ok(lines.some((line) => line.includes("line_10 =")));
       assert.ok(!lines.some((line) => line.includes("line_0 =")));
       assert.ok(!lines.some((line) => line.includes("more lines")));
       code += "\n" + source[11];
       component = renderNotebookCall(code, undefined, THEME, context);
       lines = component.render(80).map(stripAnsi);
-      assert.ok(lines[0].includes(`... ${12 - cap} lines above ...`));
+      assert.ok(lines[2].includes("(12 lines)"));
+      assert.ok(!lines.some((line) => line.includes("lines above")));
       assert.ok(lines.some((line) => line.includes("line_11 =")));
       if (mode === "fullscreen") {
         const row = labelRow(lines, "In[ ]:");

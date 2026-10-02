@@ -6,6 +6,8 @@ const {
   highlightCellCode,
   resolveShikiThemeName,
   reuseCellHighlights,
+  StreamingCellHighlights,
+  STREAM_HIGHLIGHT_INTERVAL_MS,
 } = require("../dist/execution/code-highlight.js");
 
 function theme(rgb) {
@@ -19,6 +21,43 @@ function theme(rgb) {
 }
 const LIGHT = theme({ r: 250, g: 250, b: 235 });
 const DARK = theme({ r: 20, g: 20, b: 25 });
+test("streaming coalesces 200 source updates into one active and one latest job", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  const jobs = [];
+  const completed = [];
+  const scheduler = new StreamingCellHighlights((code) => new Promise((resolve) => jobs.push({ code, resolve })));
+  t.after(() => scheduler.cancelPending());
+  const request = (code) => scheduler.request({ key: code, code, theme: LIGHT, onResult: () => completed.push(code) });
+  request("value = 0");
+  for (let i = 1; i <= 200; i++) request(`value = ${i}`);
+  assert.equal(jobs.length, 1, "never tokenize all the intermediate versions");
+  jobs[0].resolve(["first"]);
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  t.mock.timers.tick(STREAM_HIGHLIGHT_INTERVAL_MS - 1);
+  assert.equal(jobs.length, 1);
+  t.mock.timers.tick(1);
+  assert.equal(jobs.length, 2);
+  assert.equal(jobs[1].code, "value = 200");
+  jobs[1].resolve(["latest"]);
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  assert.deepEqual(completed, ["value = 0", "value = 200"]);
+});
+
+test("settling cancels queued streaming work", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
+  let resolve;
+  let calls = 0;
+  const scheduler = new StreamingCellHighlights(() => { calls++; return new Promise((done) => { resolve = done; }); });
+  const request = (code) => scheduler.request({ key: code, code, theme: LIGHT, onResult: () => {} });
+  request("first");
+  request("second");
+  scheduler.cancelPending();
+  resolve([]);
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  t.mock.timers.tick(1000);
+  assert.equal(calls, 1);
+});
+
 test("retained highlights color only the unchanged prefix, including partial and shortened lines", () => {
   const red = (text) => "\x1b[31m" + text + "\x1b[0m";
   assert.deepEqual(reuseCellHighlights("abcDEF", "abc", [red("abc")]), [red("abc") + "DEF"]);
@@ -73,6 +112,16 @@ test("highlight caches are keyed by code and theme, including light/dark changes
   assert.equal(cachedCellHighlights(code, LIGHT), light);
   assert.equal(cachedCellHighlights(code, DARK), dark);
   assert.equal(await highlightCellCode(code, LIGHT), light);
+});
+
+test("visible historical highlights survive a stream of new cache entries", async () => {
+  const visible = "cache_lru_visible = 1";
+  const expected = await highlightCellCode(visible, LIGHT);
+  for (let i = 0; i < 150; i++) {
+    assert.strictEqual(cachedCellHighlights(visible, LIGHT), expected);
+    await highlightCellCode(`cache_lru_streaming = ${i}`, LIGHT);
+  }
+  assert.strictEqual(cachedCellHighlights(visible, LIGHT), expected);
 });
 
 test("light-theme readability guard does not replace already-dark readable ink", async () => {

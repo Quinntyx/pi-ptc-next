@@ -46,7 +46,14 @@ export function cellHighlightKey(code: string, theme?: Theme): string {
 }
 
 export function cachedCellHighlights(code: string, theme?: Theme): string[] | undefined {
-  return highlights.get(cellHighlightKey(code, theme));
+  const key = cellHighlightKey(code, theme);
+  const lines = highlights.get(key);
+  if (lines) {
+    // Visible historical cells stay warm while streaming adds new snapshots.
+    highlights.delete(key);
+    highlights.set(key, lines);
+  }
+  return lines;
 }
 
 /** Keep colors on the unchanged source prefix while a newer Shiki result is pending. */
@@ -76,6 +83,68 @@ export function reuseCellHighlights(code: string, previousCode: string, previous
     }
     return prefix + "\x1b[0m" + line.slice(keep);
   });
+}
+
+/** At most ten streaming tokenizations per second, with only the latest source queued. */
+export const STREAM_HIGHLIGHT_INTERVAL_MS = 100;
+
+interface StreamingHighlightRequest {
+  key: string;
+  code: string;
+  theme: Theme;
+  onResult: (lines: string[] | null) => void;
+}
+
+export class StreamingCellHighlights {
+  private latest?: StreamingHighlightRequest;
+  private active?: StreamingHighlightRequest;
+  private timer?: ReturnType<typeof setTimeout>;
+  private lastStarted = Number.NEGATIVE_INFINITY;
+
+  constructor(private readonly highlight: typeof highlightCellCode = highlightCellCode) {}
+
+  request(request: StreamingHighlightRequest): void {
+    if (this.active?.key === request.key) {
+      this.latest = undefined;
+      return;
+    }
+    this.latest = request;
+    this.schedule();
+  }
+
+  cancelPending(): void {
+    this.latest = undefined;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+
+  private schedule(): void {
+    if (this.active || this.timer || !this.latest) return;
+    const delay = Math.max(0, this.lastStarted + STREAM_HIGHLIGHT_INTERVAL_MS - Date.now());
+    if (!delay) this.flush();
+    else {
+      this.timer = setTimeout(() => {
+        this.timer = undefined;
+        this.flush();
+      }, delay);
+      this.timer.unref();
+    }
+  }
+
+  private flush(): void {
+    const request = this.latest;
+    if (!request) return;
+    this.latest = undefined;
+    this.active = request;
+    this.lastStarted = Date.now();
+    void this.highlight(request.code, request.theme)
+      .then(request.onResult, () => request.onResult(null))
+      .finally(() => {
+        this.active = undefined;
+        this.schedule();
+      })
+      .catch((error: unknown) => debugLog(`streaming highlight update failed: ${String(error)}`));
+  }
 }
 
 function getHighlighter(name: string): Promise<Highlighter | null> {
@@ -130,7 +199,7 @@ export async function highlightCellCode(code: string, theme?: Theme): Promise<st
         const font = (style & 1 ? "\x1b[3m" : "") + (style & 2 ? "\x1b[1m" : "") + (style & 4 ? "\x1b[4m" : "");
         return color || font ? color + font + token.content + "\x1b[0m" : token.content;
       }).join(""));
-      if (highlights.size >= 32) highlights.clear();
+      if (highlights.size >= 128) highlights.delete(highlights.keys().next().value!);
       highlights.set(key, lines);
       return lines;
     } catch (error) {

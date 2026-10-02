@@ -23,7 +23,7 @@
 
 import { Text, type Component } from "@earendil-works/pi-tui";
 import { NotebookComponent } from "./notebook-component";
-import { cachedCellHighlights, cellHighlightKey, highlightCellCode, reuseCellHighlights } from "./code-highlight";
+import { cachedCellHighlights, cellHighlightKey, highlightCellCode, reuseCellHighlights, StreamingCellHighlights } from "./code-highlight";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { parseSectionedOutput } from "../utils";
 import {
@@ -63,6 +63,7 @@ export interface NotebookRenderState {
   callCode?: string;
   highlights?: Map<string, string[] | null>;
   pendingHighlights?: Set<string>;
+  streamingHighlights?: StreamingCellHighlights;
   highlightRevision?: number;
   lastHighlights?: { code: string; themeKey: string; lines: string[]; revision: number };
 }
@@ -152,6 +153,7 @@ function renderHighlights(
   theme: Theme,
   state: NotebookRenderState,
   redraw?: () => void,
+  streaming = false,
 ): string[] | undefined {
   const key = cellHighlightKey(code, theme);
   const themeKey = cellHighlightKey("", theme);
@@ -166,7 +168,17 @@ function renderHighlights(
     remember(ready, state.highlightRevision = (state.highlightRevision ?? 0) + 1);
     return ready;
   }
-  if (redraw && cached !== null) {
+  if (redraw && cached !== null && streaming) {
+    const scheduler = state.streamingHighlights ??= new StreamingCellHighlights(highlightCellCode);
+    const revision = state.highlightRevision = (state.highlightRevision ?? 0) + 1;
+    scheduler.request({ key, code, theme, onResult: (lines) => {
+      const highlights = state.highlights ??= new Map();
+      if (highlights.size >= 8) highlights.delete(highlights.keys().next().value!);
+      highlights.set(key, lines);
+      if (lines) remember(lines, revision);
+      redraw();
+    } });
+  } else if (redraw && cached !== null) {
     const pending = state.pendingHighlights ??= new Set();
     if (!pending.has(key)) {
       pending.add(key);
@@ -174,7 +186,7 @@ function renderHighlights(
       void highlightCellCode(code, theme).then((lines) => {
         pending.delete(key);
         const highlights = state.highlights ??= new Map();
-        if (highlights.size >= 8) highlights.clear();
+        if (highlights.size >= 8) highlights.delete(highlights.keys().next().value!);
         highlights.set(key, lines);
         if (lines) remember(lines, revision);
         redraw();
@@ -343,7 +355,7 @@ export function renderNotebookCall(
       cellNumber: null,
       theme,
       labelBackground: "toolPendingBg",
-      highlightLines: renderHighlights(source, undefined, theme, state, context?.invalidate),
+      highlightLines: renderHighlights(source, undefined, theme, state, context?.invalidate, true),
     }, (opts) => renderInCell(source, opts), 0, true);
   }, state, context?.invalidate);
 }
@@ -547,6 +559,7 @@ export function renderNotebookResult(
     const state = (context?.state ?? {}) as NotebookRenderState;
     if (["exec_cell", "run_cell", "scratch_run"].includes(toolName)) {
       state.resultOwnsInput = details.userCode !== undefined || state.callCode !== undefined;
+    if (state.resultOwnsInput) state.streamingHighlights?.cancelPending();
     }
     if (options.isPartial) {
       return renderExecutingFrame(toolName, details, theme, state, options.expanded ?? false, context?.invalidate);

@@ -305,8 +305,8 @@ interface BoxSpec {
   contentError?: boolean;
   /** Show the `... N more lines >...` hint below the box (collapsed normal mode only). */
   showMoreHint?: boolean;
-  /** Tail windows keep a stable hint row above the fence, even when scrolled to the top. */
-  hiddenAbove?: number;
+  /** Metadata occupies existing gutter rows below the label, never extra box rows. */
+  metadata?: string[];
 }
 
 const FENCE_TOP_LEFT = "┌";
@@ -343,7 +343,9 @@ function renderBox(spec: BoxSpec): string[] {
   const leftPadding = spec.leftPadding ?? 0;
   const prefixWidth = leftPadding + gutterChars + 1; // gutter + separating space before the fence
   const interior = Math.max(1, width - prefixWidth - 2);
-  const numberField = lineNumberWidth > 0 ? lineNumberWidth + 1 : 0;
+  // Very narrow panes prefer intact fences and content over a number/rail
+  // field that would push rows past the terminal width.
+  const numberField = lineNumberWidth > 0 && interior >= lineNumberWidth + 4 ? lineNumberWidth + 1 : 0;
   // The rail column (+ its separating space) sits between the line-number
   // field and the content, in both In and Out boxes.
   const railWidth = numberField > 0 ? 2 : 0;
@@ -352,8 +354,8 @@ function renderBox(spec: BoxSpec): string[] {
   const gutterText = (text: string, style: BodyStyle = "muted"): string =>
     spec.wholeCellError ? applyStyle(text, "error", theme) : applyStyle(text, style, theme);
 
-  const gutterFor = (isLabelRow: boolean): string => {
-    const text = isLabelRow ? label.padEnd(gutterChars, " ") : " ".repeat(gutterChars);
+  const gutterFor = (isLabelRow: boolean, metadataIndex = -1): string => {
+    const text = (isLabelRow ? label : spec.metadata?.[metadataIndex] ?? "").padEnd(gutterChars, " ");
     return " ".repeat(leftPadding) + gutterText(text) + " ";
   };
 
@@ -361,9 +363,6 @@ function renderBox(spec: BoxSpec): string[] {
     gutterText(left + HORIZONTAL.repeat(interior) + right);
 
   const lines: string[] = [];
-  if (spec.hiddenAbove !== undefined) {
-    lines.push(truncateVisible(" ".repeat(prefixWidth) + applyStyle(`... ${spec.hiddenAbove} lines above ...`, "muted", theme), width));
-  }
   // The label does not sit on the fence row: it is pushed down one line so it
   // aligns with the box's upper-left corner — the first character of the first
   // content row.
@@ -381,7 +380,7 @@ function renderBox(spec: BoxSpec): string[] {
     const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(content)));
     const numStyle = style === "plain" ? "muted" : style;
     // The label rides the first content row; later rows keep a blank gutter.
-    const labelGutter = rowIndex === 0 ? gutterFor(true) : gutterFor(false);
+    const labelGutter = gutterFor(rowIndex === 0, rowIndex - 1);
     // Vertical rail between the line-number field and the content.
     const rail = numberField > 0 ? applyStyle("│", "muted", theme) + " " : "";
     lines.push(
@@ -462,7 +461,8 @@ function gutterLabels(opts: CellRenderOptions, kind: "in" | "out"): { label: str
     numbered && opts.cellNumber !== null ? digits(opts.cellNumber!) : 1,
   );
   const widest = visibleWidth(`Out[${"9".repeat(cellDigits)}]:`);
-  return { label, labelWidth: Math.max(visibleWidth(label), widest) };
+  // Reserve a stable metadata column, including four-digit line counts.
+  return { label, labelWidth: Math.max(12, visibleWidth(label), widest) };
 }
 
 function lineNumberWidthFor(totalLines: number): number {
@@ -473,8 +473,12 @@ function lineNumberWidthFor(totalLines: number): number {
 
 function codeBodyRows(code: string, opts: CellRenderOptions): BodyRow[] {
   const lines = splitBodyLines(code);
-  const highlighted =
-    opts.highlightLines && opts.highlightLines.length === lines.length ? opts.highlightLines : undefined;
+  // The raw renderer removes one trailing blank line; Shiki and retained
+  // streaming snapshots may keep it. Do not discard every color on newline.
+  const highlighted = opts.highlightLines && (
+    opts.highlightLines.length === lines.length ||
+    (opts.highlightLines.length === lines.length + 1 && opts.highlightLines.at(-1)?.replace(/\x1b\[[0-9;]*m/g, "") === "")
+  ) ? opts.highlightLines : undefined;
   return lines.map((line, index) => ({
     text: highlighted ? expandTabs(highlighted[index]!) : line,
     style: "plain",
@@ -490,7 +494,10 @@ function buildBox(
 ): string[] {
   const { label, labelWidth } = gutterLabels(opts, kind);
   const viewport = applyViewport(rows, opts.mode, opts.viewStart, opts.followTail);
-  const cap = opts.mode === "fullscreen" ? FULLSCREEN_VIEWPORT_LINES : NORMAL_VIEWPORT_LINES;
+  const countLabel = `(${rows.length} lines)`;
+  const metadata = rows.length > 7
+    ? countLabel.length <= labelWidth ? [countLabel] : [`(${rows.length}`, "lines)"]
+    : undefined;
   return renderBox({
     label,
     labelWidth,
@@ -504,9 +511,7 @@ function buildBox(
     wholeCellError: extras?.wholeCellError,
     contentError: extras?.contentError,
     showMoreHint: opts.mode === "normal" && !opts.followTail,
-    hiddenAbove: opts.followTail && viewport.hidden > 0
-      ? clamp(opts.viewStart ?? rows.length - cap + 1, 1, rows.length - cap + 1) - 1
-      : undefined,
+    metadata,
   });
 }
 

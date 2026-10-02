@@ -1731,9 +1731,10 @@ Load the bundled pi-subagents skill (skills/pi-subagents/SKILL.md) and read it f
 
 1. Decompose the request into agent-sized units and decide the stages (audit/build/review/synth as appropriate), how many subagents per stage, and what each agent's precise, self-contained task brief is.
 2. Decide termination: linear fan-out vs. a review/fix cycle (gate any cycle on a metadata rounds cap).
-3. Pick the model for each stage and set thinking levels appropriate to the work.
-4. Provision a throwaway kernel with provision_kernel (use a /tmp notebook path unless the user asked for a durable notebook), define the tasks, build the AgentPool, submit, and consume results in completion order in ONE exec_cell cell.
-5. Feed results forward yourself: parse structured results in Python and restate them as prose in the next agent's prompt — never paste raw JSON between agents.
+3. Inherit the configured subagent profile's default model unless the user specifies a model; set thinking levels appropriate to the work.
+4. Provision a durable notebook-backed kernel in the project's .pi/workflows folder. Use three or more cells: first declare prompts, tasks, schemas, working-directory paths, and other constants; then build the AgentPool, submit tasks, consume results in completion order, and route follow-ups in orchestration-only cells; finally close the pool in a separate teardown cell after reviewing the results. Create the opening orchestration cell with write_cell and present it for review before run_cell, rather than using exec_cell or scratch_run to launch it. Only orchestration logic belongs in the reviewable cell; never inline prompts into it.
+5. Set each agent's working directory through Task(cwd=WORKDIR), not instructions in its prompt.
+6. Feed results forward yourself: parse structured results in Python and restate them as prose in the next agent's prompt — never paste raw JSON between agents.
 
 If the request is too small to warrant a workflow (a single agent would do), say so and just do the work directly instead.
 

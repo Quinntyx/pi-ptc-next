@@ -65,11 +65,11 @@ test("exec_cell completed: In[N] box + Out[N] box from the reported execution co
     "exec_cell",
     textResult("42", { userCode: ["x = 6", "x * 7"], cellIdx: 12 }),
   );
-  assert.match(lines[0], /^ {11}┌/);
-  assert.match(lines[1], /^ In\[12\]: {3}│/);
-  // (gutter = "Out[12]:" width 8 + 1 separator; all rows 50 wide)
-  assert.ok(lines.some((line, i) => /^ {11}┌/.test(line) && i > 1), lines.join("\n"));
-  assert.ok(lines.some((line) => /^ Out\[12\]: {2}│/.test(line)), lines.join("\n"));
+  assert.match(lines[0], /^ {14}┌/);
+  assert.match(lines[1], /^ In\[12\]: {6}│/);
+  // Shared metadata gutter keeps all rows 50 columns wide.
+  assert.ok(lines.some((line, i) => /^ {14}┌/.test(line) && i > 1), lines.join("\n"));
+  assert.ok(lines.some((line) => /^ Out\[12\]: {5}│/.test(line)), lines.join("\n"));
   const flat = lines.map(stripAnsi).join("\n");
   assert.ok(flat.includes("x = 6"), flat);
   assert.ok(flat.includes("42"), flat);
@@ -77,7 +77,7 @@ test("exec_cell completed: In[N] box + Out[N] box from the reported execution co
 
 test("exec_cell without a reported count degrades to the empty In[ ] (never invents N)", () => {
   const lines = renderPlain("exec_cell", textResult("ok", { userCode: ["print(1)"] }));
-  assert.match(lines[1], /^ In\[ \]: {4}│/);
+  assert.match(lines[1], /^ In\[ \]: {7}│/);
 });
 
 test("exec_cell error results render the Out box red", () => {
@@ -132,8 +132,8 @@ test("scratch_run: unnumbered In: box + Out: box", () => {
     "scratch_run",
     textResult("7", { userCode: ["3 + 4"], sectioned: true }),
   );
-  assert.match(lines[0], /^ {11}┌/); // blank gutter on the fence row
-  assert.ok(lines.some((line) => /^ Out: {6}│/.test(line)), lines.join("\n"));
+  assert.match(lines[0], /^ {14}┌/); // blank gutter on the fence row
+  assert.ok(lines.some((line) => /^ Out: {9}│/.test(line)), lines.join("\n"));
 });
 
 // ---------------------------------------------------------------------------
@@ -151,8 +151,8 @@ test("write_cell insert: In box only, unexecuted (empty In[ ] gutter)", () => {
       cellSource: "y = 2",
     }),
   );
-  assert.match(lines[0], /^ {11}┌/);
-  assert.match(lines[1], /^ In\[ \]: {4}│/);
+  assert.match(lines[0], /^ {14}┌/);
+  assert.match(lines[1], /^ In\[ \]: {7}│/);
   assert.ok(!lines.some((line) => /^ Out/.test(line)), "no Out box for a write");
   const flat = lines.map(stripAnsi).join("\n");
   assert.ok(flat.includes("y = 2"), flat);
@@ -199,8 +199,8 @@ test("write_cell replace without old source degrades to a fresh-write In box", (
     "write_cell",
     textResult("Wrote code cell at position 2.", { at: 2, replaced: true, cellSource: "z = 9" }),
   );
-  assert.match(lines[0], /^ {11}┌/);
-  assert.match(lines[1], /^ In\[ \]: {4}│/);
+  assert.match(lines[0], /^ {14}┌/);
+  assert.match(lines[1], /^ In\[ \]: {7}│/);
   assert.ok(lines.map(stripAnsi).join("\n").includes("z = 9"));
 });
 
@@ -290,11 +290,11 @@ test("read_cell: In box with the cell's recorded execution count, plus its Out b
       ],
     }),
   );
-  assert.match(lines[0], /^ {11}┌/);
-  assert.match(lines[1], /^ In\[7\]: {4}│/);
-  // gutter = "Out[7]:" width 7 + 1; fences align with the Out box below
-  assert.ok(lines.some((line, i) => /^ {11}┌/.test(line) && i > 2), lines.join("\n"));
-  assert.ok(lines.some((line) => /^ Out\[7\]: {3}│1 │/.test(line)), lines.join("\n"));
+  assert.match(lines[0], /^ {14}┌/);
+  assert.match(lines[1], /^ In\[7\]: {7}│/);
+  // Shared metadata gutter aligns the fences with the Out box below.
+  assert.ok(lines.some((line, i) => /^ {14}┌/.test(line) && i > 2), lines.join("\n"));
+  assert.ok(lines.some((line) => /^ Out\[7\]: {6}│1 │/.test(line)), lines.join("\n"));
 });
 
 test("read_cells: compact muted list, one block per cell", () => {
@@ -368,8 +368,8 @@ test("partial frame: the In box carries the code while streaming, no legacy head
   const flat = lines.map(stripAnsi);
   // The In box renders exactly like the settled one — no separate
   // "Executing Python code" header, no legacy line-marker view.
-  assert.match(flat[0], /^ {11}┌/);
-  assert.match(flat[1], /^ In\[ \]: {4}│/);
+  assert.match(flat[0], /^ {14}┌/);
+  assert.match(flat[1], /^ In\[ \]: {7}│/);
   assert.ok(flat.some((line) => line.includes("b = 2")), flat.join("\n"));
   assert.ok(!flat.some((line) => line.includes("Executing Python code")), flat.join("\n"));
 });
@@ -388,7 +388,7 @@ test("partial frame: live Out box appended below the code view", () => {
   );
   const flat = lines.map(stripAnsi).join("\n");
   assert.ok(flat.includes("... 4 earlier output lines"), flat);
-  assert.match(flat, / Out\[ \]: {3}│1 │ 0/);
+  assert.match(flat, / Out\[ \]: {6}│1 │ 0/);
   assert.ok(flat.includes("│2 │ 1"), flat);
 });
 
