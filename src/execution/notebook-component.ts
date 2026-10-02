@@ -1,5 +1,5 @@
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { FULLSCREEN_VIEWPORT_LINES, type CellRenderOptions } from "./cell-view";
+import { FULLSCREEN_VIEWPORT_LINES, NORMAL_VIEWPORT_LINES, type CellRenderOptions } from "./cell-view";
 import type { NotebookRenderState } from "./notebook-render";
 
 interface ScrollRegion {
@@ -25,8 +25,9 @@ export class NotebookBoxLayout {
     followsTail = false,
     scrollable = true,
   ): string[] {
-    const maximum = Math.max(1, totalLines - FULLSCREEN_VIEWPORT_LINES + 1);
-    const position = this.state.scrollPositions?.[key] ?? options.viewStart ?? 1;
+    const cap = options.mode === "normal" ? NORMAL_VIEWPORT_LINES : FULLSCREEN_VIEWPORT_LINES;
+    const maximum = Math.max(1, totalLines - cap + 1);
+    const position = this.state.scrollPositions?.[key] ?? options.viewStart ?? (followsTail ? maximum : 1);
     const start = Math.max(1, Math.min(maximum, position));
     const lines = render({ ...options, viewStart: start });
     if (scrollable && options.mode === "fullscreen" && maximum > 1) {
@@ -59,7 +60,7 @@ export class NotebookComponent implements Component {
     const region = this.regions.find((box) => event.y >= box.top && event.y < box.bottom);
     if (!region) return undefined;
     const next = Math.max(1, Math.min(region.maximum, region.start + event.wheelDelta));
-    if (next === region.start) return undefined;
+    if (next === region.start) return { handled: true, render: false };
     const positions = this.state.scrollPositions ??= {};
     if (region.followsTail && next === region.maximum) delete positions[region.key];
     else positions[region.key] = next;
@@ -68,5 +69,7 @@ export class NotebookComponent implements Component {
     return { handled: true, render: true };
   }
 
-  invalidate(): void { this.regions = []; }
+  // Keep the last painted hit regions until repaint: host invalidation can occur
+  // between consecutive wheel events, which must not leak into transcript scrolling.
+  invalidate(): void {}
 }

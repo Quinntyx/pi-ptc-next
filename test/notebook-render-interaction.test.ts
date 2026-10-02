@@ -156,7 +156,7 @@ test("fullscreen input and output wheel windows scroll independently and persist
     assert.ok(lines.some((line) => line.includes("output_3")));
     assert.ok(recreated.handleMouse(wheel(0, -100))?.handled);
     recreated.render(55);
-    assert.equal(recreated.handleMouse(wheel(0, -100)), undefined);
+    assert.deepEqual(recreated.handleMouse(wheel(0, -100)), { handled: true, render: false });
     assert.equal(recreated.handleMouse({ ...wheel(2, 1), type: "press", button: "left" }), undefined);
   } finally { setNotebookTuiModeProvider(undefined); }
 });
@@ -170,16 +170,19 @@ test("live output follows the tail, pauses while scrolled up, and resumes at the
     let lines = component.render(80);
     let row = labelRow(lines, "Out[ ]:");
     assert.ok(lines[row].includes("output_12"));
+    assert.ok(lines[row - 2].includes("... 12 lines above ..."));
     component.handleMouse(wheel(row, -4));
     component = frame(details(22), state, true);
     lines = component.render(80);
     row = labelRow(lines, "Out[ ]:");
     assert.ok(lines[row].includes("output_8"));
+    assert.ok(lines[row - 2].includes("... 8 lines above ..."));
     component.handleMouse(wheel(row, 100));
     component = frame(details(24), state, true);
     lines = component.render(80);
     row = labelRow(lines, "Out[ ]:");
     assert.ok(lines[row].includes("output_16"));
+    assert.ok(lines[row - 2].includes("... 16 lines above ..."));
   } finally { setNotebookTuiModeProvider(undefined); }
 });
 
@@ -219,6 +222,78 @@ test("write/read/delete/batch boxes also expose fullscreen scrolling", () => {
 });
 
 
+test("streaming highlights retain colored prefixes while appended tokens wait for Shiki", async () => {
+  const oldCode = "stream_flicker_regression = 123\nprint(stream_flicker_regression";
+  const oldHighlights = await highlightCellCode(oldCode, THEME);
+  const state = {};
+  const context = { state, invalidate: () => {} };
+  renderNotebookCall(oldCode, undefined, THEME, context).render(100);
+  const newCode = oldCode + "_suffix)";
+  const lines = renderNotebookCall(newCode, undefined, THEME, context).render(100);
+  assert.ok(lines.some((line) => line.includes(oldHighlights[0])));
+  assert.ok(lines.some((line) => line.includes("\x1b[0m_suffix)")));
+  assert.ok(lines.map(stripAnsi).some((line) => line.includes("print(stream_flicker_regression_suffix)")));
+  const dark = { ...THEME, colors: { toolSuccessBg: { kind: "rgb", r: 20, g: 20, b: 20 } } };
+  const darkLines = renderNotebookCall(newCode + " # new theme", undefined, dark, context).render(100);
+  assert.ok(!darkLines.some((line) => line.includes("\x1b[38;2;")), "do not retain the previous theme's foreground colors");
+});
+
+test("late older Shiki results cannot replace a newer retained highlight snapshot", async (t) => {
+  const module = require("../dist/execution/code-highlight.js");
+  const pending = [];
+  t.mock.method(module, "highlightCellCode", (code) => new Promise((resolve) => pending.push({ code, resolve })));
+  const state = {};
+  const context = { state, invalidate: () => {} };
+  const first = "out_of_order_shiki_regression = 1";
+  const second = first + "2";
+  renderNotebookCall(first, undefined, THEME, context).render(100);
+  renderNotebookCall(second, undefined, THEME, context).render(100);
+  assert.equal(pending.length, 2);
+  pending[1].resolve(["\x1b[32m" + second + "\x1b[0m"]);
+  await Promise.resolve();
+  pending[0].resolve(["\x1b[31m" + first + "\x1b[0m"]);
+  await Promise.resolve();
+  assert.equal(state.lastHighlights.code, second);
+  assert.ok(state.lastHighlights.lines[0].includes("\x1b[32m"));
+});
+
+test("streaming previews retain the newest lines with an above-box omitted-line count", () => {
+  try {
+    for (const [mode, cap] of [["regular", 7], ["fullscreen", 8]]) {
+      setNotebookTuiModeProvider(() => mode);
+      const state = {};
+      const context = { state };
+      let code = source.slice(0, 11).join("\n");
+      let component = renderNotebookCall(code, undefined, THEME, context);
+      let lines = component.render(80).map(stripAnsi);
+      assert.ok(lines[0].includes(`... ${11 - cap} lines above ...`));
+      assert.ok(lines[1].includes("┌"));
+      assert.ok(lines.some((line) => line.includes("line_10 =")));
+      assert.ok(!lines.some((line) => line.includes("line_0 =")));
+      assert.ok(!lines.some((line) => line.includes("more lines")));
+      code += "\n" + source[11];
+      component = renderNotebookCall(code, undefined, THEME, context);
+      lines = component.render(80).map(stripAnsi);
+      assert.ok(lines[0].includes(`... ${12 - cap} lines above ...`));
+      assert.ok(lines.some((line) => line.includes("line_11 =")));
+      if (mode === "fullscreen") {
+        const row = labelRow(lines, "In[ ]:");
+        assert.ok(component.handleMouse(wheel(row, -2))?.handled);
+        component.invalidate();
+        assert.ok(component.handleMouse(wheel(row, -1))?.handled, "hit regions survive invalidation before repaint");
+        lines = component.render(80).map(stripAnsi);
+        assert.ok(!lines.some((line) => line.includes("line_11 =")));
+        const scrolledRow = labelRow(lines, "In[ ]:");
+        component.handleMouse(wheel(scrolledRow, 100));
+        assert.deepEqual(component.handleMouse(wheel(scrolledRow, 1)), { handled: true, render: false });
+        code += "\n" + source[12];
+        lines = renderNotebookCall(code, undefined, THEME, context).render(80).map(stripAnsi);
+        assert.ok(lines.some((line) => line.includes("line_12 =")), "returning to the bottom resumes tail-following");
+      }
+    }
+  } finally { setNotebookTuiModeProvider(undefined); }
+});
+
 test("real Pi tool shell replaces its call preview and routes fullscreen wheel events into the box", async () => {
   const { initTheme, ToolExecutionComponent } = await import("@earendil-works/pi-coding-agent");
   initTheme("light", false);
@@ -238,15 +313,17 @@ test("real Pi tool shell replaces its call preview and routes fullscreen wheel e
     host.updateResult(result({ userCode: source, liveOutput: output.slice(0, 12) }), true);
     let lines = host.render(80).map(stripAnsi);
     assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1);
-    assert.ok(host.handleMouse(wheel(labelRow(lines, "In[ ]:"), 4))?.handled);
+    const inputRow = labelRow(lines, "In[ ]:");
+    assert.ok(host.handleMouse(wheel(inputRow, 4))?.handled);
+    assert.ok(host.handleMouse(wheel(inputRow, 2))?.handled, "a second event before repaint must not scroll the transcript");
     lines = host.render(80).map(stripAnsi);
-    assert.ok(lines.some((line) => line.includes("line_4 =")));
+    assert.ok(lines.some((line) => line.includes("line_6 =")));
     host.updateResult(result({ userCode: source, cellIdx: 43 }, output.join("\n")), false);
     lines = host.render(80).map(stripAnsi);
     assert.equal(lines.filter((line) => /^ In/.test(line)).length, 1);
     assert.ok(lines.some((line) => /^ In\[43\]:/.test(line)));
     assert.ok(!lines.some((line) => /^ In\[ \]:/.test(line)));
-    assert.ok(lines.some((line) => line.includes("line_4 =")));
+    assert.ok(lines.some((line) => line.includes("line_6 =")));
     assert.ok(redraws > 0);
   } finally { setNotebookTuiModeProvider(undefined); }
 });

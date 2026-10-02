@@ -153,6 +153,25 @@ test("expanded mode draws the full text regardless of length", () => {
   assert.ok(!lines.some((l) => l.includes("more lines")));
 });
 
+test("tail viewports put omitted-line counts above the fence and keep expanded cells complete", () => {
+  const code = Array.from({ length: 11 }, (_, i) => `tail_${i} = ${i}`).join("\n");
+  for (const [mode, hidden] of [["normal", 4], ["fullscreen", 3]]) {
+    const lines = renderInCell(code, { width: 80, mode, followTail: true });
+    assert.ok(lines[0].includes(`... ${hidden} lines above ...`));
+    assert.ok(lines[1].includes("┌"));
+    assert.ok(lines.some((line) => line.includes("tail_10 =")));
+    assert.ok(!lines.some((line) => line.includes("tail_0 =")));
+    assert.ok(!lines.some((line) => line.includes("more lines")));
+    assert.ok(lines.every((line) => visibleWidth(line) <= 80));
+    const narrow = renderInCell(code, { width: 20, mode, followTail: true });
+    assert.ok(narrow.every((line) => visibleWidth(line) <= 20));
+  }
+  const expanded = renderInCell(code, { width: 80, mode: "expanded", followTail: true });
+  assert.ok(!expanded.some((line) => line.includes("lines above")));
+  assert.ok(expanded.some((line) => line.includes("tail_0 =")));
+  assert.ok(expanded.some((line) => line.includes("tail_10 =")));
+});
+
 test("applyViewport is the shared slicing primitive behind the rules", () => {
   const rows = codeOf(10).split("\n").map((text, i) => ({ text, num: i + 1 }));
   assert.equal(applyViewport(rows, "expanded").rows.length, 10);

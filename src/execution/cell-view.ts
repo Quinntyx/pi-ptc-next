@@ -76,6 +76,8 @@ export interface CellRenderOptions {
    * FULLSCREEN_VIEWPORT_LINES lines; ignored otherwise.
    */
   viewStart?: number;
+  /** Stream the newest lines and show omitted-line counts above the box. */
+  followTail?: boolean;
   /**
    * Pre-highlighted body content, one entry per body line, with the SAME
    * visible text as the plain lines. Synchronous shiki output goes here.
@@ -303,6 +305,8 @@ interface BoxSpec {
   contentError?: boolean;
   /** Show the `... N more lines >...` hint below the box (collapsed normal mode only). */
   showMoreHint?: boolean;
+  /** Tail windows keep a stable hint row above the fence, even when scrolled to the top. */
+  hiddenAbove?: number;
 }
 
 const FENCE_TOP_LEFT = "┌";
@@ -357,6 +361,9 @@ function renderBox(spec: BoxSpec): string[] {
     gutterText(left + HORIZONTAL.repeat(interior) + right);
 
   const lines: string[] = [];
+  if (spec.hiddenAbove !== undefined) {
+    lines.push(truncateVisible(" ".repeat(prefixWidth) + applyStyle(`... ${spec.hiddenAbove} lines above ...`, "muted", theme), width));
+  }
   // The label does not sit on the fence row: it is pushed down one line so it
   // aligns with the box's upper-left corner — the first character of the first
   // content row.
@@ -425,12 +432,13 @@ export function applyViewport(
   rows: BodyRow[],
   mode: ViewportMode,
   viewStart?: number,
+  followTail = false,
 ): ViewportResult {
   if (mode === "expanded") return { rows, hidden: 0 };
   const cap = mode === "fullscreen" ? FULLSCREEN_VIEWPORT_LINES : NORMAL_VIEWPORT_LINES;
   if (rows.length <= cap) return { rows, hidden: 0 };
-  if (mode === "fullscreen") {
-    const start = clamp(viewStart ?? 1, 1, rows.length - cap + 1);
+  if (mode === "fullscreen" || followTail) {
+    const start = clamp(viewStart ?? (followTail ? rows.length - cap + 1 : 1), 1, rows.length - cap + 1);
     return { rows: rows.slice(start - 1, start - 1 + cap), hidden: rows.length - cap };
   }
   return { rows: rows.slice(0, cap), hidden: rows.length - cap };
@@ -481,7 +489,8 @@ function buildBox(
   extras?: { lineNumberWidth?: number; wholeCellError?: boolean; contentError?: boolean; showLineNumbers?: boolean },
 ): string[] {
   const { label, labelWidth } = gutterLabels(opts, kind);
-  const viewport = applyViewport(rows, opts.mode, opts.viewStart);
+  const viewport = applyViewport(rows, opts.mode, opts.viewStart, opts.followTail);
+  const cap = opts.mode === "fullscreen" ? FULLSCREEN_VIEWPORT_LINES : NORMAL_VIEWPORT_LINES;
   return renderBox({
     label,
     labelWidth,
@@ -494,9 +503,10 @@ function buildBox(
     theme: opts.theme,
     wholeCellError: extras?.wholeCellError,
     contentError: extras?.contentError,
-    // The scrollable fullscreen box moves through the body via `viewStart`
-    // instead of the hint; only the non-fullscreen collapsed view gets one.
-    showMoreHint: opts.mode === "normal",
+    showMoreHint: opts.mode === "normal" && !opts.followTail,
+    hiddenAbove: opts.followTail && viewport.hidden > 0
+      ? clamp(opts.viewStart ?? rows.length - cap + 1, 1, rows.length - cap + 1) - 1
+      : undefined,
   });
 }
 

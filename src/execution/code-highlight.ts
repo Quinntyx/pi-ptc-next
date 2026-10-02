@@ -49,6 +49,35 @@ export function cachedCellHighlights(code: string, theme?: Theme): string[] | un
   return highlights.get(cellHighlightKey(code, theme));
 }
 
+/** Keep colors on the unchanged source prefix while a newer Shiki result is pending. */
+export function reuseCellHighlights(code: string, previousCode: string, previous: string[]): string[] {
+  let common = 0;
+  while (common < code.length && common < previousCode.length && code[common] === previousCode[common]) common++;
+  // Never preserve half of a changed surrogate pair.
+  if (common > 0 && /[\uD800-\uDBFF]/.test(code[common - 1]!)) common--;
+  const previousLines = previousCode.split("\n");
+  return code.split("\n").map((line, index) => {
+    const keep = Math.max(0, Math.min(line.length, common));
+    common = Math.max(0, common - line.length - 1);
+    const old = previous[index];
+    if (!keep || old === undefined) return line;
+    if (keep === line.length && line === previousLines[index]) return old;
+    let prefix = "";
+    let length = 0;
+    for (const match of old.matchAll(/\x1b\[[0-9;]*m|[^\n]/gu)) {
+      const part = match[0];
+      if (part.startsWith("\x1b[")) prefix += part;
+      else {
+        if (length + part.length > keep) break;
+        prefix += part;
+        length += part.length;
+      }
+      if (length >= keep) break;
+    }
+    return prefix + "\x1b[0m" + line.slice(keep);
+  });
+}
+
 function getHighlighter(name: string): Promise<Highlighter | null> {
   let promise = highlighters.get(name);
   if (!promise) {

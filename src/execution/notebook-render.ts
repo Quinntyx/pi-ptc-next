@@ -23,7 +23,7 @@
 
 import { Text, type Component } from "@earendil-works/pi-tui";
 import { NotebookComponent } from "./notebook-component";
-import { cachedCellHighlights, cellHighlightKey, highlightCellCode } from "./code-highlight";
+import { cachedCellHighlights, cellHighlightKey, highlightCellCode, reuseCellHighlights } from "./code-highlight";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { parseSectionedOutput } from "../utils";
 import {
@@ -63,6 +63,8 @@ export interface NotebookRenderState {
   callCode?: string;
   highlights?: Map<string, string[] | null>;
   pendingHighlights?: Set<string>;
+  highlightRevision?: number;
+  lastHighlights?: { code: string; themeKey: string; lines: string[]; revision: number };
 }
 
 /** Structural view of pi's ToolRenderResultOptions. */
@@ -152,21 +154,35 @@ function renderHighlights(
   redraw?: () => void,
 ): string[] | undefined {
   const key = cellHighlightKey(code, theme);
+  const themeKey = cellHighlightKey("", theme);
+  const remember = (lines: string[], revision: number): void => {
+    if (revision >= (state.lastHighlights?.revision ?? -1)) {
+      state.lastHighlights = { code, themeKey, lines, revision };
+    }
+  };
   const cached = cachedCellHighlights(code, theme) ?? state.highlights?.get(key);
-  if (cached !== undefined) return cached ?? undefined;
-  if (!redraw) return supplied;
-  const pending = state.pendingHighlights ??= new Set();
-  if (!pending.has(key)) {
-    pending.add(key);
-    void highlightCellCode(code, theme).then((lines) => {
-      pending.delete(key);
-      const highlights = state.highlights ??= new Map();
-      if (highlights.size >= 8) highlights.clear();
-      highlights.set(key, lines);
-      redraw();
-    });
+  const ready = cached ?? supplied;
+  if (ready) {
+    remember(ready, state.highlightRevision = (state.highlightRevision ?? 0) + 1);
+    return ready;
   }
-  return undefined;
+  if (redraw && cached !== null) {
+    const pending = state.pendingHighlights ??= new Set();
+    if (!pending.has(key)) {
+      pending.add(key);
+      const revision = state.highlightRevision = (state.highlightRevision ?? 0) + 1;
+      void highlightCellCode(code, theme).then((lines) => {
+        pending.delete(key);
+        const highlights = state.highlights ??= new Map();
+        if (highlights.size >= 8) highlights.clear();
+        highlights.set(key, lines);
+        if (lines) remember(lines, revision);
+        redraw();
+      });
+    }
+  }
+  const previous = state.lastHighlights;
+  return previous?.themeKey === themeKey ? reuseCellHighlights(code, previous.code, previous.lines) : undefined;
 }
 function resultText(result: NotebookToolResult): string {
   return result.content
@@ -295,7 +311,7 @@ function renderExecutingFrame(
     // Retain the live tail in regular mode; fullscreen additionally allows
     // independent wheel scrolling, suspended while the user inspects history.
     lines.push(...layout.box("output", total, {
-      ...opts, mode: expanded ? "expanded" : "fullscreen",
+      ...opts, mode: expanded ? "expanded" : "fullscreen", followTail: true,
       viewStart: Math.max(1, total - FULLSCREEN_VIEWPORT_LINES + 1),
     }, (options) => renderOutCell(liveText, options), lines.length, true, mode === "fullscreen"));
     return lines;
@@ -323,11 +339,12 @@ export function renderNotebookCall(
     return layout.box("input", bodyLineCount(source), {
       width: options?.width ?? width,
       mode: currentViewportMode(false),
+      followTail: true,
       cellNumber: null,
       theme,
       labelBackground: "toolPendingBg",
       highlightLines: renderHighlights(source, undefined, theme, state, context?.invalidate),
-    }, (opts) => renderInCell(source, opts));
+    }, (opts) => renderInCell(source, opts), 0, true);
   }, state, context?.invalidate);
 }
 // Completed frames, per op

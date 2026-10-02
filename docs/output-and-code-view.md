@@ -43,16 +43,16 @@ Every executed cell is appended to the kernel's `.ipynb`, and the full (uncollap
 The input and output fences align across one-, two-, and three-digit counts. Labels sit one column in from the transcript edge. The normal pending/success/error tool-call background covers every row across the full box width; ANSI resets in highlighted code or output restore that background. Counts beyond 999 grow the gutter safely rather than overflowing it.
 
 - **Regular, collapsed:** seven body lines and a below-box `... N more lines >...` hint. The terminal owns transcript scrollback.
-- **Fullscreen, collapsed:** eight body lines per box. Mouse-wheel events over a box scroll its own window; input and output positions are independent and survive redraws, streamed updates, and resizing. At the window boundary, wheel events fall through to transcript scrolling.
+- **Fullscreen, collapsed:** eight body lines per box. Mouse-wheel events over a box scroll its own window; input and output positions are independent and survive redraws, streamed updates, and resizing. Wheel events remain inside the box, including at either window boundary and between redraws; they never simultaneously scroll the transcript.
 - **Expanded (`ctrl+o`, or click a completed tool):** show the full cell, with no inner scrolling.
 
-Live output follows its newest lines. Scrolling upward in fullscreen pauses tail-following; returning to the bottom resumes it. A capture-limit notice appears above the output when earlier streamed lines are no longer available.
+Streaming argument previews and live output follow their newest lines, with a `... N lines above ...` count above the box instead of a below-box hint. The line currently being written stays visible. Scrolling upward in fullscreen pauses tail-following; returning to the bottom resumes it. A capture-limit notice appears above the output when earlier streamed lines are no longer available.
 
 ### Syntax highlighting
 
 `src/execution/code-highlight.ts` is shared by argument previews, streaming/finished input boxes, code reads/writes, and the approval popup. It selects GitHub Light or GitHub Dark from the main tool-pane background luma (using the active theme's resolved background color, including terminal defaults), with `PTC_CODE_THEME` as an explicit override. Cached highlights include the theme in their key, so light/dark changes do not reuse stale colors.
 
-Highlighting runs asynchronously and requests a redraw when ready. Geometry always comes from the raw source: the color update never changes row counts, truncation, or fence columns. A failed highlighter leaves readable plain code. The contrast guard retains dark ink on light backgrounds and replaces washed-out colors instead of replacing readable dark colors.
+Highlighting runs asynchronously and requests a redraw when ready. While newer tokens wait for Shiki, the unchanged source prefix retains its last-known colors and only new or edited text uses plain ink. Older asynchronous results cannot replace a newer highlight snapshot, and theme changes never reuse the previous theme's colors. Geometry always comes from the raw source: the color update never changes row counts, truncation, or fence columns. A failed highlighter leaves readable plain code. The contrast guard retains dark ink on light backgrounds and replaces washed-out colors instead of replacing readable dark colors.
 
 ### The approval popup (`confirm: true`)
 

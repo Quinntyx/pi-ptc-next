@@ -5,6 +5,7 @@ const {
   cellHighlightKey,
   highlightCellCode,
   resolveShikiThemeName,
+  reuseCellHighlights,
 } = require("../dist/execution/code-highlight.js");
 
 function theme(rgb) {
@@ -18,6 +19,17 @@ function theme(rgb) {
 }
 const LIGHT = theme({ r: 250, g: 250, b: 235 });
 const DARK = theme({ r: 20, g: 20, b: 25 });
+test("retained highlights color only the unchanged prefix, including partial and shortened lines", () => {
+  const red = (text) => "\x1b[31m" + text + "\x1b[0m";
+  assert.deepEqual(reuseCellHighlights("abcDEF", "abc", [red("abc")]), [red("abc") + "DEF"]);
+  assert.deepEqual(reuseCellHighlights("abX", "abc", [red("abc")]), [red("ab") + "X"]);
+  assert.deepEqual(reuseCellHighlights("ab", "abc", [red("abc")]), [red("ab")]);
+  assert.deepEqual(reuseCellHighlights("abc\nnew", "abc", [red("abc")]), [red("abc"), "new"]);
+  assert.deepEqual(reuseCellHighlights("new", "old", [red("old")]), ["new"]);
+  assert.deepEqual(reuseCellHighlights("🦊y", "🦊", [red("🦊")]), [red("🦊") + "y"]);
+  assert.deepEqual(reuseCellHighlights("🦊", "🦁", [red("🦁")]), ["🦊"]);
+});
+
 const stripAnsi = (text) => text.replace(/\x1b\[[0-9;]*m/g, "");
 
 test("Shiki follows main tool-pane luma, not selectedBg, text, or theme name", () => {
