@@ -34,7 +34,7 @@ Supporting tools cover discovery (`list_kernels`, `inspect_kernel`), paging thro
 
 ### Execution tools
 
-- **`exec_cell`** runs one new cell and appends it to the notebook. It takes exactly one of `code` or `file`; `file` executes a `.py` inside the kernel with IPython `%run` semantics (definitions land in the namespace, tracebacks map to the real file path). `confirm: true` opens an approval popup first.
+- **`exec_cell`** runs one new cell and appends it to the notebook. It takes exactly one of `code` or `file`; `file` executes a `.py` inside the kernel with IPython `%run` semantics (definitions land in the namespace, tracebacks map to the real file path). Use `request_cell_review` separately when the operation needs user review.
 - **`scratch_run`** executes code that mutates the namespace but records **no** cell: nothing is appended to the notebook (the file is not even created if it did not exist). Use it for exploration and setup that should not become part of the artifact.
 - **`run_cell(n)`** executes the code cell at position `n` and replaces that cell's stored outputs in place (execution-order numbering).
 - **`run_to(n)`** executes code cells `1..n` in notebook order; **`run_all`** executes every code cell in order. Both stop at the first error, update each cell's outputs, and report a per-cell status list. Markdown cells are skipped.
@@ -106,7 +106,7 @@ All settings are environment-based (`loadSettingsFromEnv`, `src/utils.ts`); ther
 | `PTC_MAX_PARALLEL_TOOL_CALLS` | `8` | Default parallelism of the in-kernel `ptc.gather_limit` helper for nested tool calls. |
 | `PTC_LIBRARY_DIR` | `~/.pi/agent/pycells-library` (or `$PI_CODING_AGENT_DIR/pycells-library`) | Library directory for `source` bare-name resolution and `promote_to_skill_notebook` (`src/python-session-manager.ts`). |
 | `PTC_MAX_PYTHON_SESSIONS` | `4` | Parsed but **not enforced** — provisioning never rejects; vestigial. |
-| `PTC_CODE_THEME` | `github-dark` | Shiki theme for the `confirm: true` cell-approval popup. |
+| `PTC_CODE_THEME` | `github-dark` | Shiki theme override for cell boxes and standalone cell review. |
 | `PTC_PYTHON_EXECUTABLE` | venv at `~/.cache/pi-pycells/python-env`, else `python3` | Interpreter used for kernels and for `provision_dependency` installs (`src/sandbox-manager.ts`). |
 | `PTC_DEBUG` | `false` | Debug logging to stdout. |
 

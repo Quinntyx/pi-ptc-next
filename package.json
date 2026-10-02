@@ -30,6 +30,7 @@
   ],
   "pi": {
     "extensions": [
+      "./node_modules/pi-activity/extensions/index.ts",
       "./node_modules/pi-sock/index.ts",
       "./src/index.ts"
     ],
@@ -58,10 +59,12 @@
     "@sinclair/typebox": "*"
   },
   "dependencies": {
+    "pi-activity": "https://git.quinntyx.dev/quinntyx/pi-activity/archive/843db3a9248616715a4f4b9b33c19eb70518118e.tar.gz",
     "pi-sock": "https://codeload.github.com/Quinntyx/pi-sock/tar.gz/aa842bcfbd178667b9b359ca4411aa879480ff0f",
     "shiki": "^4.4.3"
   },
   "bundledDependencies": [
+    "pi-activity",
     "pi-sock"
   ],
   "devDependencies": {

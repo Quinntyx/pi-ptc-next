@@ -12,6 +12,7 @@ export type PtcCaller = "direct" | "code_execution";
 export const PTC_TOOL_NAMES = [
   "provision_kernel",
   "exec_cell",
+  "request_cell_review",
   "list_kernels",
   "inspect_kernel",
   "provision_dependency",

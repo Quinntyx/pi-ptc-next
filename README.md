@@ -65,6 +65,7 @@ Use ordinary Python libraries inside cells. For example, `pathlib` handles files
 | `write_cell` | Add or replace a code or markdown cell without executing it. Replacing a cell clears its stored outputs. |
 | `run_cell` | Execute an existing code cell and refresh its outputs. The usual loop is **write one cell, run one cell**. |
 | `exec_cell` | Execute proven code and append it as a new cell; also accepts a Python file. |
+| `request_cell_review` | Preview code, a file, or a saved cell for user review without executing it. |
 | `read_cells` / `read_cell` / `delete_cell` | Inspect and curate the notebook document. |
 | `reset_kernel` | Restart the interpreter with an empty namespace, leaving the notebook intact. |
 | `run_to` / `run_all` | Execute through a chosen position or the whole notebook, stopping at the first error. |
@@ -81,7 +82,7 @@ Every recorded execution updates the standard `.ipynb` on disk, including output
 - Syntax-highlighted **In** boxes and numbered **Out** boxes render cells in the terminal.
 - Live output streams below the executing cell; long output shows a preview while the full result stays in the notebook.
 - Rich display output, including images, is captured in the notebook.
-- `exec_cell(confirm: true)` asks for approval before executing. **Esc** interrupts a running cell without disposing the kernel.
+- `request_cell_review` asks the user to review an operation; execution is a separate call. **Esc** interrupts a running cell without disposing the kernel.
 
 More: [kernels and document operations](docs/kernels.md).
 
@@ -108,25 +109,35 @@ pi
 
 The positive value caps concurrency and enables background provisioning of `pi_subagents` into the shared Python environment. Without it, notebook work still functions and no subagent module is downloaded.
 
-Cells can import `pi_subagents`, create an `AgentPool`, submit tasks to stages, and collect results in completion order. Each agent is a real Pi instance in a tmux window, visible and steerable while it works. Keep setup/submission, result collection, and teardown in separate cells, and always finish with `pool.close()` to dispose the agent windows and report the pool summary. Check failed results rather than silently ignoring them.
+Cells can import `pi_subagents`, create an `AgentPool`, submit tasks to stages, and collect results in completion order. Each agent is a real Pi instance in a tmux window, visible and steerable while it works. Keep constants/prompts, task construction/data flow, and teardown in separate recorded cells. Failures raise at handle waits or `pool.pop()`; inspect the surviving pool before continuing. A dedicated `pool.close()` cell disposes the agent windows and reports the pool summary.
 
 ### Default configuration
 
-Agents share your current Pi configuration by default, including the pi-sock extension installed with pi-pycells. No separate pi-sock installation is needed in this case. If this configuration already loads a standalone copy of pi-sock, disable that copy with `pi config` to avoid loading the extension twice; keep the copy supplied by pi-pycells enabled.
+Agents share your current Pi configuration by default. Installing pi-pycells also installs and loads **pi-sock** (agent communication) and **pi-activity** (activity tracking API). No separate installation is needed in this case, and **pi-tool-tree is not required**. If your configuration already loads standalone copies of these extensions, disable those copies with `pi config` to avoid duplicate loading; keep the copies supplied by pi-pycells enabled.
 
 ### Separate subagents configuration
 
-Set `PI_CODING_SUBAGENT_DIR` to a separate Pi agent directory for a leaner extension set or a different default model. **That configuration must also load pi-sock**: installing pi-pycells in the main configuration does not install extensions into a separate profile. For an existing standalone subagents configuration, install pi-sock there:
+Set `PI_CODING_SUBAGENT_DIR` to a separate Pi agent directory for a leaner extension set or a different default model. **That configuration must load pi-sock and pi-activity** to provide agent communication and activity snapshots: installing pi-pycells in the main configuration does not install extensions into a separate profile. For an existing standalone subagents configuration, install both there:
 
 ```bash
 # Replace this path with your subagents profile's Pi agent directory.
 PI_CODING_AGENT_DIR=/path/to/subagents pi install git:github.com/Quinntyx/pi-sock
+PI_CODING_AGENT_DIR=/path/to/subagents pi install git:git.quinntyx.dev/quinntyx/pi-activity
 export PI_CODING_SUBAGENT_DIR=/path/to/subagents
 ```
 
-If pi-pycells is installed in that configuration too, it already supplies pi-sock; you do not need the separate install. Make sure the selected configuration has working model credentials. Unless you explicitly select a model, agents use that configuration's default; [pi-profiles](https://github.com/chaychoong/pi-profiles) can manage these directories but is not required.
+If pi-pycells is installed in that configuration too, it already supplies both extensions; you do not need the separate installs. Make sure the selected configuration has working model credentials. Unless you explicitly select a model, agents use that configuration's default; [pi-profiles](https://github.com/chaychoong/pi-profiles) can manage these directories but is not required.
 
-[pi-activity](https://git.quinntyx.dev/quinntyx/pi-activity) optionally supplies live activity labels. Load it before pi-pycells. It is not required for notebooks or subagent execution.
+### Activity API
+
+[pi-activity](https://git.quinntyx.dev/quinntyx/pi-activity) is a bundled, API-only dependency: it does not replace Pi's renderers. Pi-pycells loads it before registering its tools. Other extensions can query the stable API directly:
+
+```js
+const activity = globalThis[Symbol.for("pi-activity:api")];
+const snapshot = activity?.getActivity();
+```
+
+For a subagent, `handle.activity()` retrieves its activity snapshot through pi-sock. Activity snapshots expose the current phase, label, running calls, and timing data. Label assignment is owned by pi-activity and may evolve; consumers should use the API rather than infer activities from tool names, prose, or rendering. See the [activity API reference](https://git.quinntyx.dev/quinntyx/pi-activity/src/branch/main/API.md).
 
 More: [subagent setup](docs/subagents.md) and the bundled [pi-subagents skill](skills/pi-subagents/SKILL.md).
 

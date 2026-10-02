@@ -266,6 +266,7 @@ test("ptc extension bootstraps session tools, the /ptc command, and cleans up ru
         "read_cell",
         "read_cell_output",
         "read_cells",
+        "request_cell_review",
         "reset_kernel",
         "run_all",
         "run_cell",

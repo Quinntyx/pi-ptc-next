@@ -25,55 +25,46 @@ Syncs are throttled by a stamp file, `<extensionRoot>/.ptc-subagents-sync.json`,
 
 ## Usage
 
-Orchestration lives in `exec_cell` cells. A whole workflow is normally one cell (top-level `await` is available; never `asyncio.run`):
-
-```python
-import pi_subagents as subagents   # also autoimported as `subagents`
-
-pool = subagents.AgentPool(concurrency=8, name="migration")
-build  = pool.stage("build",  slots=4)   # slots are soft priority reservations;
-review = pool.stage("review", slots=4)   # idle slots are borrowed; names unique per pool
-
-# Tasks are immutable specs; metadata always carries an integer "rounds" (roots = 0).
-hs = build.submit_all([
-    subagents.Task(f"Migrate module {m}", name=f"build-{m}",
-                   model="provider/model", thinking="high",
-                   schema={"type": "object", "required": ["ok"],
-                           "properties": {"ok": {"type": "boolean"}}},
-                   metadata={"file": m, "rounds": 0})
-    for m in ("auth.py", "api.py")
-])
-
-# Consume in completion order; None = quiescent (pool stays usable for follow-ups).
-while (result := await pool.pop(timeout=600)) is not None:
-    if result.stage is build and result.ok:
-        verdict_src = result.unwrap()          # schema-obeying dict
-        problems = "\n".join(f"- {p['file']}: {p['issue']}" for p in verdict_src["issues"])
-        review.submit(subagents.Task(
-            f"The build agent finished and reported these problems:\n{problems}\n"
-            f"Review each fix in the working tree."), parent=result)
-    elif result.stage is review:
-        verdict = result.unwrap()              # body, or raises the stored error
-        rounds = result.task.metadata["rounds"]
-        if not verdict["ok"] and rounds < 5:   # REQUIRED: gate cyclic workflows,
-            build.submit(subagents.Task("Fix it", metadata={"rounds": rounds + 1}),
-                         parent=result)        # or pop()=None never ends the loop
-
-summary = pool.close()   # the ONLY teardown: kills every window, invalidates
-                         # handles, echoes the PoolSummary report
-```
+Read the bundled [pi-subagents skill](../skills/pi-subagents/SKILL.md), including
+its [three-cell API example](../skills/pi-subagents/SKILL.md#api). A workflow
+uses separate recorded cells for constants, task construction and data flow,
+and teardown. Author the workflow with `write_cell`, submit it to
+`request_cell_review`, and execute it with `run_cell` after approval. There is
+no review flag on execution; ordinary repairs within approved scope do not
+need another review.
 
 Key semantics:
 
-- **Results** carry `task`, `stage`, `handle`, `body`, `error`, `status` (`settled`/`failed`/`cancelled`), `duration_ms`, `parent`, `ok`, `unwrap()`, and `session` (`tool_calls`, `thinking`, `prose`, `trajectory()`). Failures arrive as results with `ok=False`; only pop timeouts raise (`AgentPoolTimeoutError` with `.pool`/`.snapshot()`, leaving the pool intact).
-- **Handles**: `await h` / `h.wait(timeout)`, `h.cancel()`, `h.send(text)` (steers the running turn only), and `h.state()` / `h.activity()` / `h.agent_state()` for inspection.
-- **Session reuse**: continue a settled session with `stage.submit(new_task, session_handle=h)` — same tmux window, new handle. Omitted `model`/`thinking`/`cwd`/`profile` are inherited from the prior session; explicit conflicts raise `SessionReuseError`; `session_name="..."` renames the live session.
-- **Lifecycle sugar**: `with subagents.AgentPool(...) as pool:` auto-closes on clean exit (report at `pool.last_summary`) but deliberately leaves the pool alive on exception so you can inspect and resume in a follow-up cell.
-- **Model selection**: `subagents.best_model_match("flash")` resolves one pick (exact slug > profile default provider > first-party > proxied); `model_slugs` / `resolve_models` / `list_models` give full rows. The catalog expires after `PI_SUBAGENTS_CATALOG_TTL` (default 120 s); `list_models(refresh=True)` forces a re-read.
-- **Prompt hygiene**: never f-string raw JSON (`result.body`) into a follow-up prompt — subagent prompts are user-observable in tmux windows. Parse in Python and restate in prose (as above).
-- **Timeouts**: set explicit `Task.timeout` for models that can fail at the provider; an errored turn may otherwise sit out the default 30-minute settle timeout.
+- **Successful results:** `task`, `stage`, `handle`, `body`, `status`,
+  `duration_ms`, and `parent`. Schema-task bodies are validated Python dicts;
+  use their fields directly, without manual JSON parsing or `.unwrap()`.
+- **Failures:** handle waits raise the underlying exception; `pool.pop()`
+  raises `AgentPoolFailureError`, with the failed task in `.result` and the
+  original exception as its cause. There is no `fail_fast` option or `ok` flag.
+  Catch only expected failures for individual agents, not the whole workflow.
+- **Invalid structured output:** the library sends the actual parse/schema
+  error back for up to three repair follow-ups. Exhaustion raises
+  `SchemaValidationError`; invalid JSON is not returned as a successful body.
+- **Inspection:** `handle.state()`, `handle.agent_state()`, and the cached
+  `handle.activity` snapshot. Fetch a live activity snapshot with
+  `handle.get_activity()` or `await handle.get_activity_async()`.
+- **Session reuse:** set `Task.resume_from` to a prior result or handle. The
+  retained session receives a new turn; conflicting configuration raises
+  `SessionReuseError`. Use `Task.cwd`, not a directory instruction in a prompt.
+- **Lifecycle:** `pool.pop()` returning `None` means quiescent, not closed.
+  Inspect results before a dedicated teardown cell calls synchronous
+  `pool.close()`. Exceptions and pop timeouts leave the pool alive for a later
+  cell. Avoid resetting or killing the interpreter while agents are active.
+- **Model selection:** inherit the configured profile default unless the user
+  names a model. Resolve named models with the library's catalog helpers.
+- **Follow-ups:** turn dictionary fields into readable findings and actions,
+  never a raw JSON/dictionary dump in the next agent's prompt.
+- **Timeouts:** set explicit task budgets; unavailable providers may otherwise
+  wait out the default 30-minute settle timeout.
 
-For long or destructive workflows, put the entire declared workflow in one cell and set `confirm=true` so the user approves the full plan up front, then it runs autonomously. Interrupts (Esc, `/ptc interrupt`) stop the cell — not the pool; resume with `pool.pop()` in the next cell. Avoid `/ptc kill` mid-workflow: it drops the interpreter and orphans running windows.
+Activities come from pi-activity's stable API, relayed by pi-sock. No
+pi-tool-tree renderer is required. Activity label-assignment rules belong to
+pi-activity and can evolve independently of this API.
 
 ## Options / Configuration
 
@@ -130,7 +121,7 @@ The Python module is provisioned separately from the Pi extensions. Relevant def
 
 - **Source URL.** `PTC_SUBAGENTS_REPO_URL` defaults to the public GitHub mirror (`https://github.com/Quinntyx/pi-subagents`) and works anonymously. Point it at your own fork if you maintain one: `export PTC_SUBAGENTS_REPO_URL=https://github.com/<you>/pi-subagents`. The provisioner shells out to plain `git`, so the URL must be reachable by your credential helper.
 - **Author-specific dev-checkout path.** `PTC_SUBAGENTS_SOURCE` defaults to `~/docs/src/pi-subagents` (joined from your homedir, `src/subagents-env.ts:50`). If you don't have that directory nothing breaks — resolution falls through to the managed clone — but set `PTC_SUBAGENTS_SOURCE` if you keep a checkout elsewhere.
-- **tmux and pi-sock are required for subagents.** `pi_subagents` warns at import when not running under tmux (its API then raises `NotImplementedError`). pi-pycells supplies pi-sock in its own configuration; a standalone subagents profile must load it separately as described above. Existing extensions (optionally pi-activity) and auth carry over only when agents share the orchestrator's configuration.
+- **tmux and pi-sock are required for subagents.** `pi_subagents` warns at import when not running under tmux (its API then raises `NotImplementedError`). pi-pycells bundles and loads pi-sock and the API-only pi-activity extension in its own configuration. A standalone subagents profile must load both separately, as described above. Extensions and auth carry over only when agents share the orchestrator's configuration.
 - **`pi_subagents` is not on PyPI / npm.** It is fetched from git at sync time. Without network access to a valid repo, provisioning fails (stamped, and logged to `~/.cache/pi-pycells/subagents-sync.log`); a previous working checkout or dev source keeps working. You can also supply any checkout via `PTC_SUBAGENTS_SOURCE` — it must contain a `pyproject.toml` at its root or under a `main/` subdirectory.
 - **Machine cache layout.** The venv (`python-env/`), managed clone (`pi-subagents/`), sync log, and lock file all live under `~/.cache/pi-pycells/` (non-configurable in code). The venv is used for *all* PTC kernels, even if you never use subagents; delete it if you want kernels on a different interpreter.
 - **`uv` and `git` assumed.** `uv` is preferred for venv creation and editable installs (falls back to `python3 -m venv` / `pip`); `git` is required for the managed-clone path.

@@ -28,6 +28,7 @@ import {
 import { createSandbox } from "./sandbox-manager";
 import { ensurePtcVenv, resolvePiSubagentsSource, startSubagentsEnv } from "./subagents-env";
 import { describePythonHelpers } from "./tools/python-tool-contract";
+import { createCellReviewTool } from "./tools/cell-review";
 import { ToolRegistry } from "./tool-registry";
 import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
 import type { SubagentRuntimeSnapshot } from "./contracts/execution-types";
@@ -192,7 +193,7 @@ const EXEC_CELL_DESCRIPTION = `Execute a cell in a persistent Jupyter-like kerne
 - Large results are shown as a head/tail preview. Use read_cell_output(cellIdx, kernel?, offset?, limit?) to page through the full notebook-persisted output without re-running the cell; kernel defaults to the most recently used kernel.
 - file (optional): run a .py file's contents inside this kernel instead of inline code (IPython %run semantics — definitions land in the namespace; tracebacks map to the real file). Prefer cells: the notebook on disk is already the durable record.
 - IPython magics (%time, %timeit, %pip, %%capture, ...) and !-shell escapes run like in Jupyter.
-- confirm (optional): set true to ask the user for approval before running. The popup shows the full cell body in a Shiki-syntax-highlighted, scrollable viewport (PgUp/PgDn to scroll). Run most cells immediately; set confirm=true for destructive work. Never set it when the user said "run autonomously" or "don't prompt me". Approval/autonomy policy for orchestrated workflows: see the pi-subagents skill.
+- Review is separate from execution: use request_cell_review before substantial workflows or destructive operations unless the user explicitly requested no prompts. It previews code without executing it. After approval, ordinary fixes within the same scope do not require another review. See the pi-subagents skill for workflow review and autonomy policy.
 
 Cells run synchronously and stream progress, including a live viewer of any pi_subagents fan-out. End subagent workflows with pool.close() — its echoed summary is the report.`;
 
@@ -576,7 +577,7 @@ function restoreActiveToolsAfterRouting(pi: ExtensionAPI, sessionState: PtcSessi
 }
 
 // ============================================================================
-// Cell approval gate (exec_cell confirm=true)
+// Explicit cell review (never executes code)
 // ============================================================================
 
 /**
@@ -651,7 +652,7 @@ function execFilePtc(
   });
 }
 
-/** Model's approve/reject decision for a confirm=true cell. */
+/** User's approve/reject decision for an explicit cell review. */
 interface CellApprovalDecision {
   action: "approve" | "reject";
   note?: string;
@@ -659,8 +660,8 @@ interface CellApprovalDecision {
 
 /** The three choices offered in the cell approval popup. */
 const CELL_APPROVAL_OPTIONS = [
-  { value: "approve", label: "Approve — run this cell" },
-  { value: "reject", label: "Reject — do not run it" },
+  { value: "approve", label: "Approve — accept this operation" },
+  { value: "reject", label: "Reject — do not execute this operation" },
   { value: "note", label: "Reject with note — tell the model why" },
 ] as const;
 
@@ -741,7 +742,7 @@ async function requestCellApproval(
         const visible = rows.slice(rowOffset, rowOffset + viewportRows);
 
         const lines: string[] = [];
-        lines.push(theme.fg("accent", "┌─ cell approval ─ kernel " + sessionId + " " + "─".repeat(Math.max(0, renderWidth - 22 - sessionId.length))));
+        lines.push(theme.fg("accent", "┌─ cell review ─ kernel " + sessionId + " " + "─".repeat(Math.max(0, renderWidth - 22 - sessionId.length))));
         const rangeLabel = visible.length
           ? `lines ${visible[0].line + 1}–${visible[visible.length - 1].line + 1} of ${previewLines.length}`
           : "0 lines";
@@ -985,7 +986,7 @@ function provisionKernelTool(
   });
 }
 
-/** exec_cell tool: run one cell in a persistent kernel, with confirmation gate, preview collapsing, recovery, and subagent streaming. */
+/** exec_cell: persistent execution with preview folding, recovery and subagent streaming. Review is separate. */
 function execCellTool(
   pi: ExtensionAPI,
   sessionManager: PythonSessionManager,
@@ -1011,19 +1012,12 @@ function execCellTool(
             "Path to a .py file executed inside the kernel instead of inline code (IPython %run semantics; tracebacks map to the real path). Prefer cells — the notebook on disk is the durable artifact.",
         })
       ),
-      confirm: Type.Optional(
-        Type.Boolean({
-          description:
-            "Ask the user for approval before running. The popup shows only the code parameter. Never set it when the user said 'run autonomously' or 'don't prompt me'.",
-        })
-      ),
     }),
         execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-          const { session_id: sessionId, code, file: cellFile, confirm: needsConfirmation } = params as {
+          const { session_id: sessionId, code, file: cellFile } = params as {
             session_id: string;
             code?: string;
             file?: string;
-            confirm?: boolean;
           };
           if (!code && !cellFile) {
             return {
@@ -1053,20 +1047,6 @@ function execCellTool(
             }
           }
 
-          if (needsConfirmation) {
-            const decision = await requestCellApproval(ctx, sessionId, cellCode as string);
-            if (decision.action === "reject") {
-              return {
-                content: [{
-                  type: "text",
-                  text: decision.note
-                    ? `Cell rejected by user — note: ${decision.note}`
-                    : "Cell rejected by user.",
-                }],
-                details: { sessionId, rejected: true },
-              };
-            }
-          }
 
           // background/wait_for modes are WIP (deferred): synchronous runs make the
           // live subagent viewer straightforward. The manager keeps the machinery
@@ -1265,36 +1245,15 @@ function scratchRunTool(
         Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
       ),
       code: Type.String({ description: "Python code to run. Top-level await works; the last bare expression echoes." }),
-      confirm: Type.Optional(
-        Type.Boolean({
-          description:
-            "Ask the user for approval before running. The popup shows only the code parameter. Never set it when the user said 'run autonomously' or 'don't prompt me'.",
-        })
-      ),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { session_id: sessionId, code, confirm } = params as {
+      const { session_id: sessionId, code } = params as {
         session_id?: string;
         code: string;
-        confirm?: boolean;
       };
       const target = resolveKernelId(sessionManager, sessionId);
       if ("error" in target) {
         return { content: [{ type: "text", text: target.error }], details: {} };
-      }
-      if (confirm) {
-        const decision = await requestCellApproval(ctx, target.id, code);
-        if (decision.action === "reject") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: decision.note ? `Cell rejected by user — note: ${decision.note}` : "Cell rejected by user.",
-              },
-            ],
-            details: { sessionId: target.id, rejected: true },
-          };
-        }
       }
       sessionState.lastCtx = ctx;
       sessionState.activeForegroundExecutions.set(toolCallId, target.id);
@@ -1544,18 +1503,11 @@ function runCellTool(
         Type.String({ description: "Kernel id; defaults to the most recently used kernel." })
       ),
       n: Type.Integer({ minimum: 1, description: "1-based position of the code cell to run." }),
-      confirm: Type.Optional(
-        Type.Boolean({
-          description:
-            "Ask the user for approval before running. Never set it when the user said 'run autonomously' or 'don't prompt me'.",
-        })
-      ),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      const { session_id: sessionId, n, confirm } = params as {
+      const { session_id: sessionId, n } = params as {
         session_id?: string;
         n: number;
-        confirm?: boolean;
       };
       const target = resolveKernelId(sessionManager, sessionId);
       if ("error" in target) {
@@ -1570,20 +1522,6 @@ function runCellTool(
           content: [{ type: "text", text: `run_cell failed: ${error instanceof Error ? error.message : String(error)}` }],
           details: { sessionId: target.id, n },
         };
-      }
-      if (confirm) {
-        const decision = await requestCellApproval(ctx, target.id, code);
-        if (decision.action === "reject") {
-          return {
-            content: [
-              {
-                type: "text",
-                text: decision.note ? `Cell rejected by user — note: ${decision.note}` : "Cell rejected by user.",
-              },
-            ],
-            details: { sessionId: target.id, n, rejected: true },
-          };
-        }
       }
       sessionState.lastCtx = ctx;
       sessionState.activeForegroundExecutions.set(toolCallId, target.id);
@@ -1955,6 +1893,7 @@ async function handleSessionStart(
   pi.registerTool(deleteCellTool(sessionManager));
   pi.registerTool(readCellsTool(sessionManager));
   pi.registerTool(readCellTool(sessionManager));
+  pi.registerTool(createCellReviewTool(sessionManager, requestCellApproval));
   pi.registerTool(runCellTool(sessionManager, settings, sessionState));
   pi.registerTool(
     runBatchTool(sessionManager, sessionState, {

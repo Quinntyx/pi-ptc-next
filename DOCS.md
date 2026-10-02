@@ -56,7 +56,7 @@ top = sorted(counts.items(), key=lambda kv: -kv[1])[:5]
 top
 ```
 
-**4. You stay in control.** While a cell streams you see a line-numbered code view with a `▶` marker on the executing line (and a live subagent panel when pools are running). A cell requested with `confirm: true` pops up a syntax-highlighted approval box (Approve / Reject / Reject-with-note). **Esc** interrupts the running chunk with Ctrl-C semantics — the kernel stays alive with its namespace intact. `/ptc interrupt [session_id]` (alias `/ptc stop`) and `/ptc kill [session_id]` do the same from the TUI.
+**4. You stay in control.** While a cell streams you see a line-numbered code view with a `▶` marker on the executing line (and a live subagent panel when pools are running). `request_cell_review` previews a cell in a syntax-highlighted review box without executing it (Approve / Reject / Reject-with-note). **Esc** interrupts the running chunk with Ctrl-C semantics — the kernel stays alive with its namespace intact. `/ptc interrupt [session_id]` (alias `/ptc stop`) and `/ptc kill [session_id]` do the same from the TUI.
 
 **5. Outputs are compact but never lost.** The model sees at most `PTC_OUTPUT_PREVIEW_CHARS` (default 12,000 chars) of any cell as a head/tail preview; the full output is persisted in the notebook's cell metadata and paged back via `read_cell_output(cellIdx, offset, limit)` (default 2,000 lines / 50 KB per call).
 
@@ -72,7 +72,8 @@ A kernel is a persistent Python subprocess bound to a real `.ipynb` notebook fil
 provision_kernel({ notebook: "analysis.ipynb" })
 exec_cell({ session_id: "a3f8c1d2e4f5", code: "import json; rows = json.load(open('data/events.json')); len(rows)" })
 → return (Out[1]): 1482
-exec_cell({ session_id: "a3f8c1d2e4f5", code: "rows[:2]", confirm: true })   # user approves the popup
+request_cell_review({ session_id: "a3f8c1d2e4f5", code: "rows[:2]" })
+exec_cell({ session_id: "a3f8c1d2e4f5", code: "rows[:2]" })  # separate execution after approval
 ```
 
 More: [docs/kernels.md](docs/kernels.md)
@@ -96,7 +97,7 @@ More: [docs/tool-bridge.md](docs/tool-bridge.md)
 
 ## Output handling and the code view
 
-The host composes the model-visible result into structural sections — `output:` (stdout), `return (Out[n]):` (echoed expression), `kernel:` (namespace digest), `subagents:` (pool progress) — with cell lines indented two spaces under column-0 markers, so a cell cannot impersonate a section. Anything over the preview budget collapses into a whole-line ~70/30 head/tail preview with a marker pointing at `read_cell_output(cellIdx=K)`; the untruncated text lives in the notebook's cell `metadata.ptc_full_output` and pages back in 2,000-line/50 KB slices with continuation hints. On failures, at most one deterministic `help:` hint is appended to the traceback (e.g. `ModuleNotFoundError` → `provision_dependency('<distribution>')`). User-side, a running cell renders as a line-numbered code view with a `▶` executing-line marker and 10-line windowing for long cells (repainted on a 120 ms ticker so it animates during pure `await`s); a finished cell renders with a `[PTC]` header (nested tool calls, `~N tokens saved`, duration, figures); `confirm: true` cells get a Shiki-highlighted approval popup (`PTC_CODE_THEME`, default `github-dark`) with Approve / Reject / Reject-with-note.
+The host composes the model-visible result into structural sections — `output:` (stdout), `return (Out[n]):` (echoed expression), `kernel:` (namespace digest), `subagents:` (pool progress) — with cell lines indented two spaces under column-0 markers, so a cell cannot impersonate a section. Anything over the preview budget collapses into a whole-line ~70/30 head/tail preview with a marker pointing at `read_cell_output(cellIdx=K)`; the untruncated text lives in the notebook's cell `metadata.ptc_full_output` and pages back in 2,000-line/50 KB slices with continuation hints. On failures, at most one deterministic `help:` hint is appended to the traceback (e.g. `ModuleNotFoundError` → `provision_dependency('<distribution>')`). User-side, a running cell renders as a line-numbered code view with a `▶` executing-line marker and 10-line windowing for long cells (repainted on a 120 ms ticker so it animates during pure `await`s); a finished cell renders with a `[PTC]` header (nested tool calls, `~N tokens saved`, duration, figures); `request_cell_review` opens a Shiki-highlighted review popup without executing code (`PTC_CODE_THEME`, default `github-dark`) with Approve / Reject / Reject-with-note.
 
 More: [docs/output-and-code-view.md](docs/output-and-code-view.md)
 
@@ -205,7 +206,7 @@ Everything is configured through environment variables, read **once** at extensi
 | `PTC_MAX_PYTHON_SESSIONS` | `4` | Parsed but **not enforced** (vestigial). |
 | `PTC_DEBUG` | `false` | `[PTC]`-prefixed debug lines on stdout. |
 | `PTC_SUBAGENT_FOOTER` | `true` | Live subagent status footer; set `false` for custom footers. |
-| `PTC_CODE_THEME` | `github-dark` | Shiki theme for the `confirm: true` approval popup. |
+| `PTC_CODE_THEME` | `github-dark` | Shiki theme override for cell rendering and the standalone review popup. |
 
 ### Paths
 
@@ -235,8 +236,8 @@ More: [docs/configuration.md](docs/configuration.md) — the full per-variable r
 | **IPython** | Required (session kernels) | Runs each cell with Jupyter semantics: one persistent namespace, `In[n]`/`Out[n]` echo, top-level await, and magics. | Session kernels fail to start with an actionable error; install it into the shared venv with `provision_dependency('ipython')`. |
 | **`git`** | Optional | Required only for the managed-clone path of `pi_subagents` provisioning. | Subagents provisioning fails (logged, non-fatal) if there's no dev checkout to use instead. |
 | **`pi_subagents` + tmux + `pi-sock`** | Optional (opt-in via `PI_SUBAGENTS_MAX_CONCURRENT`) | The subagent orchestration stack: set `PI_SUBAGENTS_MAX_CONCURRENT` to a positive number and the module installs into the shared venv from the public GitHub mirror at the next session start; tmux (each agent is a tmux window; the module refuses to spawn without tmux), and `pi-sock` (prompt-delivery transport — must be installed in your agent dir, which subagents share by default). Spawned agents run under your own agent dir; `PI_CODING_SUBAGENT_DIR` points them elsewhere. | Everything else works untouched; without the env var nothing is downloaded and `import pi_subagents` in cells fails with a hint. |
-| **pi-activity** | Optional | Live agent activity labels in the panel and model-supplied activity words on tool calls (`globalThis[Symbol.for("pi-activity:api")]`). Load it before pi-pycells. | The subagent panel, timers, and vendored shimmer work without it; only live activity labels are unavailable. |
-| **shiki** | Bundled | Syntax highlighting for the `confirm: true` approval popup. It is a regular dependency, so highlighting works out of the box; if it ever fails to load the popup falls back to plain text (visible with `PTC_DEBUG=1`) without aborting. | Nothing to install. |
+| **pi-activity** | Bundled | API-only activity tracking, loaded before pi-pycells. Query `globalThis[Symbol.for("pi-activity:api")]` directly, or use a subagent handle's `get_activity()` or cached `activity` snapshot through pi-sock. Activity assignment is owned by pi-activity, not inferred by this plugin. | Installed automatically. A standalone subagents profile must also load it; no pi-tool-tree installation is needed. |
+| **shiki** | Bundled | Syntax highlighting for cell boxes and standalone cell review. It is a regular dependency, so highlighting works out of the box; if it ever fails to load the popup falls back to plain text (visible with `PTC_DEBUG=1`) without aborting. | Nothing to install. |
 
 Note that the shared venv at `~/.cache/pi-pycells/python-env` is created by the subagent provisioner but, once it exists, is preferred by **every** kernel over `python3` — even for users who never touch subagents. Set `PTC_PYTHON_EXECUTABLE` if you want to pin your own interpreter.
 

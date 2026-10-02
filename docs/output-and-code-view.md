@@ -2,7 +2,7 @@
 
 ## What it does
 
-When the model runs a Python cell through `exec_cell`, the extension decides what the model sees, what the user sees, and what survives on disk. The raw cell output is never sent to the model in full: it is composed into host-owned sections (`output:`, `return (Out[n]):`, `kernel:`, `subagents:`), and anything larger than a configured character budget is collapsed into a head/tail preview that points at the `read_cell_output` tool, which pages through the full output persisted in the notebook. On the user's side, call arguments, running cells, and finished cells share line-numbered `In[N]:` / `Out[N]:` boxes. The pending input preview is replaced by the result, never duplicated. Labels have a one-column transcript inset and a shared three-digit gutter. The host tool-call background covers the entire box, including labels, borders, content, and padding. Cells requested with `confirm: true` show a separate Shiki-highlighted approval popup before execution. Python tracebacks get at most one appended, deterministic `help:` hint.
+When the model runs a Python cell through `exec_cell`, the extension decides what the model sees, what the user sees, and what survives on disk. The raw cell output is never sent to the model in full: it is composed into host-owned sections (`output:`, `return (Out[n]):`, `kernel:`, `subagents:`), and anything larger than a configured character budget is collapsed into a head/tail preview that points at the `read_cell_output` tool, which pages through the full output persisted in the notebook. On the user's side, call arguments, running cells, and finished cells share line-numbered `In[N]:` / `Out[N]:` boxes. The pending input preview is replaced by the result, never duplicated. Labels have a one-column transcript inset and a shared three-digit gutter. The host tool-call background covers the entire box, including labels, borders, content, and padding. `request_cell_review` shows a separate Shiki-highlighted preview without executing code. Python tracebacks get at most one appended, deterministic `help:` hint.
 
 ## How it works
 
@@ -54,9 +54,18 @@ Streaming argument previews and live output follow their newest lines without an
 
 Highlighting runs asynchronously and requests a redraw when ready. Streaming requests are coalesced to at most one tokenization every 100 ms, with only one active job and the latest source queued; intermediate token snapshots are not highlighted. Visible historical cells retain their cached colors instead of being flushed whenever the streaming cache fills. While newer tokens wait for Shiki, the unchanged source prefix retains its last-known colors and only new or edited text uses plain ink. Older asynchronous results cannot replace a newer highlight snapshot, and theme changes never reuse the previous theme's colors. Geometry always comes from the raw source: the color update never changes row counts, truncation, or fence columns. A trailing newline does not discard retained colors when its empty highlight row is omitted from the visible box. A failed highlighter leaves readable plain code. The contrast guard retains dark ink on light backgrounds and replaces washed-out colors instead of replacing readable dark colors.
 
-### The approval popup (`confirm: true`)
+### Explicit cell review (`request_cell_review`)
 
-When the model sets `confirm: true`, `requestCellApproval` shows a boxed preview of the cell code with line numbers, wrapped to terminal width, scrollable over a 24-row viewport (PgUp/PgDn, mouse wheel, Home/End), followed by Approve / Reject / Reject-with-note options (also `y`/`n`/Esc). The code is highlighted with Shiki to ANSI colors (GitHub Light/Dark chosen from the tool-pane background, `PTC_CODE_THEME` to override); if Shiki can't load, it falls back to plain text — the popup never aborts the flow. A rejection (with or without a note) is returned to the model without running the cell; a broken dialog also fails closed. With no UI available (`ctx.hasUI` false), the cell is rejected automatically.
+Review is independent of execution. `request_cell_review` previews inline
+`code`, a file's full contents (`file`), or the saved code cell at `n` in an
+optional `session_id`. It shows a scrollable, syntax-highlighted viewport and
+Approve / Reject / Reject-with-note choices. The result reports the decision;
+no code runs, no cell is appended, and notebook outputs are not changed.
+
+After approval, the model executes separately. Ordinary bug fixes within the
+approved operation do not require another review; material scope changes do.
+Escape rejects. Missing UI and dialog failures reject rather than running
+unreviewed work. Execution tools have no `confirm` or `review` argument.
 
 ### Python error help hints
 
@@ -102,7 +111,7 @@ To page through the full durable output:
 [Showing lines 1-2000 of 2812. Use offset=2001 to continue.]
 ```
 
-For a destructive cell, the model sets `confirm: true` on `exec_cell`; the user sees the highlighted code in the approval box and can approve, reject, or reject with a note that goes back to the model.
+Before a destructive operation, the model calls `request_cell_review`. The user can approve, reject, or reject with feedback. Only a later execution call runs the approved operation; ordinary repairs within approved scope do not prompt again.
 
 ## Options / configuration
 
@@ -119,6 +128,6 @@ Label, border, diff, and error colors come from the active Pi theme. Code syntax
 
 - **Shiki is bundled, but highlight failure is silent.** `shiki` is a regular dependency of the package, so the approval popup works out of the box. Under the extension's jiti-based TypeScript loader the ESM import is shimmed specially; if highlighting ever fails you get plain text and, with `PTC_DEBUG=1`, a `[PTC] shiki unavailable...` line. No action needed.
 - **`PTC_CODE_THEME` must be a valid Shiki theme name** (e.g. `github-dark`, `github-light`, `one-dark-pro`). An invalid name logs a debug message and falls back to plain text; it does not crash the popup.
-- **Subagent panel and shimmer are self-contained.** The `subagents:` section, the workflow rollup, the footer status, and the shimmer animation only appear when the cell actually spawned `pi_subagents` pools. The shimmer painter is vendored into pi-pycells (`src/execution/shimmer.ts`) and renders identically without pi-activity; installing pi-activity only adds live agent activity labels and tool-call activity words.
+- **Subagent panel and shimmer are self-contained.** The `subagents:` section, the workflow rollup, the footer status, and the shimmer animation only appear when the cell actually spawned `pi_subagents` pools. Panel rendering remains owned by pi-pycells. The bundled pi-activity extension supplies the stable activity API, not a replacement renderer. Activity snapshots are queried through pi-sock; activity assignment policy belongs to pi-activity.
 - **Cell numbering includes sourced prefix cells.** If a kernel was provisioned with a `source` notebook, prefix cells (including markdown) count toward numbering — with 7 source cells, the first new cell is 8. `read_cell_output` matches the `execution_count` shown in `Out[n]` and previews, so use those numbers, not the position in the file.
 - **The full output lives in the notebook file.** `read_cell_output` reads the `.ipynb` bound to the most recently used kernel. If you moved or deleted the notebook mid-session, paging fails with a `could not read notebook ...` error; keep the file in place until the session ends.

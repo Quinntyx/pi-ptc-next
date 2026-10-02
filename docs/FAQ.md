@@ -33,9 +33,9 @@ subagent spawning is unavailable here. Run this script inside tmux to spawn suba
 
 This surfaces as a failed per-agent pool result, not a cell crash — the cell completes normally, and the subagent footer/panels simply never activate.
 
-### What happens without pi-tool-tree?
+### Does activity tracking require pi-tool-tree?
 
-Everything functional works; only cosmetics degrade. `withActivityLabel()` looks up `globalThis[Symbol.for("pi-tool-tree:activity-api")]` and returns the tool unchanged if the wrapper is absent (`src/utils.ts`), so tool rows render plainly. The shimmer animation is vendored into pi-pycells (`src/execution/shimmer.ts`) and works without pi-tool-tree — the only loss is the live activity labels/words on agent rows and tool calls.
+No. Pi-pycells bundles and loads pi-activity, an API-only extension, before registering its own tools. `withActivityLabel()` uses `globalThis[Symbol.for("pi-activity:api")]`. Subagent handles retrieve activity snapshots through pi-sock. A standalone subagents profile must install pi-activity alongside pi-sock; a profile with pi-pycells already receives both. Activity assignment is owned by pi-activity, and consumers should use its stable API rather than depend on labeling heuristics.
 
 ### Do I need to run `npm install` or `npm run build` before installing?
 
